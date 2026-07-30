@@ -643,6 +643,11 @@ python3 crates/sandlock-cli/examples/deferred_commit.py
 The example verifies both decisions and asserts that the real workdir remains
 unchanged while each branch is pending.
 
+See
+[`docs/explicit-cow-branches.md`](docs/explicit-cow-branches.md)
+for the complete Rust API, CLI wire protocol, failure semantics, and
+operational constraints.
+
 ### COW Fork & Map-Reduce
 
 Initialize expensive state once, then fork COW clones that share memory.
