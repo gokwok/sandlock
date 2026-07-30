@@ -115,6 +115,15 @@ pub enum BranchError {
     #[error("branch conflict: {0}")]
     Conflict(String),
 
+    #[error("COW branch is still attached to a running sandbox")]
+    NotReady,
+
+    #[error("no retained COW branch is available")]
+    Unavailable,
+
+    #[error("COW branch has already been committed or aborted")]
+    AlreadyResolved,
+
     #[error("disk quota exceeded")]
     QuotaExceeded,
 

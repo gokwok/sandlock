@@ -192,9 +192,15 @@ impl TryFrom<&Sandbox> for Confinement {
 /// Action to take on branch exit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BranchAction {
+    /// Merge branch writes into the workdir when the sandbox is dropped.
     #[default]
     Commit,
+    /// Discard branch writes when the sandbox is dropped.
     Abort,
+    /// Leave the branch unresolved when the sandbox is dropped.
+    ///
+    /// Prefer [`Sandbox::run_pending`] or [`Sandbox::take_pending_branch`]
+    /// when the caller needs a retained branch it can later commit or abort.
     Keep,
 }
 
@@ -1261,6 +1267,62 @@ impl Sandbox {
         self.wait().await
     }
 
+    /// Run a command and retain its completed COW filesystem branch for an
+    /// explicit commit or abort decision.
+    ///
+    /// This requires `workdir` and the seccomp supervisor. The child and
+    /// supervisor are reaped before this method returns; file contents remain
+    /// in the branch's on-disk upper directory. Dropping the returned pending
+    /// branch aborts it.
+    ///
+    /// `on_exit` and `on_error` are not applied because ownership of the COW
+    /// branch is transferred to the returned [`crate::branch::PendingBranch`].
+    pub async fn run_pending(
+        &mut self,
+        cmd: &[&str],
+    ) -> Result<crate::branch::PendingRunResult, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        if self.workdir.is_none() || self.no_supervisor {
+            return Err(SandboxRuntimeError::Branch(BranchError::Unavailable).into());
+        }
+
+        self.do_create(cmd, true).await?;
+        self.do_start()?;
+        let run_result = self.wait().await?;
+        let branch = self.take_pending_branch()?;
+        Ok(crate::branch::PendingRunResult { run_result, branch })
+    }
+
+    /// Detach the completed COW branch from this sandbox.
+    ///
+    /// Call this only after [`Sandbox::wait`] has completed. Taking the branch
+    /// releases the stopped sandbox runtime and returns a lightweight handle
+    /// that owns the staged filesystem state. Dropping that handle aborts it.
+    pub fn take_pending_branch(
+        &mut self,
+    ) -> Result<crate::branch::PendingBranch, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        let branch = {
+            let rt = self
+                .runtime
+                .as_mut()
+                .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+            if !matches!(rt.state, RuntimeState::Stopped(_)) {
+                return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+            }
+            rt.seccomp_cow
+                .take()
+                .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?
+        };
+
+        let upper_dir = branch.upper_dir().to_path_buf();
+        self.fs_readable.retain(|path| path != &upper_dir);
+        self.runtime = None;
+        Ok(crate::branch::PendingBranch::new(branch))
+    }
+
     /// Run with inherited stdio (interactive mode).
     pub async fn run_interactive(
         &mut self,
@@ -1762,29 +1824,21 @@ impl Sandbox {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-            match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
-                Ok(mut branch) => {
-                    // `Keep` must survive a sandbox that is never `wait()`ed:
-                    // the branch only reaches `Sandbox`'s own disposition after
-                    // a completed `wait()`, and the branch's `Drop` would
-                    // otherwise reclaim the upper the caller asked to keep.
-                    // Commit and Abort are NOT carried over that way — an
-                    // abandoned run has no exit status and merging its writes
-                    // is not something it can ask for, so those keep the
-                    // reclaiming default. With no exit status there is also no
-                    // choice between the two actions, so either one asking for
-                    // `Keep` preserves.
-                    branch.set_keep_if_abandoned(
-                        self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
-                    );
-                    self.fs_readable.push(branch.upper_dir().to_path_buf());
-                    Some(branch)
-                }
-                Err(e) => {
-                    eprintln!("sandlock: seccomp COW branch creation failed: {}", e);
-                    None
-                }
-            }
+            let mut branch = crate::cow::seccomp::SeccompCowBranch::create(
+                &workdir,
+                storage.as_deref(),
+                max_disk,
+            )
+            .map_err(SandboxRuntimeError::Branch)?;
+            // `Keep` must survive a sandbox that is never `wait()`ed:
+            // the branch only reaches `Sandbox`'s own disposition after
+            // a completed `wait()`, and the branch's `Drop` would otherwise
+            // reclaim the upper the caller asked to keep.
+            branch.set_keep_if_abandoned(
+                self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
+            );
+            self.fs_readable.push(branch.upper_dir().to_path_buf());
+            Some(branch)
         } else {
             None
         };

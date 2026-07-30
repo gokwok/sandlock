@@ -55,6 +55,9 @@ mod test_chroot;
 #[path = "integration/test_dry_run.rs"]
 mod test_dry_run;
 
+#[path = "integration/test_pending_branch.rs"]
+mod test_pending_branch;
+
 #[path = "integration/test_http_acl.rs"]
 mod test_http_acl;
 

@@ -29,13 +29,14 @@ pub mod transaction;
 pub mod policy_fn;
 pub mod image;
 pub mod fork;
+pub mod branch;
 pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod dry_run;
 pub mod control;
 mod transparent_proxy;
 
-pub use error::SandlockError;
+pub use error::{BranchError, SandlockError};
 pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
@@ -43,6 +44,7 @@ pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
 };
 pub use result::{RunResult, ExitStatus};
+pub use branch::{BranchState, PendingBranch, PendingRunResult};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
