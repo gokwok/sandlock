@@ -554,6 +554,43 @@ for changes (added/modified/deleted files), prints a summary, then
 aborts — leaving the workdir completely untouched. Useful for previewing
 what a command would do before committing.
 
+**Explicit branch resolution (Rust API)**: `run_pending` reaps the
+command and supervisor but retains its COW filesystem branch. The
+workdir remains untouched until the caller explicitly commits; aborting
+or dropping the pending branch discards it.
+
+```rust
+let mut sandbox = Sandbox::builder()
+    .fs_read("/usr")
+    .fs_read("/lib")
+    .fs_read("/bin")
+    .fs_write("/opt/project")
+    .workdir("/opt/project")
+    .build()?;
+
+let pending = sandbox
+    .run_pending(&["sh", "-c", "printf staged > /opt/project/result.txt"])
+    .await?;
+let (result, mut branch) = pending.into_parts();
+
+if action_was_selected && result.success() {
+    branch.commit()?;
+} else {
+    branch.abort()?;
+}
+```
+
+The retained handle is lightweight: staged file contents stay in the
+on-disk upper directory rather than process memory. This API is
+in-process only; it does not persist a branch for another process to
+reopen.
+
+Run the complete two-candidate example on Linux:
+
+```sh
+cargo run -p sandlock-core --example speculative_branches
+```
+
 ### COW Fork & Map-Reduce
 
 Initialize expensive state once, then fork COW clones that share memory.
