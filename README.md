@@ -232,6 +232,10 @@ sandlock run --workdir /opt/project -r /usr -r /lib -- python3 task.py
 # Dry-run (show what files would change, then discard)
 sandlock run --dry-run --workdir . -w . -r /usr -r /lib -r /bin -r /etc -- make build
 
+# Defer COW publication until a controller sends commit or abort
+sandlock run --workdir /opt/project \
+  --defer-commit --decision-fd 3 --status-fd 4 -- python3 task.py
+
 # Use a saved profile
 sandlock run -p build -- make -j4
 
@@ -590,6 +594,54 @@ Run the complete two-candidate example on Linux:
 ```sh
 cargo run -p sandlock-core --example speculative_branches
 ```
+
+**Deferred branch resolution (CLI)**: `--defer-commit` keeps the CLI process
+alive after the command exits and waits for an explicit decision. It requires
+`--workdir`, `--decision-fd`, and `--status-fd`:
+
+```bash
+sandlock run \
+  --workdir /workspace \
+  --defer-commit \
+  --decision-fd 3 \
+  --status-fd 4 \
+  -- command
+```
+
+When the Action finishes, Sandlock writes exactly one JSON line to the status
+descriptor while the real workdir is still unchanged:
+
+```json
+{"state":"pending","exit_code":0}
+```
+
+The controller must then write exactly one line to the decision descriptor:
+
+```text
+commit
+```
+
+or:
+
+```text
+abort
+```
+
+After applying the decision, Sandlock exits with the Action's exit code. An
+invalid decision, decision-fd EOF, status delivery failure, or commit/abort
+failure makes the CLI fail; any still-pending branch is aborted. The control
+descriptors must be distinct and numbered 3 or higher. They are CLI-only and
+are not exposed to the sandboxed Action.
+
+Run the end-to-end controller example on Linux:
+
+```bash
+cargo build -p sandlock-cli
+python3 crates/sandlock-cli/examples/deferred_commit.py
+```
+
+The example verifies both decisions and asserts that the real workdir remains
+unchanged while each branch is pending.
 
 ### COW Fork & Map-Reduce
 

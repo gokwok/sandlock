@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+mod deferred_commit;
 mod learn;
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
@@ -130,8 +131,24 @@ struct RunArgs {
     #[arg(long = "profile-file", value_name = "PATH", conflicts_with = "profile")]
     profile_file: Option<PathBuf>,
 
+    /// Write the command result as one JSON line to this file descriptor.
+    ///
+    /// With --defer-commit, the line is written as soon as the COW branch is
+    /// pending, before sandlock waits for the commit/abort decision.
     #[arg(long = "status-fd", value_name = "FD")]
     status_fd: Option<i32>,
+
+    /// Retain the completed COW branch until an explicit commit/abort decision.
+    #[arg(
+        long = "defer-commit",
+        requires_all = ["decision_fd", "status_fd"],
+        conflicts_with_all = ["dry_run", "no_supervisor", "on_exit", "on_error"]
+    )]
+    defer_commit: bool,
+
+    /// Read `commit` or `abort` from this file descriptor after the status event.
+    #[arg(long = "decision-fd", value_name = "FD", requires = "defer_commit")]
+    decision_fd: Option<i32>,
 
     /// Sandbox name (also exposed as the virtual hostname; auto-generated if omitted)
     #[arg(long)]
@@ -239,13 +256,6 @@ struct LearnArgs {
     /// Command to observe (everything after --)
     #[arg(last = true, required = true)]
     cmd: Vec<String>,
-}
-
-#[derive(serde::Serialize)]
-struct SandboxStatus {
-    exit_code: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    signal: Option<i32>,
 }
 
 #[tokio::main(worker_threads = 2)]
@@ -452,6 +462,17 @@ async fn main() -> Result<()> {
 async fn run_command(args: RunArgs) -> Result<i32> {
     let pb = &args.sandbox_builder;
 
+    let deferred_control = if args.defer_commit {
+        Some(deferred_commit::Control::open(
+            args.decision_fd
+                .expect("clap requires --decision-fd with --defer-commit"),
+            args.status_fd
+                .expect("clap requires --status-fd with --defer-commit"),
+        )?)
+    } else {
+        None
+    };
+
     // `--no-supervisor` reaches the same `Sandbox::run` path as everything
     // else; the deny-only filter and skipped supervisor are gated on the
     // sandbox's `no_supervisor` field. Validate flag/profile combinations
@@ -642,6 +663,15 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         }
     }
 
+    // Fail closed on every path before ownership is transferred to a
+    // PendingBranch (setup error, timeout, status-fd error, etc.). Once the
+    // branch is detached, its explicit commit/abort lifecycle takes over.
+    if args.defer_commit {
+        builder = builder
+            .on_exit(BranchAction::Abort)
+            .on_error(BranchAction::Abort);
+    }
+
     // Auto-generated names are handled by sandlock-core's sandbox_resolve_name
     // (format: sandbox-<pid>-<counter>). Let core handle it when name is None.
     let sandbox_name = args.name.clone();
@@ -703,6 +733,10 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     }
 
     let policy = builder.build()?;
+    if args.defer_commit && policy.workdir.is_none() {
+        return Err(anyhow!("--defer-commit requires --workdir"));
+    }
+
     let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = args.exec_shell {
         vec!["/bin/sh", "-c", shell_cmd.as_str()]
     } else if let Some(ref ic) = image_cmd {
@@ -767,22 +801,21 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         policy.run_interactive(&cmd_strs).await?
     };
 
-    if let Some(fd) = args.status_fd {
-        use std::io::Write as _;
-        use std::os::unix::io::FromRawFd;
-        use sandlock_core::ExitStatus as SandlockExitStatus;
-        let (code, signal) = match &result.exit_status {
-            SandlockExitStatus::Code(c) => (*c, None),
-            SandlockExitStatus::Signal(s) => (-1, Some(*s)),
-            SandlockExitStatus::Killed => (-1, None),
-            SandlockExitStatus::Timeout => (-1, None),
-        };
-        let status = SandboxStatus { exit_code: code, signal };
-        if let Ok(json) = serde_json::to_string(&status) {
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let _ = writeln!(file, "{}", json);
-            std::mem::forget(file); // Don't close the fd
+    if let Some(control) = deferred_control {
+        let mut branch = policy.take_pending_branch()?;
+        match control.announce_and_wait(&result)? {
+            deferred_commit::Decision::Commit => branch
+                .commit()
+                .map_err(|e| anyhow!("failed to commit deferred COW branch: {e}"))?,
+            deferred_commit::Decision::Abort => branch
+                .abort()
+                .map_err(|e| anyhow!("failed to abort deferred COW branch: {e}"))?,
         }
+    } else if let Some(fd) = args.status_fd {
+        // Preserve the existing best-effort status-fd behavior for normal
+        // runs. Deferred mode treats delivery errors as fatal because the
+        // decision protocol cannot proceed safely without its ready event.
+        let _ = deferred_commit::write_run_status(fd, &result);
     }
 
     let exit_code = result.code().unwrap_or(1);

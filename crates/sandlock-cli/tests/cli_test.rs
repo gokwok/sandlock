@@ -302,6 +302,129 @@ fn test_cow_commit_runs_on_cli_exit() {
     assert_eq!(contents.trim(), "committed");
 }
 
+#[cfg(target_os = "linux")]
+fn run_deferred_cow_decision(decision: Option<&str>) -> (std::process::Output, bool) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::process::Stdio;
+
+    fn pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: pipe2 initialized both descriptors and transfers ownership.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn make_inheritable(fd: i32) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+    }
+
+    let workdir = tempfile::tempdir().expect("tempdir");
+    let sentinel = workdir.path().join("deferred.txt");
+    let (status_read, status_write) = pipe();
+    let (decision_read, mut decision_write) = pipe();
+    make_inheritable(status_write.as_raw_fd());
+    make_inheritable(decision_read.as_raw_fd());
+
+    let status_fd = status_write.as_raw_fd().to_string();
+    let decision_fd = decision_read.as_raw_fd().to_string();
+    let workdir_arg = workdir.path().to_str().unwrap();
+    let child = sandlock_bin()
+        .args(args_for_host(&[
+            "run",
+            "-r", "/usr",
+            "-r", "/lib",
+            "-r", "/lib64",
+            "-r", "/bin",
+            "-r", "/etc",
+            "--workdir", workdir_arg,
+            "--defer-commit",
+            "--decision-fd", &decision_fd,
+            "--status-fd", &status_fd,
+            "--",
+            "sh", "-c", "printf staged > deferred.txt",
+        ]))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn deferred sandlock");
+
+    drop(status_write);
+    drop(decision_read);
+
+    let mut status_line = String::new();
+    BufReader::new(status_read)
+        .read_line(&mut status_line)
+        .expect("read pending status");
+    let status: serde_json::Value =
+        serde_json::from_str(&status_line).expect("parse pending status");
+    assert_eq!(status["state"], "pending");
+    assert_eq!(status["exit_code"], 0);
+    assert!(
+        !sentinel.exists(),
+        "real workdir must remain unchanged before the decision"
+    );
+
+    if let Some(decision) = decision {
+        writeln!(decision_write, "{decision}").expect("write decision");
+    }
+    drop(decision_write);
+
+    let output = child.wait_with_output().expect("wait for deferred sandlock");
+    let published = sentinel.exists();
+    drop(workdir);
+    (output, published)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_deferred_commit_publishes_branch() {
+    let (output, published) = run_deferred_cow_decision(Some("commit"));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(published, "commit decision should publish the staged file");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_deferred_abort_discards_branch() {
+    let (output, published) = run_deferred_cow_decision(Some("abort"));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!published, "abort decision should discard the staged file");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_deferred_decision_eof_aborts_branch() {
+    let (output, published) = run_deferred_cow_decision(None);
+    assert!(!output.status.success());
+    assert!(!published, "decision EOF should discard the staged file");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("EOF"), "stderr: {stderr}");
+}
+
 /// `--user N:N` maps the sandbox to UID `N` via an unprivileged
 /// user namespace, even when the host UID is non-zero. This is the only
 /// remaining `CLONE_NEWUSER` site after the overlayfs backend removal;
