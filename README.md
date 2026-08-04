@@ -558,10 +558,11 @@ for changes (added/modified/deleted files), prints a summary, then
 aborts — leaving the workdir completely untouched. Useful for previewing
 what a command would do before committing.
 
-**Explicit branch resolution (Rust API)**: `run_pending` reaps the
-command and supervisor but retains its COW filesystem branch. The
+**Explicit branch resolution (Rust API)**: `create_fs_branch` and
+`run_in_branch` retain one COW filesystem branch across any number of
+serial Actions. `run_pending` is the one-Action convenience API. The
 workdir remains untouched until the caller explicitly commits; aborting
-or dropping the pending branch discards it.
+or dropping the branch discards it.
 
 ```rust
 let mut sandbox = Sandbox::builder()
@@ -587,7 +588,10 @@ if action_was_selected && result.success() {
 The retained handle is lightweight: staged file contents stay in the
 on-disk upper directory rather than process memory. This API is
 in-process only; it does not persist a branch for another process to
-reopen.
+reopen. It shares Sandlock's COW merge, commit lock, and recovery
+machinery with `Transaction`; unlike `Transaction`, publication is
+controlled externally instead of happening automatically after a fixed
+stage list.
 
 Run the complete two-candidate example on Linux:
 

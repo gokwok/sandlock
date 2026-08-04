@@ -25,6 +25,22 @@ Explicit branch resolution is available through:
 The Python, Go, and C APIs do not currently expose `FsBranch`
 directly. They can orchestrate the CLI protocol as a subprocess.
 
+### Relationship to `Transaction`
+
+`Transaction` and `FsBranch` share Sandlock's internal COW branch, commit
+lock, merge, preservation, and recovery machinery, but expose different
+ownership semantics:
+
+- `Transaction` executes a fixed list of stages sequentially over one shared
+  upper and resolves it automatically when the stage set finishes.
+- `FsBranch` lets the caller retain the upper between arbitrary Actions,
+  switch between independent branches, and choose when to commit or abort.
+- `--defer-commit` is the one-Action CLI form of that external decision gate.
+
+Use `Transaction` when the stage graph and success policy are known before
+execution. Use `FsBranch` or `--defer-commit` when an Agent or controller must
+make the publication decision after the Action has already completed.
+
 ## Lifecycle
 
 The branch lifecycle is deliberately small:
@@ -65,7 +81,8 @@ modifies it. Commit fails with `BranchError::Conflict` if one of those paths
 changed in the lower layer. Branches that modify disjoint paths may therefore
 commit in sequence. This is write-conflict detection, not snapshot isolation:
 unmodified reads follow the live lower directory, and Sandlock does not track
-read dependencies.
+read dependencies. Conflict validation runs after taking the same per-workdir
+commit lock used by `Transaction`, immediately before the merge begins.
 
 Commit is a filesystem merge, not an atomic transaction. A failed commit
 leaves the handle pending, but some paths may already have been copied into
