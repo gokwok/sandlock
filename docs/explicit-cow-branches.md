@@ -18,10 +18,11 @@ Explicit branch resolution is available through:
 
 | Surface | Entry point | Ownership model |
 |---|---|---|
-| Rust API | `Sandbox::run_pending` / `Sandbox::take_pending_branch` | The caller owns a `PendingBranch` handle |
+| Rust API | `Sandbox::create_fs_branch` / `Sandbox::run_in_branch` | The caller owns a reusable `FsBranch` handle |
+| Rust compatibility API | `Sandbox::run_pending` / `Sandbox::take_pending_branch` | `PendingBranch` is an alias for `FsBranch` |
 | CLI | `sandlock run --defer-commit` | The CLI process owns the branch and waits on a decision fd |
 
-The Python, Go, and C APIs do not currently expose `PendingBranch`
+The Python, Go, and C APIs do not currently expose `FsBranch`
 directly. They can orchestrate the CLI protocol as a subprocess.
 
 ## Lifecycle
@@ -29,16 +30,15 @@ directly. They can orchestrate the CLI protocol as a subprocess.
 The branch lifecycle is deliberately small:
 
 ```text
-Running Action
+              Action exits
+                  |
+                  v
+Pending/Open -> Running
+      ^           |
+      |-----------|
       |
-      | Action and supervisor exit
-      v
-   Pending
-    /   \
-commit  abort
-  |       |
-  v       v
-Committed Aborted
+      +-- commit --> Committed
+      +-- abort  --> Aborted
 ```
 
 While the branch is `Pending`:
@@ -60,10 +60,12 @@ made writable outside `workdir` is not part of this branch and may be changed
 immediately by the Action. Configure the sandbox so every path that must be
 speculative is inside `workdir`.
 
-The lower `workdir` should remain stable while branches are pending. Sandlock
-does not provide MVCC, snapshot isolation, or conflict detection against
-unrelated host writers. If several speculative branches share one lower
-directory, coordinate them so at most one branch commits.
+An `FsBranch` records the lower-layer state of each path when the branch first
+modifies it. Commit fails with `BranchError::Conflict` if one of those paths
+changed in the lower layer. Branches that modify disjoint paths may therefore
+commit in sequence. This is write-conflict detection, not snapshot isolation:
+unmodified reads follow the live lower directory, and Sandlock does not track
+read dependencies.
 
 Commit is a filesystem merge, not an atomic transaction. A failed commit
 leaves the handle pending, but some paths may already have been copied into
@@ -71,6 +73,44 @@ the real workdir. Retrying or aborting the handle does not roll those paths
 back.
 
 ## Rust API
+
+### Reusable `FsBranch`
+
+Create branches independently of command execution, then run any number of
+serial Actions against each branch:
+
+```rust
+use sandlock_core::Sandbox;
+
+let mut sandbox = Sandbox::builder()
+    .fs_read("/usr")
+    .fs_read("/lib")
+    .fs_read_if_exists("/lib64")
+    .fs_read("/bin")
+    .fs_write("/workspace")
+    .workdir("/workspace")
+    .build()?;
+
+let mut branch_a = sandbox.create_fs_branch()?;
+let mut branch_b = sandbox.create_fs_branch()?;
+
+sandbox.run_in_branch(&mut branch_a, &["sh", "-c", "npm install"]).await?;
+sandbox.run_in_branch(&mut branch_b, &["sh", "-c", "cargo build"]).await?;
+sandbox.run_in_branch(&mut branch_a, &["sh", "-c", "npm test"]).await?;
+
+branch_a.commit()?;
+branch_b.commit()?; // succeeds only if its modified lower paths are unchanged
+```
+
+Selecting another branch is just passing a different `FsBranch` handle to
+`run_in_branch`; Sandlock has no workspace registry or implicit current
+branch. A branch supports one running Action at a time and retains filesystem
+state only. `commit` and `abort` remain terminal operations.
+
+`FsBranch::conflicts()` returns the relative paths that currently fail lower
+state validation. Conflict detection uses filesystem identity and metadata; it
+does not perform content merges or identify a stale output derived from a file
+that the Action only read.
 
 ### `Sandbox::run_pending`
 
@@ -136,6 +176,7 @@ The retained branch exposes:
 | `workdir()` | Lower directory that receives a successful commit |
 | `upper_dir()` | On-disk staging directory; removed after resolution |
 | `changes()` | Added, modified, and deleted paths relative to `workdir` |
+| `conflicts()` | Modified paths whose lower-layer state has changed |
 | `commit()` | Merge the branch into `workdir` |
 | `abort()` | Discard the branch |
 
@@ -392,7 +433,7 @@ The branch lifecycle and CLI protocol require a real Linux kernel with
 seccomp user notification:
 
 ```bash
-# PendingBranch unit tests
+# FsBranch lifecycle unit tests
 cargo test -p sandlock-core branch::tests -- --test-threads=1
 
 # Real COW commit/abort integration tests
@@ -413,7 +454,8 @@ On macOS, run these commands in the project's Orb Linux environment.
   process. A branch has exactly one owner.
 - Keep the real workdir unchanged while reasoning and speculative Actions
   are in flight.
-- Select at most one winner for a shared lower workdir.
+- Serialize commits that target the same lower workdir.
+- Disjoint write sets may commit sequentially; overlapping writes conflict.
 - Abort losers promptly to release their upper directories.
 - Treat commit failure as potentially partial.
 - Put every path whose changes must be reversible under `workdir`.
