@@ -1083,7 +1083,10 @@ fn proc_cmdline(pid: i32) -> Option<String> {
         // middle of a multi-byte UTF-8 codepoint.
         let joined = args.join(" ");
         if joined.len() > 60 {
-            let end = joined.floor_char_boundary(57);
+            let mut end = 57;
+            while !joined.is_char_boundary(end) {
+                end -= 1;
+            }
             Some(format!("{}…", &joined[..end]))
         } else {
             Some(joined)
