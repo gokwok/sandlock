@@ -4,9 +4,10 @@
 //! No root, no mount namespace, no kernel filesystem support needed.
 //! Works on any Linux 5.9+ kernel with seccomp user notification.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,7 +37,11 @@ fn branch_errno(e: BranchError) -> i32 {
         BranchError::Denied => libc::EPERM,
         BranchError::Deleted => libc::ENOENT,
         BranchError::Exists => libc::EEXIST,
-        BranchError::Operation(_) | BranchError::Conflict(_) => libc::EIO,
+        BranchError::Operation(_)
+        | BranchError::Conflict(_)
+        | BranchError::NotReady
+        | BranchError::Unavailable
+        | BranchError::AlreadyResolved => libc::EIO,
     }
 }
 
@@ -627,6 +632,37 @@ pub struct SeccompCowBranch {
     keep_if_abandoned: bool,
     max_disk_bytes: u64,
     disk_used: u64,
+    base: Option<HashMap<String, BaseStamp>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BaseStamp {
+    Absent { parent: Option<(u64, u64)> },
+    Present {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        size: i64,
+        mtime: i64,
+        mtime_nsec: i64,
+        ctime: i64,
+        ctime_nsec: i64,
+    },
+}
+
+impl BaseStamp {
+    fn present(st: &libc::stat) -> Self {
+        Self::Present {
+            device: st.st_dev as u64,
+            inode: st.st_ino as u64,
+            mode: st.st_mode,
+            size: st.st_size,
+            mtime: st.st_mtime,
+            mtime_nsec: st.st_mtime_nsec,
+            ctime: st.st_ctime,
+            ctime_nsec: st.st_ctime_nsec,
+        }
+    }
 }
 
 impl SeccompCowBranch {
@@ -685,6 +721,7 @@ impl SeccompCowBranch {
             keep_if_abandoned: false,
             max_disk_bytes,
             disk_used: 0,
+            base: None,
         })
     }
 
@@ -754,6 +791,7 @@ impl SeccompCowBranch {
     /// branch already removed from the workdir leaves it non-outstanding, which
     /// is correct — the workdir entry is already gone.
     pub fn mark_deleted(&mut self, rel_path: &str) {
+        self.record_base(rel_path);
         self.deleted.insert(rel_path);
         self.has_changes = true;
     }
@@ -765,6 +803,62 @@ impl SeccompCowBranch {
     /// contents (`deletions_are_applied_before_additions_at_the_same_path`).
     fn outstanding_deletions(&self) -> impl Iterator<Item = &str> {
         self.deleted.iter().filter(|r| !self.applied_deletions.contains(*r))
+    }
+
+    fn record_base(&mut self, rel_path: &str) {
+        if self.base.as_ref().is_some_and(|base| !base.contains_key(rel_path)) {
+            let stamp = self.lower_stamp(rel_path);
+            self.base
+                .as_mut()
+                .unwrap()
+                .insert(rel_path.to_string(), stamp);
+        }
+    }
+
+    pub(crate) fn track_conflicts(&mut self) {
+        self.base.get_or_insert_with(HashMap::new);
+    }
+
+    fn lower_stamp(&self, rel_path: &str) -> BaseStamp {
+        match crate::sys::fs::statat_in_root(&self.workdir, rel_path, false) {
+            Ok(st) => BaseStamp::present(&st),
+            Err(_) => BaseStamp::Absent {
+                parent: self.lower_parent_identity(rel_path),
+            },
+        }
+    }
+
+    fn lower_parent_identity(&self, rel_path: &str) -> Option<(u64, u64)> {
+        let mut parent = Path::new(rel_path).parent();
+        while let Some(path) = parent {
+            if path.as_os_str().is_empty() || path == Path::new(".") {
+                let meta = fs::symlink_metadata(&self.workdir).ok()?;
+                return Some((meta.dev(), meta.ino()));
+            }
+            if let Ok(st) = crate::sys::fs::statat_in_root(
+                &self.workdir,
+                &path.to_string_lossy(),
+                false,
+            ) {
+                return Some((st.st_dev as u64, st.st_ino as u64));
+            }
+            parent = path.parent();
+        }
+        None
+    }
+
+    pub fn conflicts(&self) -> Vec<PathBuf> {
+        let mut conflicts = self
+            .base
+            .as_ref()
+            .into_iter()
+            .flat_map(|base| base.iter())
+            .filter_map(|(path, stamp)| {
+                (self.lower_stamp(path) != *stamp).then(|| PathBuf::from(path))
+            })
+            .collect::<Vec<_>>();
+        conflicts.sort();
+        conflicts
     }
 
     /// Check whether `additional` bytes would exceed the disk quota.
@@ -802,6 +896,7 @@ impl SeccompCowBranch {
         // Already materialized in upper? Confined lstat succeeds for any
         // existing entry (including a dangling symlink).
         if crate::sys::fs::statat_in_root(&self.upper, rel_path, false).is_ok() {
+            self.record_base(rel_path);
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
@@ -822,7 +917,13 @@ impl SeccompCowBranch {
         // parent component cannot make us follow out of the tree (issue #112).
         // The lstat also yields the size of the entry we will actually copy.
         let st = match crate::sys::fs::statat_in_root(&self.workdir, rel_path, false) {
-            Ok(st) => st,
+            Ok(st) => {
+                if let Some(base) = self.base.as_mut() {
+                    base.entry(rel_path.to_string())
+                        .or_insert_with(|| BaseStamp::present(&st));
+                }
+                st
+            }
             // Absent or confined-out: treat as a new file created in upper.
             // EACCES gets the same disposition as execute_copy's source-open
             // gives it: the supervisor cannot see inside the lower directory
@@ -830,6 +931,15 @@ impl SeccompCowBranch {
             // an empty upper file rather than falling through to a real
             // permission error the virtualized child was promised not to hit.
             Err(libc::ENOENT) | Err(libc::EACCES) => {
+                if self.base.as_ref().is_some_and(|base| !base.contains_key(rel_path)) {
+                    let stamp = BaseStamp::Absent {
+                        parent: self.lower_parent_identity(rel_path),
+                    };
+                    self.base
+                        .as_mut()
+                        .unwrap()
+                        .insert(rel_path.to_string(), stamp);
+                }
                 self.check_quota(0)?;
                 return Ok(CowCopyPlan::Ready(upper_file));
             }
@@ -1246,6 +1356,7 @@ impl SeccompCowBranch {
         }
         let upper_file = self.upper.join(&rel);
         let lower_file = self.workdir.join(&rel);
+        self.record_base(&rel);
 
         // Check type mismatches: rmdir on a non-directory or unlink on a directory.
         // We check both upper (COW layer) and lower (real filesystem).
@@ -1302,6 +1413,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.record_base(&rel);
         self.check_quota(4096)?; // directory metadata
         self.has_changes = true;
         let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
@@ -1378,6 +1490,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.record_base(&new_rel);
         let src_is_dir = match self.merged_entry_is_dir(&old_rel) {
             Some(d) => d,
             None => return Err(libc::ENOENT),
@@ -1442,6 +1555,7 @@ impl SeccompCowBranch {
         if std::path::Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
             return Ok(false);
         }
+        self.record_base(&rel);
         self.check_quota(256)?;
         self.has_changes = true;
         if let Some(p) = parent_rel(&rel) {
@@ -1466,6 +1580,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.record_base(&new_rel);
         if self.is_deleted(&old_rel) {
             return Err(BranchError::Deleted);
         }
@@ -1849,6 +1964,16 @@ impl SeccompCowBranch {
             }
         };
         // `_lock` is held across the merge and released when this scope ends.
+        let conflicts = self.conflicts();
+        if !conflicts.is_empty() {
+            return Err(CommitError::Merge(BranchError::Conflict(
+                conflicts
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )));
+        }
         self.commit_merge().map_err(CommitError::Merge)
     }
 
