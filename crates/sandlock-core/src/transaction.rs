@@ -523,11 +523,8 @@ async fn run_txn(
     let branch = crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
         .map_err(|source| TxnError::Branch { workdir: workdir.clone(), source })?;
     let upper_dir = branch.upper_dir().to_path_buf();
-
-    let mut cow_state = crate::seccomp::state::CowState::new();
-    cow_state.branch = Some(branch);
-    let state = std::sync::Arc::new(tokio::sync::Mutex::new(cow_state));
-    let shared = crate::sandbox::SharedCow { state: std::sync::Arc::clone(&state), upper_dir: upper_dir.clone() };
+    let shared = crate::sandbox::SharedCow::new(branch);
+    let state = std::sync::Arc::clone(&shared.state);
 
     // Stage results are accumulated through a handle the coordinator also holds,
     // so a timeout that cancels the driver future does not take the completed

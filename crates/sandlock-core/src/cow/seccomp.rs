@@ -1443,6 +1443,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        self.record_base(&rel);
         self.check_quota(256)?;
         self.has_changes = true;
         // Ensure the parent directory exists in the upper layer before creating

@@ -26,34 +26,41 @@ pub struct PendingRunResult {
     /// Exit status and captured standard output/error from the command.
     pub run_result: RunResult,
     /// Retained COW filesystem branch for the command.
-    pub branch: PendingBranch,
+    pub branch: FsBranch,
 }
 
 impl PendingRunResult {
     /// Split the command result from the retained filesystem branch.
-    pub fn into_parts(self) -> (RunResult, PendingBranch) {
+    pub fn into_parts(self) -> (RunResult, FsBranch) {
         (self.run_result, self.branch)
     }
 }
 
-/// A lightweight handle to a completed COW filesystem branch.
+/// A reusable copy-on-write filesystem branch.
 ///
-/// The sandbox process and its supervisor have already been reaped when this
-/// handle is produced. File contents remain in the branch's on-disk upper
-/// directory; only branch metadata is retained in memory.
+/// Commands may be run serially against the branch with
+/// [`crate::Sandbox::run_in_branch`]. Each command sees changes staged by
+/// earlier commands in the same branch while the lower directory remains
+/// unchanged until commit.
 ///
-/// Dropping a pending handle aborts the branch, so callers must explicitly
-/// call [`PendingBranch::commit`] to publish its changes.
-#[must_use = "dropping a pending branch aborts its staged changes"]
-pub struct PendingBranch {
+/// Dropping an unresolved handle aborts the branch, so callers must explicitly
+/// call [`FsBranch::commit`] to publish its changes.
+#[must_use = "dropping an unresolved branch aborts its staged changes"]
+pub struct FsBranch {
     inner: Option<SeccompCowBranch>,
     workdir: PathBuf,
     upper_dir: PathBuf,
     state: BranchState,
 }
 
-impl PendingBranch {
-    pub(crate) fn new(branch: SeccompCowBranch) -> Self {
+impl FsBranch {
+    /// Create a branch with temporary on-disk COW storage.
+    pub fn create(workdir: impl AsRef<Path>) -> Result<Self, BranchError> {
+        SeccompCowBranch::create(workdir.as_ref(), None, 0).map(Self::new)
+    }
+
+    pub(crate) fn new(mut branch: SeccompCowBranch) -> Self {
+        branch.track_conflicts();
         Self {
             workdir: branch.workdir().to_path_buf(),
             upper_dir: branch.upper_dir().to_path_buf(),
@@ -72,6 +79,12 @@ impl PendingBranch {
         &self.workdir
     }
 
+    /// Alias for [`FsBranch::workdir`] that describes its role as the lower
+    /// COW layer.
+    pub fn lower_dir(&self) -> &Path {
+        &self.workdir
+    }
+
     /// On-disk upper directory containing staged file additions and writes.
     ///
     /// The directory is removed after commit, abort, or dropping a pending
@@ -85,7 +98,16 @@ impl PendingBranch {
         self.pending()?.changes()
     }
 
+    /// Paths whose lower-layer state changed after this branch first modified
+    /// them. An empty result means no write conflict was detected.
+    pub fn conflicts(&self) -> Result<Vec<PathBuf>, BranchError> {
+        Ok(self.pending()?.conflicts())
+    }
+
     /// Merge this branch into its workdir.
+    ///
+    /// The merge is rejected before writing when [`FsBranch::conflicts`]
+    /// reports a lower-layer change.
     ///
     /// A failed commit leaves the handle pending so the caller can inspect,
     /// retry, or abort it. The merge is not atomic: a failure may occur after
@@ -114,11 +136,21 @@ impl PendingBranch {
     fn pending_mut(&mut self) -> Result<&mut SeccompCowBranch, BranchError> {
         self.inner.as_mut().ok_or(BranchError::AlreadyResolved)
     }
+
+    pub(crate) fn take_cow(&mut self) -> Result<SeccompCowBranch, BranchError> {
+        self.inner.take().ok_or(BranchError::AlreadyResolved)
+    }
+
+    pub(crate) fn replace_cow(&mut self, branch: SeccompCowBranch) {
+        self.workdir = branch.workdir().to_path_buf();
+        self.upper_dir = branch.upper_dir().to_path_buf();
+        self.inner = Some(branch);
+    }
 }
 
-impl fmt::Debug for PendingBranch {
+impl fmt::Debug for FsBranch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PendingBranch")
+        f.debug_struct("FsBranch")
             .field("workdir", &self.workdir)
             .field("upper_dir", &self.upper_dir)
             .field("state", &self.state)
@@ -126,13 +158,17 @@ impl fmt::Debug for PendingBranch {
     }
 }
 
-impl Drop for PendingBranch {
+impl Drop for FsBranch {
     fn drop(&mut self) {
         if let Some(ref mut branch) = self.inner {
             let _ = branch.abort();
         }
     }
 }
+
+/// Backwards-compatible name for an [`FsBranch`] returned by
+/// [`crate::Sandbox::run_pending`].
+pub type PendingBranch = FsBranch;
 
 #[cfg(test)]
 mod tests {

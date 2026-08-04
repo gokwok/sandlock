@@ -106,3 +106,57 @@ async fn pending_branch_drop_aborts() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+#[tokio::test]
+async fn fs_branch_reuses_changes_and_detects_write_conflicts() {
+    let workdir = temp_dir("reuse");
+    let mut sandbox = sandbox(&workdir);
+    let mut branch_a = sandbox.create_fs_branch().unwrap();
+    let mut branch_b = sandbox.create_fs_branch().unwrap();
+    let mut conflicting = sandbox.create_fs_branch().unwrap();
+
+    let a_path = workdir.join("a.txt");
+    let b_path = workdir.join("b.txt");
+    let write_a = format!("printf first > {}", a_path.display());
+    if let Err(e) = sandbox.run_in_branch(&mut branch_a, &["sh", "-c", &write_a]).await {
+        eprintln!("FsBranch test skipped: {}", e);
+        let _ = fs::remove_dir_all(&workdir);
+        return;
+    }
+
+    let extend_a = format!(
+        "test \"$(cat {})\" = first && printf -- -second >> {}",
+        a_path.display(),
+        a_path.display(),
+    );
+    assert!(sandbox
+        .run_in_branch(&mut branch_a, &["sh", "-c", &extend_a])
+        .await
+        .unwrap()
+        .success());
+
+    let write_b = format!("printf independent > {}", b_path.display());
+    sandbox
+        .run_in_branch(&mut branch_b, &["sh", "-c", &write_b])
+        .await
+        .unwrap();
+    let overwrite_a = format!("printf conflicting > {}", a_path.display());
+    sandbox
+        .run_in_branch(&mut conflicting, &["sh", "-c", &overwrite_a])
+        .await
+        .unwrap();
+
+    branch_a.commit().unwrap();
+    branch_b.commit().unwrap();
+    assert_eq!(fs::read_to_string(&a_path).unwrap(), "first-second");
+    assert_eq!(fs::read_to_string(&b_path).unwrap(), "independent");
+
+    assert_eq!(conflicting.conflicts().unwrap(), vec![PathBuf::from("a.txt")]);
+    assert!(matches!(
+        conflicting.commit(),
+        Err(BranchError::Conflict(_))
+    ));
+    conflicting.abort().unwrap();
+
+    let _ = fs::remove_dir_all(&workdir);
+}

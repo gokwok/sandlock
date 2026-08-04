@@ -293,22 +293,16 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
-    /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
-    /// that shares one COW upper across all stages. When present, `do_create_stdio`
-    /// reuses this `CowState` (instead of building its own branch), and neither
-    /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
-    /// coordinator owns the single commit/abort. See [`SharedCow`].
+    /// Set when an external owner shares one COW upper with this sandbox. When
+    /// present, `do_create_stdio` reuses this `CowState`, and neither `wait()`
+    /// nor `Drop` takes or resolves the branch. See [`SharedCow`].
     shared_cow: Option<SharedCow>,
     // The interactive child took the terminal's foreground process group at
     // spawn; whoever reaps it must hand the foreground back to this process.
     tty_foreground_taken: bool,
 }
 
-/// A COW branch (one `upper` over the workdir) shared by every stage of a
-/// [`Transaction`](crate::transaction::Transaction). Cloned into each stage's
-/// `Runtime` so sequential stages accumulate writes in the same upper
-/// (read-committed), while the coordinator retains the original to commit/abort
-/// once at the end.
+/// A COW branch shared across sequential sandbox runs.
 #[derive(Clone)]
 pub(crate) struct SharedCow {
     /// The shared supervisor COW state (holds the single `SeccompCowBranch`).
@@ -318,6 +312,22 @@ pub(crate) struct SharedCow {
     /// EXECUTE against a file's real path, which for anything written inside the
     /// workdir is the upper. Cached here to avoid locking `state` to read it.
     pub(crate) upper_dir: PathBuf,
+}
+
+impl SharedCow {
+    pub(crate) fn new(branch: crate::cow::seccomp::SeccompCowBranch) -> Self {
+        let upper_dir = branch.upper_dir().to_path_buf();
+        let mut cow = crate::seccomp::state::CowState::new();
+        cow.branch = Some(branch);
+        Self {
+            state: Arc::new(tokio::sync::Mutex::new(cow)),
+            upper_dir,
+        }
+    }
+
+    pub(crate) async fn take_branch(&self) -> Option<crate::cow::seccomp::SeccompCowBranch> {
+        self.state.lock().await.branch.take()
+    }
 }
 
 /// Lifecycle state for the runtime.
@@ -1281,17 +1291,80 @@ impl Sandbox {
         &mut self,
         cmd: &[&str],
     ) -> Result<crate::branch::PendingRunResult, crate::error::SandlockError> {
+        let mut branch = self.create_fs_branch()?;
+        let run_result = self.run_in_branch(&mut branch, cmd).await?;
+        Ok(crate::branch::PendingRunResult { run_result, branch })
+    }
+
+    /// Create a reusable filesystem branch using this sandbox's workdir,
+    /// storage directory, and disk quota.
+    pub fn create_fs_branch(
+        &self,
+    ) -> Result<crate::branch::FsBranch, crate::error::SandlockError> {
         use crate::error::{BranchError, SandboxRuntimeError};
 
-        if self.workdir.is_none() || self.no_supervisor {
+        let workdir = self.workdir.as_deref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        if self.no_supervisor {
             return Err(SandboxRuntimeError::Branch(BranchError::Unavailable).into());
         }
+        let branch = crate::cow::seccomp::SeccompCowBranch::create(
+            workdir,
+            self.fs_storage.as_deref(),
+            self.max_disk.map(|size| size.0).unwrap_or(0),
+        )
+        .map_err(SandboxRuntimeError::Branch)?;
+        Ok(crate::branch::FsBranch::new(branch))
+    }
 
-        self.do_create(cmd, true).await?;
-        self.do_start()?;
-        let run_result = self.wait().await?;
-        let branch = self.take_pending_branch()?;
-        Ok(crate::branch::PendingRunResult { run_result, branch })
+    /// Run one command against an existing filesystem branch.
+    ///
+    /// The branch remains reusable after the command exits, so later commands
+    /// can observe its staged filesystem changes. Exit/error branch actions
+    /// are not applied; the caller owns the explicit commit/abort decision.
+    pub async fn run_in_branch(
+        &mut self,
+        branch: &mut crate::branch::FsBranch,
+        cmd: &[&str],
+    ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        let workdir = self.workdir.as_deref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?
+            .canonicalize()
+            .map_err(SandboxRuntimeError::Io)?;
+        if branch.workdir() != workdir {
+            return Err(SandboxRuntimeError::Branch(BranchError::Conflict(format!(
+                "branch lower {} does not match workdir {}",
+                branch.workdir().display(), workdir.display(),
+            ))).into());
+        }
+
+        let cow = branch.take_cow().map_err(SandboxRuntimeError::Branch)?;
+        let shared = SharedCow::new(cow);
+        if let Err(error) = self.set_shared_cow(shared.clone()) {
+            branch.replace_cow(
+                shared.take_branch().await
+                    .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?,
+            );
+            return Err(error);
+        }
+
+        let result = async {
+            self.do_create(cmd, true).await?;
+            self.do_start()?;
+            self.wait().await
+        }.await;
+
+        branch.replace_cow(
+            shared.take_branch().await
+                .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?,
+        );
+        if result.is_ok() {
+            self.fs_readable.retain(|path| path != branch.upper_dir());
+            self.runtime = None;
+        }
+        result
     }
 
     /// Detach the completed COW branch from this sandbox.
@@ -1302,6 +1375,12 @@ impl Sandbox {
     pub fn take_pending_branch(
         &mut self,
     ) -> Result<crate::branch::PendingBranch, crate::error::SandlockError> {
+        self.take_seccomp_branch().map(crate::branch::PendingBranch::new)
+    }
+
+    fn take_seccomp_branch(
+        &mut self,
+    ) -> Result<crate::cow::seccomp::SeccompCowBranch, crate::error::SandlockError> {
         use crate::error::{BranchError, SandboxRuntimeError};
 
         let branch = {
@@ -1320,7 +1399,7 @@ impl Sandbox {
         let upper_dir = branch.upper_dir().to_path_buf();
         self.fs_readable.retain(|path| path != &upper_dir);
         self.runtime = None;
-        Ok(crate::branch::PendingBranch::new(branch))
+        Ok(branch)
     }
 
     /// Run with inherited stdio (interactive mode).
@@ -1654,10 +1733,10 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Attach a transaction's shared COW branch to this sandbox before `create`.
-    /// The stage reuses the shared upper instead of building its own, and leaves
-    /// commit/abort to the transaction coordinator. Internal — used only by
-    /// [`Transaction`](crate::transaction::Transaction).
+    /// Attach a caller-owned shared COW branch before `create`.
+    ///
+    /// The sandbox reuses the shared upper instead of building its own and
+    /// leaves commit/abort to the transaction or filesystem-branch owner.
     pub(crate) fn set_shared_cow(&mut self, shared: SharedCow) -> Result<(), crate::error::SandlockError> {
         self.ensure_runtime()?;
         self.rt_mut().shared_cow = Some(shared);
@@ -1697,7 +1776,11 @@ impl Sandbox {
         self.do_create_stdio(cmd, stdio).await
     }
 
-    async fn do_create_stdio(&mut self, cmd: &[&str], stdio: StdioSpec) -> Result<(), crate::error::SandlockError> {
+    async fn do_create_stdio(
+        &mut self,
+        cmd: &[&str],
+        stdio: StdioSpec,
+    ) -> Result<(), crate::error::SandlockError> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
@@ -2512,8 +2595,11 @@ impl Drop for Sandbox {
                 rt.state,
                 RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0))
             );
-            let action = if is_error { &self.on_error } else { &self.on_exit };
-            let action = action.clone();
+            let action = if is_error {
+                self.on_error.clone()
+            } else {
+                self.on_exit.clone()
+            };
 
             if let Some(ref mut cow) = rt.seccomp_cow {
                 match action {
