@@ -244,6 +244,8 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// piped run taking the foreground demotes the embedding process to a
     /// background job, and its next tty read stops it with SIGTTIN.
     pub foreground: bool,
+    /// The caller already created a new session and process group for a PTY.
+    pub session_created: bool,
 }
 
 /// Set the calling thread/process name (`/proc/<pid>/comm`, shown by `ps`). The
@@ -291,6 +293,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         extra_syscalls,
         parent_pid,
         foreground,
+        session_created,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -304,7 +307,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     use std::io::Write;
 
     // 1. New process group
-    if unsafe { libc::setpgid(0, 0) } != 0 {
+    if !session_created && unsafe { libc::setpgid(0, 0) } != 0 {
         fail!("setpgid");
     }
 

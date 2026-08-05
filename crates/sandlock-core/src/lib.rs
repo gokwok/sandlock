@@ -41,7 +41,8 @@ pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
 pub use sandbox::{
-    BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
+    BindPorts, Confinement, ConfinementBuilder, PauseGuard, Process, Sandbox, SandboxBuilder,
+    StdioMode,
 };
 pub use result::{RunResult, ExitStatus};
 pub use branch::{BranchState, FsBranch, PendingBranch, PendingRunResult};

@@ -287,6 +287,8 @@ struct Runtime {
     ctrl_fd: Option<std::os::fd::OwnedFd>,
     stdout_pipe: Option<std::os::fd::OwnedFd>,
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
+    /// PTY slave used to create a controlling terminal in the child.
+    pty_slave: Option<i32>,
     extra_fds: Vec<(i32, i32)>,
     http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
     #[allow(clippy::type_complexity)]
@@ -648,6 +650,32 @@ impl Clone for Sandbox {
     }
 }
 
+/// Proof that a sandbox process group reached a stable stopped state.
+///
+/// Dropping the guard resumes the process group.
+#[must_use = "dropping the pause guard immediately resumes the process group"]
+pub struct PauseGuard<'a> {
+    sandbox: &'a mut Sandbox,
+    active: bool,
+}
+
+impl PauseGuard<'_> {
+    /// Resume the process group explicitly.
+    pub fn resume(mut self) -> Result<(), crate::error::SandlockError> {
+        self.sandbox.resume()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for PauseGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.sandbox.resume();
+        }
+    }
+}
+
 impl Sandbox {
     pub fn builder() -> SandboxBuilder {
         SandboxBuilder::default()
@@ -775,6 +803,55 @@ impl Sandbox {
         }
         self.rt_mut().state = RuntimeState::Running;
         Ok(())
+    }
+
+    /// Stop the process group and wait until every visible member is stopped.
+    ///
+    /// The returned guard resumes the group on drop. This provides the stable
+    /// quiescence point needed before publishing a filesystem branch.
+    pub async fn pause_and_wait(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<PauseGuard<'_>, crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+
+        let pid = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.child_pid)
+            .ok_or(SandboxRuntimeError::NotRunning)?;
+        self.pause()?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stable_samples = 0_u8;
+        loop {
+            match process_group_is_stopped(pid) {
+                Ok(true) => {
+                    stable_samples += 1;
+                    if stable_samples >= 2 {
+                        return Ok(PauseGuard {
+                            sandbox: self,
+                            active: true,
+                        });
+                    }
+                }
+                Ok(false) => {
+                    stable_samples = 0;
+                    let _ = unsafe { libc::killpg(pid, libc::SIGSTOP) };
+                }
+                Err(error) => {
+                    let _ = self.resume();
+                    return Err(SandboxRuntimeError::Io(error).into());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.resume();
+                return Err(SandboxRuntimeError::Child(
+                    "process group did not stop before the pause deadline".into(),
+                )
+                .into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Send SIGKILL to the child's process group.
@@ -971,6 +1048,18 @@ impl Sandbox {
         self.do_create(cmd, false).await
     }
 
+    /// Like [`Sandbox::create_interactive`], but gives the child a dedicated
+    /// controlling PTY whose slave fd becomes stdin, stdout, and stderr.
+    pub async fn create_with_pty(
+        &mut self,
+        cmd: &[&str],
+        pty_slave: std::os::fd::RawFd,
+    ) -> Result<(), crate::error::SandlockError> {
+        self.ensure_runtime()?;
+        self.rt_mut().pty_slave = Some(pty_slave);
+        self.do_create(cmd, false).await
+    }
+
     /// Release a previously `create()`d child to `execve` the configured
     /// command. Returns immediately; use `wait()` to collect the exit
     /// status when the child finishes.
@@ -992,6 +1081,18 @@ impl Sandbox {
     /// Like `spawn` but inherits stdio (no capture).
     pub async fn spawn_interactive(&mut self, cmd: &[&str]) -> Result<(), crate::error::SandlockError> {
         self.create_interactive(cmd).await?;
+        self.start()?;
+        self.wait_until_exec().await
+    }
+
+    /// Like [`Sandbox::spawn_interactive`], but runs in a dedicated controlling
+    /// PTY supplied by the caller.
+    pub async fn spawn_with_pty(
+        &mut self,
+        cmd: &[&str],
+        pty_slave: std::os::fd::RawFd,
+    ) -> Result<(), crate::error::SandlockError> {
+        self.create_with_pty(cmd, pty_slave).await?;
         self.start()?;
         self.wait_until_exec().await
     }
@@ -1125,9 +1226,11 @@ impl Sandbox {
 
     /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
     /// no longer matching `/proc/self/exe` (before execve the child still
-    /// shares the supervisor's binary). The kernel offers no direct event
-    /// for execve completion, so this polls every 1ms with a 5s ceiling.
-    async fn wait_until_exec(&self) -> Result<(), crate::error::SandlockError> {
+    /// shares the supervisor's binary). A child that exits between samples is
+    /// also considered released; [`Sandbox::wait`] retains and reports its
+    /// status. The kernel offers no direct exec event, so this polls every 1ms
+    /// with a 5s ceiling.
+    async fn wait_until_exec(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
         let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
         let Some(our_exe) = std::fs::read_link("/proc/self/exe").ok() else {
@@ -1140,6 +1243,9 @@ impl Sandbox {
                 if child_exe != our_exe {
                     return Ok(());
                 }
+            }
+            if child_has_exited(pid) {
+                return Ok(());
             }
             if std::time::Instant::now() >= deadline {
                 return Err(SandboxRuntimeError::Child(
@@ -1620,6 +1726,7 @@ impl Sandbox {
                 ctrl_fd: None,
                 stdout_pipe: pipe,
                 io_overrides: None,
+                pty_slave: None,
                 extra_fds: Vec::new(),
                 http_acl_handle: None,
                 on_bind: None,
@@ -1722,6 +1829,7 @@ impl Sandbox {
             ctrl_fd: None,
             stdout_pipe: None,
             io_overrides: None,
+            pty_slave: None,
             extra_fds: Vec::new(),
             http_acl_handle: None,
             on_bind: None,
@@ -1962,7 +2070,7 @@ impl Sandbox {
         // Interactive (fully inherited) stdio on a terminal: the child will
         // take the tty foreground group, and this process must take it back
         // once the child is reaped.
-        let foreground = stdio.all_inherit();
+        let foreground = stdio.all_inherit() && self.rt().pty_slave.is_none();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
         let pid = unsafe { libc::fork() };
@@ -1972,6 +2080,20 @@ impl Sandbox {
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
+            let session_created = if let Some(fd) = self.rt().pty_slave {
+                if unsafe { libc::setsid() } < 0
+                    || unsafe { libc::ioctl(fd, libc::TIOCSCTTY as _, 0) } < 0
+                    || unsafe { libc::tcsetpgrp(fd, libc::getpgrp()) } < 0
+                    || unsafe { libc::dup2(fd, 0) } < 0
+                    || unsafe { libc::dup2(fd, 1) } < 0
+                    || unsafe { libc::dup2(fd, 2) } < 0
+                {
+                    unsafe { libc::_exit(127) };
+                }
+                true
+            } else {
+                false
+            };
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
                 if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }
@@ -2044,6 +2166,7 @@ impl Sandbox {
                 extra_syscalls: &extra_syscalls,
                 parent_pid,
                 foreground,
+                session_created,
             });
         }
 
@@ -2866,6 +2989,53 @@ fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = file.read_to_end(&mut buf);
     buf
+}
+
+fn child_has_exited(pid: i32) -> bool {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        .is_some_and(|state| matches!(state.as_bytes().first(), Some(b'Z' | b'X')))
+}
+
+fn process_group_is_stopped(pgid: i32) -> std::io::Result<bool> {
+    let mut found = false;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<i32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
+            continue;
+        };
+        let mut fields = fields.split_whitespace();
+        let Some(state) = fields
+            .next()
+            .and_then(|field| field.as_bytes().first())
+            .copied()
+        else {
+            continue;
+        };
+        let _parent_pid = fields.next();
+        let Some(process_group) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+            continue;
+        };
+        if process_group == pgid {
+            found = true;
+            if !matches!(state, b'T' | b't' | b'Z' | b'X') {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
