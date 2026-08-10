@@ -191,7 +191,7 @@ The retained branch exposes:
 
 | Method | Result |
 |---|---|
-| `state()` | `BranchState::Pending`, `Committed`, `Aborted`, or `Persisted` |
+| `state()` | `BranchState::Pending`, `Committed`, `Aborted`, `Persisted`, `Attached`, or `Kept` |
 | `workdir()` | Lower directory that receives a successful commit |
 | `upper_dir()` | On-disk staging directory; removed after resolution |
 | `changes()` | Added, modified, and deleted paths relative to `workdir` |
@@ -199,6 +199,7 @@ The retained branch exposes:
 | `commit()` | Merge the branch into `workdir` |
 | `abort()` | Discard the branch |
 | `persist()` | Release the branch into durable storage for a later process |
+| `keep()` | Preserve the branch for manual recovery without merging it |
 | `reopen()` | Recover a branch returned by `persist()` |
 
 Change inspection is optional:
@@ -216,6 +217,10 @@ Calling `changes`, `commit`, or `abort` after the branch has been resolved
 returns `BranchError::AlreadyResolved`. A failed commit or abort leaves the
 handle in `BranchState::Pending`.
 
+If `persist()` or `keep()` publishes its recovery marker but a later directory
+sync fails, it returns `BranchError::Published` carrying the recovery record.
+The source handle is resolved because the marker is already claimable.
+
 ### Live process attachment
 
 `Sandbox::attach_fs_branch` moves an existing pending branch into the next
@@ -223,6 +228,15 @@ process created by that sandbox. This works with the ordinary interactive and
 PTY lifecycle APIs. After the process has stopped,
 `Sandbox::take_attached_fs_branch` returns the same branch with its accumulated
 changes. The caller must recover that handle before reusing the sandbox.
+The source handle reports `BranchState::Attached` during this interval.
+
+An on-disk `Attached` marker is an ownership warning, not a recoverable
+handoff. A controller must not reopen, apply, or remove it merely because the
+recorded PID exited: sandbox descendants can outlive that process and retain
+writable descriptors into the upper. `take_attached_fs_branch` first kills and
+drains the constrained process group before removing this warning. Dropping the
+sandbox preserves the upper and leaves the warning in place; recovery then
+requires operator proof that no descendant can still access it.
 
 ### Drop behavior
 

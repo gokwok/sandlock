@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::Path;
 
 pub(crate) struct DeletionSet {
@@ -70,16 +70,61 @@ fn sync_parent_dir(p: &Path) {
     }
 }
 
+pub(crate) fn read_complete(log_path: &Path) -> BTreeSet<String> {
+    let Ok(mut body) = fs::read(log_path) else {
+        return BTreeSet::new();
+    };
+    if body.last() != Some(&b'\n') {
+        let complete = body
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1);
+        body.truncate(complete);
+    }
+    String::from_utf8_lossy(&body)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(unescape)
+        .collect()
+}
+
 impl DeletionSet {
     /// Open a fresh set. `log_path` is opened for appending; `None`, or a
     /// path that cannot be created, gives a RAM-only set.
     pub fn create(log_path: Option<&Path>) -> Self {
         let log = log_path.and_then(|p| {
-            let f = fs::OpenOptions::new().create(true).append(true).open(p).ok()?;
+            let f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()?;
             sync_parent_dir(p);
             Some(f)
         });
-        Self { entries: BTreeSet::new(), log }
+        Self {
+            entries: BTreeSet::new(),
+            log,
+        }
+    }
+
+    /// Replace a stale append log with an authoritative deletion set.
+    pub fn replace(log_path: &Path, entries: impl IntoIterator<Item = String>) -> Self {
+        let entries = entries.into_iter().collect::<BTreeSet<_>>();
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .ok()
+            .and_then(|mut file| {
+                for entry in &entries {
+                    writeln!(file, "{}", escape(entry)).ok()?;
+                }
+                file.sync_data().ok()?;
+                sync_parent_dir(log_path);
+                Some(file)
+            });
+        Self { entries, log }
     }
 
     /// Rebuild a set from an existing log and reopen the log for append.
@@ -93,14 +138,7 @@ impl DeletionSet {
     // future sweep that has to recover a branch whose marker is missing.
     #[allow(dead_code)]
     pub fn load(log_path: &Path) -> Self {
-        let mut entries = BTreeSet::new();
-        if let Ok(f) = fs::File::open(log_path) {
-            for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-                if !line.is_empty() {
-                    entries.insert(unescape(&line));
-                }
-            }
-        }
+        let entries = read_complete(log_path);
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)

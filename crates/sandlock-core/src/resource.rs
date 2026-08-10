@@ -97,10 +97,7 @@ pub(crate) async fn handle_fork(
         return NotifAction::Errno(EPERM);
     }
 
-    // Threads share their parent's process slot — don't count, allow.
-    if is_thread_create(notif, notif_fd) {
-        return NotifAction::Continue;
-    }
+    let creates_thread = is_thread_create(notif, notif_fd);
 
     // Effective process limit. A policy_fn can tighten the static limit at
     // runtime (`restrict_max_processes`), so read the live value when a
@@ -119,6 +116,12 @@ pub(crate) async fn handle_fork(
     if rs.hold_forks {
         rs.held_notif_ids.push(notif.id);
         return NotifAction::Hold;
+    }
+
+    // Threads share their parent's process slot, but the freeze gate above
+    // must still hold their clone notification.
+    if creates_thread {
+        return NotifAction::Continue;
     }
 
     // Enforce concurrent process limit.
@@ -791,6 +794,16 @@ mod tests {
             assert!(fork_counted_on_continue(&vfork, fd));
             assert!(requires_process_creation_tracking(&vfork, fd, &argv_safety));
         }
+    }
+
+    #[tokio::test]
+    async fn freeze_gate_holds_thread_clone_notifications() {
+        let context = fake_supervisor_ctx(false);
+        context.resource.lock().await.hold_forks = true;
+        let notification = fake_notif(libc::SYS_clone, CLONE_THREAD);
+
+        let action = handle_fork(&notification, -1, &context, &fake_policy(false)).await;
+        assert!(matches!(action, NotifAction::Hold));
     }
 
     struct SharedFlags {

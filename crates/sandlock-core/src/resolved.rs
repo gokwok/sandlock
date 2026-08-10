@@ -45,6 +45,7 @@ pub(crate) struct SandboxFeatures {
     pub(crate) port_remap: bool,
     pub(crate) http_acl: bool,
     pub(crate) argv_safety_required: bool,
+    pub(crate) attached_execution: bool,
     pub(crate) sysv_ipc_allowed: bool,
     pub(crate) udp_or_icmp_allowed: bool,
     pub(crate) net_deny: bool,
@@ -83,6 +84,7 @@ impl SandboxFeatures {
             port_remap: sandbox.port_remap,
             http_acl,
             argv_safety_required: sandbox.policy_fn.is_some() || exec_handler,
+            attached_execution: sandbox.has_attached_execution(),
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
             udp_or_icmp_allowed: sandbox
                 .net_allow

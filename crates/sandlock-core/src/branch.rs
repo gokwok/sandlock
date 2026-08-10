@@ -19,6 +19,10 @@ pub enum BranchState {
     Aborted,
     /// The branch was persisted for a later process to reopen.
     Persisted,
+    /// The branch is temporarily owned by a sandbox process.
+    Attached,
+    /// The branch was preserved for manual recovery.
+    Kept,
 }
 
 /// A completed sandbox run whose COW filesystem changes await an explicit
@@ -138,10 +142,36 @@ impl FsBranch {
     /// resolved and [`FsBranch::reopen`] becomes the only supported way to
     /// continue using its staged changes.
     pub fn persist(&mut self) -> Result<PreservedBranch, BranchError> {
-        let preserved = self.pending_mut()?.persist_for_reopen()?;
-        self.inner = None;
-        self.state = BranchState::Persisted;
-        Ok(preserved)
+        match self.pending_mut()?.persist_for_reopen() {
+            Ok(preserved) => {
+                self.inner = None;
+                self.state = BranchState::Persisted;
+                Ok(preserved)
+            }
+            Err(error @ BranchError::Published { .. }) => {
+                self.inner = None;
+                self.state = BranchState::Persisted;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Preserve staged changes for manual recovery without merging them.
+    pub fn keep(&mut self) -> Result<PreservedBranch, BranchError> {
+        match self.pending_mut()?.keep_for_recovery() {
+            Ok(preserved) => {
+                self.inner = None;
+                self.state = BranchState::Kept;
+                Ok(preserved)
+            }
+            Err(error @ BranchError::Published { .. }) => {
+                self.inner = None;
+                self.state = BranchState::Kept;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Reopen a branch previously resolved with [`FsBranch::persist`].
@@ -158,13 +188,16 @@ impl FsBranch {
     }
 
     pub(crate) fn take_cow(&mut self) -> Result<SeccompCowBranch, BranchError> {
-        self.inner.take().ok_or(BranchError::AlreadyResolved)
+        let branch = self.inner.take().ok_or(BranchError::AlreadyResolved)?;
+        self.state = BranchState::Attached;
+        Ok(branch)
     }
 
     pub(crate) fn replace_cow(&mut self, branch: SeccompCowBranch) {
         self.workdir = branch.workdir().to_path_buf();
         self.upper_dir = branch.upper_dir().to_path_buf();
         self.inner = Some(branch);
+        self.state = BranchState::Pending;
     }
 }
 
@@ -305,6 +338,62 @@ mod tests {
             .iter()
             .any(|change| change.path == Path::new("deleted.txt")));
         reopened.abort().unwrap();
+    }
+
+    #[test]
+    fn reopen_uses_marker_deletions_instead_of_a_torn_log() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("foo"), "keep").unwrap();
+        fs::write(workdir.path().join("foobar"), "delete").unwrap();
+
+        let cow = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = FsBranch::new(cow);
+        branch.pending_mut().unwrap().mark_deleted("foobar");
+        let preserved = branch.persist().unwrap();
+        fs::write(preserved.branch_dir.join("deleted.log"), "foo").unwrap();
+
+        let mut reopened = FsBranch::reopen(preserved).unwrap();
+        reopened.commit().unwrap();
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("foo")).unwrap(),
+            "keep"
+        );
+        assert!(!workdir.path().join("foobar").exists());
+    }
+
+    #[test]
+    fn reopen_does_not_follow_upper_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cow = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = FsBranch::new(cow);
+        symlink(".", branch.upper_dir().join("loop")).unwrap();
+
+        let preserved = branch.persist().unwrap();
+        let mut reopened = FsBranch::reopen(preserved).unwrap();
+        reopened.abort().unwrap();
+    }
+
+    #[test]
+    fn keep_does_not_downgrade_an_interrupted_merge() {
+        let (_workdir, _storage, mut branch) = pending_branch();
+        branch
+            .pending_mut()
+            .unwrap()
+            .preserve_durable(crate::recovery::PreserveReason::MergeInterrupted)
+            .unwrap();
+
+        assert!(branch.keep().is_err());
+        assert_eq!(branch.state(), BranchState::Pending);
+        let preserved =
+            crate::recovery::read_preserved(branch.upper_dir().parent().unwrap()).unwrap();
+        assert_eq!(
+            preserved.reason,
+            crate::recovery::PreserveReason::MergeInterrupted
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ fn branch_errno(e: BranchError) -> i32 {
         BranchError::Deleted => libc::ENOENT,
         BranchError::Exists => libc::EEXIST,
         BranchError::Operation(_)
+        | BranchError::Published { .. }
         | BranchError::Conflict(_)
         | BranchError::NotReady
         | BranchError::Unavailable
@@ -85,20 +86,45 @@ pub enum CowOpenPlan {
     },
 }
 
-/// Recursively compute the total size of all files under `dir`.
+/// Compute the total size of all non-directory entries under `dir` without
+/// following symlinks.
 fn dir_size(dir: &Path) -> u64 {
     let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                total += dir_size(&path);
-            } else if let Ok(meta) = path.symlink_metadata() {
-                total += meta.len();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else if let Ok(metadata) = entry.path().symlink_metadata() {
+                    total += metadata.len();
+                }
             }
         }
     }
     total
+}
+
+/// Flush the staged tree before publishing a durable handoff marker.
+fn sync_tree(root: &Path) -> std::io::Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut directories = Vec::new();
+    while let Some(directory) = pending.pop() {
+        directories.push(directory.clone());
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                fs::File::open(entry.path())?.sync_all()?;
+            }
+        }
+    }
+    for directory in directories.into_iter().rev() {
+        sync_dir(&directory)?;
+    }
+    Ok(())
 }
 
 /// File name of the marker a preserved branch leaves in its storage dir. Lives
@@ -184,6 +210,10 @@ pub enum PreserveReason {
     Kept,
     /// The explicit branch owner persisted it for a later process to reopen.
     Detached,
+    /// A sandbox temporarily owns the branch. This is an ownership warning,
+    /// not a recoverable handoff: sandbox descendants may outlive the recorded
+    /// process and still hold writable descriptors into the upper.
+    Attached,
 }
 
 impl PreserveReason {
@@ -194,6 +224,7 @@ impl PreserveReason {
             PreserveReason::CommitDeferred => "commit-deferred",
             PreserveReason::Kept => "kept",
             PreserveReason::Detached => "detached",
+            PreserveReason::Attached => "attached",
         }
     }
 
@@ -203,6 +234,7 @@ impl PreserveReason {
             b"commit-deferred" => Some(PreserveReason::CommitDeferred),
             b"kept" => Some(PreserveReason::Kept),
             b"detached" => Some(PreserveReason::Detached),
+            b"attached" => Some(PreserveReason::Attached),
             _ => None,
         }
     }
@@ -324,12 +356,22 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
             _ => {}
         }
     }
+    let reason = reason?;
+    if reason == PreserveReason::Kept {
+        deleted.extend(
+            crate::cow::deletions::read_complete(&branch_dir.join("deleted.log"))
+                .into_iter()
+                .map(PathBuf::from),
+        );
+        deleted.sort();
+        deleted.dedup();
+    }
     Some(PreservedBranch {
         branch_dir: branch_dir.to_path_buf(),
         upper: upper?,
         workdir: workdir?,
         deleted,
-        reason: reason?,
+        reason,
         pid: pid?,
     })
 }
@@ -350,13 +392,13 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
 /// Unreadable entries are skipped rather than failing the sweep: one broken
 /// branch dir must not hide the rest.
 ///
-/// **A merge that is still running looks exactly like one that was
-/// interrupted.** `commit()` writes the [`PreserveReason::MergeInterrupted`]
-/// marker before its first destructive step — it has to, or a crash mid-merge
-/// would leave nothing to find — so for the duration of the merge the live
-/// branch is listed here. The marker's `pid` is the only thing that separates
-/// the two: a sweep that acts on a branch, rather than only reporting it, must
-/// check that pid is not a live process first.
+/// **A live merge or attachment is also listed.** `commit()` writes the
+/// [`PreserveReason::MergeInterrupted`] marker before its first destructive
+/// step, and attachment writes [`PreserveReason::Attached`] before transferring
+/// ownership to a sandbox. A sweep may act on a merge record after checking
+/// that its `pid` is no longer live. It must never apply, reopen, or remove an
+/// attached record: descendants can outlive that pid and retain access to the
+/// upper. An attached record is only evidence for operator-directed recovery.
 pub fn list_preserved(storage_base: &Path) -> Vec<PreservedBranch> {
     let mut found = Vec::new();
     if let Ok(rd) = fs::read_dir(storage_base) {
@@ -668,6 +710,11 @@ struct ReopenMetadata {
     base: HashMap<String, BaseStamp>,
 }
 
+struct MarkerWriteError {
+    error: std::io::Error,
+    published: bool,
+}
+
 impl BaseStamp {
     fn present(st: &libc::stat) -> Self {
         Self::Present {
@@ -754,21 +801,109 @@ impl SeccompCowBranch {
             max_disk_bytes: self.max_disk_bytes,
             base: self.base.clone().unwrap_or_default(),
         };
+        sync_tree(&self.upper)
+            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")))?;
         self.write_reopen_metadata(&metadata)?;
-        if let Err(error) = self.preserve_durable(PreserveReason::Detached) {
-            self.state = BranchState::Open;
-            return Err(BranchError::Operation(format!(
-                "persist branch marker: {error}"
-            )));
-        }
-        match read_preserved(&self.storage_dir) {
-            Some(preserved) => Ok(preserved),
-            None => {
+        let preserved = self.preserved_record(PreserveReason::Detached);
+        self.state = BranchState::Preserved(PreserveReason::Detached);
+        match self.write_preserved_marker(PreserveReason::Detached, true) {
+            Ok(()) => Ok(preserved),
+            Err(error) if error.published => Err(BranchError::Published {
+                preserved: Box::new(preserved),
+                message: error.error.to_string(),
+            }),
+            Err(error) => {
                 self.state = BranchState::Open;
-                Err(BranchError::Operation(
-                    "persisted branch marker could not be read back".to_string(),
-                ))
+                Err(BranchError::Operation(format!(
+                    "persist branch marker: {}",
+                    error.error
+                )))
             }
+        }
+    }
+
+    pub(crate) fn keep_for_recovery(&mut self) -> Result<PreservedBranch, BranchError> {
+        if self.state != BranchState::Open {
+            return Err(BranchError::Operation(
+                "only an uncommitted branch can be kept for recovery".to_string(),
+            ));
+        }
+        sync_tree(&self.upper)
+            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")))?;
+        let preserved = self.preserved_record(PreserveReason::Kept);
+        self.state = BranchState::Preserved(PreserveReason::Kept);
+        match self.write_preserved_marker(PreserveReason::Kept, true) {
+            Ok(()) => Ok(preserved),
+            Err(error) if error.published => Err(BranchError::Published {
+                preserved: Box::new(preserved),
+                message: error.error.to_string(),
+            }),
+            Err(error) => {
+                self.state = BranchState::Open;
+                Err(BranchError::Operation(format!(
+                    "keep branch marker: {}",
+                    error.error
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_attachment(&mut self) -> Result<(), BranchError> {
+        if self.state != BranchState::Open {
+            return Err(BranchError::Operation(
+                "only an uncommitted branch can be attached".to_string(),
+            ));
+        }
+        sync_tree(&self.upper)
+            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")))?;
+        match self.write_preserved_marker(PreserveReason::Attached, true) {
+            Ok(()) => {
+                self.state = BranchState::Preserved(PreserveReason::Attached);
+                Ok(())
+            }
+            Err(error) => {
+                if error.published {
+                    let _ = fs::remove_file(self.storage_dir.join(PRESERVED_MARKER));
+                }
+                Err(BranchError::Operation(format!(
+                    "prepare attached branch marker: {}",
+                    error.error
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn finish_attachment(&mut self) -> Result<(), BranchError> {
+        if self.state != BranchState::Preserved(PreserveReason::Attached) {
+            return Err(BranchError::Operation(
+                "branch is not attached to a sandbox".to_string(),
+            ));
+        }
+        match fs::remove_file(self.storage_dir.join(PRESERVED_MARKER)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(BranchError::Operation(format!(
+                    "remove attached marker: {error}"
+                )));
+            }
+        }
+        self.state = BranchState::Open;
+        // Unlink is the ownership-transfer point. Failure to fsync its parent
+        // can only leave a stale Attached warning after power loss; Attached
+        // records are deliberately never actionable recovery records.
+        let _ = sync_dir(&self.storage_dir);
+        Ok(())
+    }
+
+    fn preserved_record(&self, reason: PreserveReason) -> PreservedBranch {
+        PreservedBranch {
+            branch_dir: self.storage_dir.clone(),
+            upper: self.upper.clone(),
+            workdir: self.workdir.clone(),
+            deleted: self.outstanding_deletions().map(PathBuf::from).collect(),
+            reason,
+            pid: std::process::id(),
         }
     }
 
@@ -815,14 +950,19 @@ impl SeccompCowBranch {
             )));
         }
 
-        let mut deleted =
-            crate::cow::deletions::DeletionSet::load(&recorded.branch_dir.join("deleted.log"));
-        for path in &recorded.deleted {
-            let path = path.to_str().ok_or_else(|| {
-                BranchError::Operation("persisted deletion is not valid UTF-8".to_string())
-            })?;
-            deleted.insert(path);
-        }
+        let deleted = recorded
+            .deleted
+            .iter()
+            .map(|path| {
+                path.to_str().map(str::to_owned).ok_or_else(|| {
+                    BranchError::Operation("persisted deletion is not valid UTF-8".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let deleted = crate::cow::deletions::DeletionSet::replace(
+            &recorded.branch_dir.join("deleted.log"),
+            deleted,
+        );
         let has_changes = !metadata.base.is_empty()
             || deleted.iter().next().is_some()
             || fs::read_dir(&recorded.upper)
@@ -2486,7 +2626,9 @@ impl SeccompCowBranch {
     /// which preserves the changes for later inspection rather than merging or
     /// discarding them.
     pub(crate) fn keep(&mut self) {
-        self.preserve(PreserveReason::Kept);
+        if self.state == BranchState::Open {
+            self.preserve(PreserveReason::Kept);
+        }
     }
 
     /// Record that this branch's holder asked for `BranchAction::Keep`, so an
@@ -2542,6 +2684,7 @@ impl SeccompCowBranch {
     pub(crate) fn preserve_durable(&mut self, reason: PreserveReason) -> std::io::Result<()> {
         self.state = BranchState::Preserved(reason);
         self.write_preserved_marker(reason, true)
+            .map_err(|error| error.error)
     }
 
     /// Preserve as [`PreserveReason::CommitDeferred`] on a lock failure, but only
@@ -2568,8 +2711,8 @@ impl SeccompCowBranch {
     ///   `commit()` is documented and tested as retryable — and a plain
     ///   `fs::write` truncates in place, so a crash inside a rewrite loses a
     ///   marker that was already valid, over a workdir that may be half merged.
-    /// - **Durable** (`fsync` of the file, then of the storage dir, then
-    ///   best-effort of the base) when `durable`, for merge recovery and
+    /// - **Durable** (`fsync` of the file, then of the storage dir and base)
+    ///   when `durable`, for merge recovery and
     ///   explicit cross-process handoff.
     ///
     /// The file is fsynced BEFORE the rename: delayed allocation can otherwise
@@ -2581,12 +2724,16 @@ impl SeccompCowBranch {
     /// Scope of the guarantee, so it is not overclaimed: a SIGKILL or a panic
     /// leaves the page cache intact and the old unsynced write was already
     /// enough. These fsyncs change behaviour only on power loss or a kernel
-    /// panic — and there they make the RECORD durable while the upper it names
-    /// is written by `ensure_cow_copy` and by the child with no sync at all,
-    /// and the default storage base is `$XDG_RUNTIME_DIR` or `$TMPDIR`, i.e.
-    /// tmpfs, where the whole tree is gone anyway. They are meaningful with an
-    /// explicit disk-backed `fs_storage`, and inert without one.
-    fn write_preserved_marker(&self, reason: PreserveReason, durable: bool) -> std::io::Result<()> {
+    /// panic. Explicit branch persistence syncs the upper before this method;
+    /// merge recovery only makes the record durable because the child may have
+    /// written the upper without syncing it. The default storage base is
+    /// `$XDG_RUNTIME_DIR` or `$TMPDIR`, where the whole tree may be ephemeral;
+    /// the full guarantee requires an explicit disk-backed `fs_storage`.
+    fn write_preserved_marker(
+        &self,
+        reason: PreserveReason,
+        durable: bool,
+    ) -> Result<(), MarkerWriteError> {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
 
@@ -2614,6 +2761,7 @@ impl SeccompCowBranch {
         body.extend_from_slice(format!("\npid={}\n", std::process::id()).as_bytes());
 
         let tmp = self.storage_dir.join(PRESERVED_TMP);
+        let published = std::cell::Cell::new(false);
         let publish = || -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&body)?;
@@ -2623,12 +2771,12 @@ impl SeccompCowBranch {
             }
             drop(f);
             fs::rename(&tmp, self.storage_dir.join(PRESERVED_MARKER))?;
+            published.set(true);
             if durable {
                 sync_dir(&self.storage_dir)?;
                 // The branch dir's own name in the base `list_preserved` walks.
-                // Best-effort: an exotic `$TMPDIR` must not be able to fail a commit.
                 if let Some(base) = self.storage_dir.parent() {
-                    let _ = sync_dir(base);
+                    sync_dir(base)?;
                 }
             }
             Ok(())
@@ -2641,7 +2789,10 @@ impl SeccompCowBranch {
         // cleanup's.
         if let Err(e) = publish() {
             let _ = fs::remove_file(&tmp);
-            return Err(e);
+            return Err(MarkerWriteError {
+                error: e,
+                published: published.get(),
+            });
         }
         Ok(())
     }
@@ -6141,6 +6292,21 @@ mod tests {
         assert_eq!(p.upper, PathBuf::from("/s/upper"));
         assert_eq!(p.pid, 41);
         assert!(p.deleted.is_empty(), "no deletions were recorded, so there are none");
+    }
+
+    #[test]
+    fn attached_marker_never_claims_deletions_from_the_live_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PRESERVED_MARKER),
+            b"reason=attached\nworkdir=/w\nupper=/u\npid=41\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("deleted.log"), b"not-durable-in-marker\n").unwrap();
+
+        let preserved = read_preserved(dir.path()).unwrap();
+        assert_eq!(preserved.reason, PreserveReason::Attached);
+        assert!(preserved.deleted.is_empty());
     }
 
     /// Forward compatibility has two halves that must stay apart: an UNKNOWN

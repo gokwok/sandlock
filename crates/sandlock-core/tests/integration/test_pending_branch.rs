@@ -1,4 +1,6 @@
-use sandlock_core::{BranchError, BranchState, ChangeKind, Sandbox};
+use sandlock_core::{
+    read_preserved, BranchError, BranchState, ChangeKind, PreserveReason, Sandbox,
+};
 use std::fs;
 use std::path::PathBuf;
 
@@ -118,7 +120,10 @@ async fn fs_branch_reuses_changes_and_detects_write_conflicts() {
     let a_path = workdir.join("a.txt");
     let b_path = workdir.join("b.txt");
     let write_a = format!("printf first > {}", a_path.display());
-    if let Err(e) = sandbox.run_in_branch(&mut branch_a, &["sh", "-c", &write_a]).await {
+    if let Err(e) = sandbox
+        .run_in_branch(&mut branch_a, &["sh", "-c", &write_a])
+        .await
+    {
         eprintln!("FsBranch test skipped: {}", e);
         let _ = fs::remove_dir_all(&workdir);
         return;
@@ -151,7 +156,10 @@ async fn fs_branch_reuses_changes_and_detects_write_conflicts() {
     assert_eq!(fs::read_to_string(&a_path).unwrap(), "first-second");
     assert_eq!(fs::read_to_string(&b_path).unwrap(), "independent");
 
-    assert_eq!(conflicting.conflicts().unwrap(), vec![PathBuf::from("a.txt")]);
+    assert_eq!(
+        conflicting.conflicts().unwrap(),
+        vec![PathBuf::from("a.txt")]
+    );
     assert!(matches!(
         conflicting.commit(),
         Err(BranchError::Conflict(_))
@@ -167,6 +175,7 @@ async fn attached_branch_returns_after_the_process_stops() {
     let mut sandbox = sandbox(&workdir);
     let mut branch = sandbox.create_fs_branch().unwrap();
     sandbox.attach_fs_branch(&mut branch).unwrap();
+    assert_eq!(branch.state(), BranchState::Attached);
 
     let path = workdir.join("attached.txt");
     let command = format!("printf attached > {}", path.display());
@@ -178,6 +187,7 @@ async fn attached_branch_returns_after_the_process_stops() {
     }
 
     let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    assert_eq!(branch.state(), BranchState::Pending);
     assert!(!path.exists());
     assert!(branch
         .changes()
@@ -187,5 +197,60 @@ async fn attached_branch_returns_after_the_process_stops() {
     branch.commit().unwrap();
     assert_eq!(fs::read_to_string(path).unwrap(), "attached");
 
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+#[tokio::test]
+async fn attached_branch_waits_for_background_descendants_before_returning() {
+    let workdir = temp_dir("attached-descendant");
+    let mut sandbox = sandbox(&workdir);
+    let mut branch = sandbox.create_fs_branch().unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+
+    let path = workdir.join("daemon.txt");
+    let command = format!(
+        "if setsid true 2>/dev/null; then exit 99; fi; printf first > {0}; (exec </dev/null >/dev/null 2>&1; while :; do printf x >> {0}; sleep 0.01; done) &",
+        path.display()
+    );
+    let result = match sandbox.run(&["sh", "-c", &command]).await {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("Attached FsBranch descendant test skipped: {error}");
+            let _ = fs::remove_dir_all(&workdir);
+            return;
+        }
+    };
+    assert_eq!(result.exit_status, sandlock_core::ExitStatus::Code(0));
+
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    assert!(!sandbox
+        .extra_deny_syscalls
+        .iter()
+        .any(|name| name == "setsid" || name == "setpgid"));
+    let staged = branch.upper_dir().join("daemon.txt");
+    let size = fs::metadata(&staged).unwrap().len();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(fs::metadata(&staged).unwrap().len(), size);
+    branch.abort().unwrap();
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+#[test]
+fn dropping_sandbox_leaves_an_attached_recovery_warning() {
+    let workdir = temp_dir("attached-drop");
+    let mut sandbox = sandbox(&workdir);
+    let mut branch = sandbox.create_fs_branch().unwrap();
+    let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+    assert_eq!(
+        read_preserved(&branch_dir).unwrap().reason,
+        PreserveReason::Attached
+    );
+
+    drop(sandbox);
+
+    let preserved = read_preserved(&branch_dir).unwrap();
+    assert_eq!(preserved.reason, PreserveReason::Attached);
+    let _ = fs::remove_dir_all(&branch_dir);
     let _ = fs::remove_dir_all(&workdir);
 }

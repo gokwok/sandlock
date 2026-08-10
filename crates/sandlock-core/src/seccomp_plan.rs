@@ -337,10 +337,12 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     // Bare fork(2) carries none of the namespace/process-limit risk of
     // clone/clone3 and was historically left out of the BPF filter so
     // hot fork-loops (COW map-reduce) bypass the supervisor entirely.
-    // It only needs interception when argv safety is required, so the
-    // supervisor can register the new child via ptrace fork events before
-    // user code can mutate argv observed by policy_fn or exec handlers.
-    if features.argv_safety_required {
+    // Intercept it when argv safety is required, so the supervisor can
+    // register the new child via ptrace fork events before user code can
+    // mutate argv observed by policy_fn or exec handlers. Attached executions
+    // also intercept it so branch detachment can hold every process creation
+    // path while proving the execution domain is quiescent.
+    if features.argv_safety_required || features.attached_execution {
         nrs.push_optional(arch::sys_fork());
     }
 
@@ -433,10 +435,16 @@ fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
             None => vec![name.as_str()],
         }
     });
+    let execution_denies = policy
+        .has_attached_execution()
+        .then_some(["setsid", "setpgid"])
+        .into_iter()
+        .flatten();
     let mut set: SysnoSet = base
         .iter()
         .copied()
         .chain(extra_denies)
+        .chain(execution_denies)
         .filter_map(|n| n.parse::<Sysno>().ok())
         .collect();
     if !policy.allows_sysv_ipc() {

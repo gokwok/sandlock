@@ -112,6 +112,12 @@ pub enum BranchError {
     #[error("branch operation failed: {0}")]
     Operation(String),
 
+    #[error("branch was published but durability could not be confirmed: {message}")]
+    Published {
+        preserved: Box<crate::recovery::PreservedBranch>,
+        message: String,
+    },
+
     #[error("branch conflict: {0}")]
     Conflict(String),
 

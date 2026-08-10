@@ -13,14 +13,16 @@
 //! work, which is why this lives in its own module rather than under
 //! `transaction`.
 //!
-//! # A running merge looks like an interrupted one
+//! # Live recovery records
 //!
 //! [`list_preserved`] reports every preserved branch under a storage base,
-//! including a merge that is *still running*: a commit writes its
-//! [`PreserveReason::MergeInterrupted`] marker before the first destructive
-//! step. The marker's [`pid`](PreservedBranch::pid) is what separates the two —
-//! a sweep that *acts* on a branch, rather than only reporting it, must check
-//! that pid is not a live process first.
+//! including a merge that is *still running* and a branch attached to a live
+//! sandbox. These are marked [`PreserveReason::MergeInterrupted`] and
+//! [`PreserveReason::Attached`], respectively. A sweep may act on a merge only
+//! after checking that its [`pid`](PreservedBranch::pid) is no longer live. It
+//! must never act on an attached record: descendants can outlive the recorded
+//! process and retain writable descriptors into the branch. Attached records
+//! are conservative ownership warnings for operator-directed recovery only.
 //!
 //! # Durability of the default storage
 //!

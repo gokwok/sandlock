@@ -299,6 +299,9 @@ struct Runtime {
     /// present, `do_create_stdio` reuses this `CowState`, and neither `wait()`
     /// nor `Drop` takes or resolves the branch. See [`SharedCow`].
     shared_cow: Option<SharedCow>,
+    /// This shared branch came from the public attachment lifecycle and must
+    /// not be returned until the entire execution domain is quiescent.
+    attached_execution: bool,
     // The interactive child took the terminal's foreground process group at
     // spawn; whoever reaps it must hand the foreground back to this process.
     tty_foreground_taken: bool,
@@ -329,6 +332,10 @@ impl SharedCow {
 
     pub(crate) async fn take_branch(&self) -> Option<crate::cow::seccomp::SeccompCowBranch> {
         self.state.lock().await.branch.take()
+    }
+
+    pub(crate) async fn replace_branch(&self, branch: crate::cow::seccomp::SeccompCowBranch) {
+        self.state.lock().await.branch = Some(branch);
     }
 }
 
@@ -984,7 +991,9 @@ impl Sandbox {
         }
 
         let rt = self.rt_mut();
-        if let Some(h) = rt.notif_handle.take() { h.abort(); }
+        if !rt.attached_execution {
+            if let Some(h) = rt.notif_handle.take() { h.abort(); }
+        }
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
         if let Some(h) = rt.control_handle.take() { h.abort(); }
@@ -1459,8 +1468,16 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
         }
 
-        let cow = branch.take_cow().map_err(SandboxRuntimeError::Branch)?;
+        let mut cow = branch.take_cow().map_err(SandboxRuntimeError::Branch)?;
+        if let Err(error) = cow.prepare_attachment() {
+            branch.replace_cow(cow);
+            return Err(SandboxRuntimeError::Branch(error).into());
+        }
+        // An attached branch cannot be returned while a daemonized descendant
+        // still writes its upper. Keep the execution in one process group so
+        // take_attached_fs_branch can quiesce the complete domain.
         self.rt_mut().shared_cow = Some(SharedCow::new(cow));
+        self.rt_mut().attached_execution = true;
         Ok(())
     }
 
@@ -1480,17 +1497,31 @@ impl Sandbox {
         {
             return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
         }
+        if let Some(pid) = runtime.child_pid {
+            quiesce_process_group(pid, runtime.supervisor_resource.as_ref())
+                .await
+                .map_err(SandboxRuntimeError::Io)?;
+        }
         let shared = runtime
             .shared_cow
             .clone()
             .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
-        let branch = shared
+        let mut branch = shared
             .take_branch()
             .await
             .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        if let Err(error) = branch.finish_attachment() {
+            shared.replace_branch(branch).await;
+            return Err(SandboxRuntimeError::Branch(error).into());
+        }
         let upper_dir = branch.upper_dir().to_path_buf();
         self.fs_readable.retain(|path| path != &upper_dir);
-        self.runtime = None;
+        if let Some(mut runtime) = self.runtime.take() {
+            if let Some(handle) = runtime.notif_handle.take() { handle.abort(); }
+            if let Some(handle) = runtime.throttle_handle.take() { handle.abort(); }
+            if let Some(handle) = runtime.loadavg_handle.take() { handle.abort(); }
+            if let Some(handle) = runtime.control_handle.take() { handle.abort(); }
+        }
         Ok(crate::branch::FsBranch::new(branch))
     }
 
@@ -1504,43 +1535,18 @@ impl Sandbox {
         branch: &mut crate::branch::FsBranch,
         cmd: &[&str],
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        use crate::error::{BranchError, SandboxRuntimeError};
-
-        let workdir = self.workdir.as_deref()
-            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?
-            .canonicalize()
-            .map_err(SandboxRuntimeError::Io)?;
-        if branch.workdir() != workdir {
-            return Err(SandboxRuntimeError::Branch(BranchError::Conflict(format!(
-                "branch lower {} does not match workdir {}",
-                branch.workdir().display(), workdir.display(),
-            ))).into());
-        }
-
-        let cow = branch.take_cow().map_err(SandboxRuntimeError::Branch)?;
-        let shared = SharedCow::new(cow);
-        if let Err(error) = self.set_shared_cow(shared.clone()) {
-            branch.replace_cow(
-                shared.take_branch().await
-                    .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?,
-            );
-            return Err(error);
-        }
+        self.attach_fs_branch(branch)?;
 
         let result = async {
             self.do_create(cmd, true).await?;
             self.do_start()?;
             self.wait().await
         }.await;
-
-        branch.replace_cow(
-            shared.take_branch().await
-                .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?,
-        );
-        if result.is_ok() {
-            self.fs_readable.retain(|path| path != branch.upper_dir());
-            self.runtime = None;
+        if result.is_err() && self.pid().is_some() {
+            let _ = self.kill();
+            let _ = self.wait().await;
         }
+        *branch = self.take_attached_fs_branch().await?;
         result
     }
 
@@ -1804,6 +1810,7 @@ impl Sandbox {
                 handlers: Vec::new(),
                 ready_w: None,
                 shared_cow: None,
+                attached_execution: false,
                 tty_foreground_taken: false,
                 control_handle: None,
                 control_dir: None,
@@ -1868,6 +1875,12 @@ impl Sandbox {
         !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
     }
 
+    pub(crate) fn has_attached_execution(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.attached_execution)
+    }
+
     /// Lazily initialize the runtime block.
     ///
     /// Called by lifecycle methods (`spawn`, `run`, `fork`, etc.) on first
@@ -1907,6 +1920,7 @@ impl Sandbox {
             handlers: Vec::new(),
             ready_w: None,
             shared_cow: None,
+            attached_execution: false,
             tty_foreground_taken: false,
         }));
         Ok(())
@@ -2757,6 +2771,13 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
+                // Attached executions prohibit changing process groups. Kill
+                // remaining descendants even when the top-level child was
+                // already reaped; the Attached marker remains non-actionable
+                // if teardown cannot prove the complete group is gone.
+                if rt.attached_execution {
+                    unsafe { libc::killpg(pid, libc::SIGKILL) };
+                }
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
                     unsafe { libc::killpg(pid, libc::SIGKILL) };
                     let mut status: i32 = 0;
@@ -3072,41 +3093,109 @@ fn child_has_exited(pid: i32) -> bool {
         .is_some_and(|state| matches!(state.as_bytes().first(), Some(b'Z' | b'X')))
 }
 
-fn process_group_is_stopped(pgid: i32) -> std::io::Result<bool> {
-    let mut found = false;
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().parse::<i32>().is_err() {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessGroupState {
+    Empty,
+    Stopped,
+    Running,
+}
+
+fn process_group_state(pgid: i32) -> std::io::Result<ProcessGroupState> {
+    let mut found_live = false;
+    for process in std::fs::read_dir("/proc")? {
+        let process = process?;
+        if process.file_name().to_string_lossy().parse::<i32>().is_err() {
             continue;
         }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
+        let tasks = match std::fs::read_dir(process.path().join("task")) {
+            Ok(tasks) => tasks,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
-            continue;
-        };
-        let mut fields = fields.split_whitespace();
-        let Some(state) = fields
-            .next()
-            .and_then(|field| field.as_bytes().first())
-            .copied()
-        else {
-            continue;
-        };
-        let _parent_pid = fields.next();
-        let Some(process_group) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
-            continue;
-        };
-        if process_group == pgid {
-            found = true;
-            if !matches!(state, b'T' | b't' | b'Z' | b'X') {
-                return Ok(false);
+        for task in tasks {
+            let task = task?;
+            let stat = match std::fs::read_to_string(task.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
+                continue;
+            };
+            let mut fields = fields.split_whitespace();
+            let Some(state) = fields
+                .next()
+                .and_then(|field| field.as_bytes().first())
+                .copied()
+            else {
+                continue;
+            };
+            let _parent_pid = fields.next();
+            let process_group = fields.next().and_then(|field| field.parse::<i32>().ok());
+            if process_group != Some(pgid) || matches!(state, b'Z' | b'X') {
+                continue;
+            }
+            found_live = true;
+            if !matches!(state, b'T' | b't') {
+                return Ok(ProcessGroupState::Running);
             }
         }
     }
-    Ok(found)
+    Ok(if found_live {
+        ProcessGroupState::Stopped
+    } else {
+        ProcessGroupState::Empty
+    })
+}
+
+fn process_group_is_stopped(pgid: i32) -> std::io::Result<bool> {
+    Ok(process_group_state(pgid)? == ProcessGroupState::Stopped)
+}
+
+async fn quiesce_process_group(
+    pgid: i32,
+    resource: Option<&Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
+) -> std::io::Result<()> {
+    let resource = resource.ok_or_else(|| {
+        std::io::Error::other("sandbox process supervisor is unavailable during branch detach")
+    })?;
+    resource.lock().await.hold_forks = true;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut stable_snapshots = 0_u8;
+    loop {
+        unsafe { libc::killpg(pgid, libc::SIGSTOP) };
+        match process_group_state(pgid)? {
+            ProcessGroupState::Empty | ProcessGroupState::Stopped => {
+                stable_snapshots += 1;
+                if stable_snapshots >= 2 {
+                    break;
+                }
+            }
+            ProcessGroupState::Running => stable_snapshots = 0,
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sandbox process group did not stop before branch detach",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    loop {
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        if process_group_state(pgid)? == ProcessGroupState::Empty {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sandbox process group did not exit before branch detach",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
