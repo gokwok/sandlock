@@ -1,5 +1,5 @@
 use sandlock_core::{
-    read_preserved, BranchError, BranchState, ChangeKind, PreserveReason, Sandbox,
+    list_preserved, read_preserved, BranchError, BranchState, ChangeKind, PreserveReason, Sandbox,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -107,6 +107,65 @@ async fn pending_branch_drop_aborts() {
     }
 
     let _ = fs::remove_dir_all(&workdir);
+}
+
+#[tokio::test]
+async fn armed_running_branch_is_retained_when_the_sandbox_is_dropped() {
+    let workdir = temp_dir("armed-drop-work");
+    let storage = temp_dir("armed-drop-storage");
+    let signal = temp_dir("armed-drop-signal");
+    let mut sandbox = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write(&signal)
+        .workdir(&workdir)
+        .fs_storage(&storage)
+        .on_exit(sandlock_core::sandbox::BranchAction::Abort)
+        .on_error(sandlock_core::sandbox::BranchAction::Abort)
+        .build()
+        .unwrap();
+    let command = format!(
+        "printf staged > {}/staged.txt; printf ready > {}/ready; while :; do sleep 1; done",
+        workdir.display(),
+        signal.display()
+    );
+    if let Err(error) = sandbox.spawn(&["sh", "-c", &command]).await {
+        eprintln!("Armed branch Drop test skipped: {error}");
+        return;
+    }
+    sandbox.retain_branch_if_abandoned();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !signal.join("ready").exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(signal.join("ready").exists());
+    drop(sandbox);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let preserved = loop {
+        if let Some(branch) = list_preserved(&storage).into_iter().next() {
+            break branch;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(preserved.reason, PreserveReason::Kept);
+    assert_eq!(
+        fs::read_to_string(preserved.upper.join("staged.txt")).unwrap(),
+        "staged"
+    );
+
+    let _ = fs::remove_dir_all(preserved.branch_dir);
+    let _ = fs::remove_dir_all(workdir);
+    let _ = fs::remove_dir_all(storage);
+    let _ = fs::remove_dir_all(signal);
 }
 
 #[tokio::test]

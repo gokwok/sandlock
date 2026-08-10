@@ -682,7 +682,7 @@ pub struct SeccompCowBranch {
     /// What `Drop` does with a branch that was never disposed of: reclaim it
     /// (the default) or preserve it. Set from `BranchAction::Keep`, whose
     /// holder may never reach a disposition at all — see `Drop`.
-    keep_if_abandoned: bool,
+    keep_if_abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     max_disk_bytes: u64,
     disk_used: u64,
     base: Option<HashMap<String, BaseStamp>>,
@@ -783,7 +783,7 @@ impl SeccompCowBranch {
             applied_deletions: HashSet::new(),
             has_changes: false,
             state: BranchState::Open,
-            keep_if_abandoned: false,
+            keep_if_abandoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_disk_bytes,
             disk_used: 0,
             base: None,
@@ -994,7 +994,7 @@ impl SeccompCowBranch {
             applied_deletions: HashSet::new(),
             has_changes,
             state: BranchState::Open,
-            keep_if_abandoned: false,
+            keep_if_abandoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_disk_bytes: metadata.max_disk_bytes,
             disk_used,
             base: Some(metadata.base),
@@ -2652,7 +2652,10 @@ impl SeccompCowBranch {
     /// completed `wait()`, and a sandbox abandoned before that is exactly the
     /// case `Keep` exists for. Without this the branch's `Drop` would silently
     /// override the request and delete the upper.
-    pub(crate) fn set_keep_if_abandoned(&mut self, keep: bool) {
+    pub(crate) fn set_keep_if_abandoned(
+        &mut self,
+        keep: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         self.keep_if_abandoned = keep;
     }
 
@@ -2860,7 +2863,10 @@ impl Drop for SeccompCowBranch {
     /// never to a caller-supplied `fs_storage` base.
     fn drop(&mut self) {
         if self.state == BranchState::Open {
-            if self.keep_if_abandoned {
+            if self
+                .keep_if_abandoned
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
                 self.preserve(PreserveReason::Kept);
             } else {
                 self.cleanup();

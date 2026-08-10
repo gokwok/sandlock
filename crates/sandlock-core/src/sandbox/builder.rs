@@ -1033,6 +1033,9 @@ impl SandboxBuilder {
             name: self.name,
             init_fn: self.init_fn,
             work_fn: self.work_fn,
+            keep_branch_if_abandoned: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             runtime: None,
             restore_skipped: Vec::new(),
         })

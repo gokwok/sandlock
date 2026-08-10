@@ -557,6 +557,10 @@ pub struct Sandbox {
     #[serde(skip)]
     work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
 
+    /// Cancellation-safe disposition shared with the live COW branch.
+    #[serde(skip)]
+    keep_branch_if_abandoned: Arc<std::sync::atomic::AtomicBool>,
+
     // Heap-allocated runtime state; `None` when not started.
     #[serde(skip)]
     runtime: Option<Box<Runtime>>,
@@ -649,6 +653,7 @@ impl Clone for Sandbox {
             init_fn: None,
             // work_fn is Arc-wrapped — clone bumps the reference count.
             work_fn: self.work_fn.clone(),
+            keep_branch_if_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Runtime is NOT cloned — the clone starts with no runtime.
             runtime: None,
             // Restore diagnostics belong to the original's run, not the clone.
@@ -1881,6 +1886,19 @@ impl Sandbox {
             .is_some_and(|runtime| runtime.attached_execution)
     }
 
+    /// Retain an already-created COW branch if this sandbox is dropped before
+    /// its branch can be returned to the caller.
+    ///
+    /// This operation is synchronous and cancellation-safe. It is intended for
+    /// lifecycle owners that arm forensic retention immediately after a
+    /// successful spawn while keeping pre-spawn failures disposable.
+    pub fn retain_branch_if_abandoned(&mut self) {
+        self.keep_branch_if_abandoned
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.on_exit = BranchAction::Keep;
+        self.on_error = BranchAction::Keep;
+    }
+
     /// Lazily initialize the runtime block.
     ///
     /// Called by lifecycle methods (`spawn`, `run`, `fork`, etc.) on first
@@ -2110,9 +2128,11 @@ impl Sandbox {
             // the branch only reaches `Sandbox`'s own disposition after
             // a completed `wait()`, and the branch's `Drop` would otherwise
             // reclaim the upper the caller asked to keep.
-            branch.set_keep_if_abandoned(
+            self.keep_branch_if_abandoned.store(
                 self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
+                std::sync::atomic::Ordering::Release,
             );
+            branch.set_keep_if_abandoned(Arc::clone(&self.keep_branch_if_abandoned));
             self.fs_readable.push(branch.upper_dir().to_path_buf());
             Some(branch)
         } else {
