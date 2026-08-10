@@ -1423,6 +1423,77 @@ impl Sandbox {
         Ok(crate::branch::FsBranch::new(branch))
     }
 
+    /// Attach an existing filesystem branch to the next process created by
+    /// this sandbox.
+    ///
+    /// The branch handle remains temporarily unavailable until
+    /// [`Sandbox::take_attached_fs_branch`] is called after the process stops.
+    pub fn attach_fs_branch(
+        &mut self,
+        branch: &mut crate::branch::FsBranch,
+    ) -> Result<(), crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        if self.no_supervisor {
+            return Err(SandboxRuntimeError::Branch(BranchError::Unavailable).into());
+        }
+        let workdir = self
+            .workdir
+            .as_deref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?
+            .canonicalize()
+            .map_err(SandboxRuntimeError::Io)?;
+        if branch.workdir() != workdir {
+            return Err(SandboxRuntimeError::Branch(BranchError::Conflict(format!(
+                "branch lower {} does not match workdir {}",
+                branch.workdir().display(),
+                workdir.display(),
+            )))
+            .into());
+        }
+        self.ensure_runtime()?;
+        if !matches!(self.rt().state, RuntimeState::Created)
+            || self.rt().child_pid.is_some()
+            || self.rt().shared_cow.is_some()
+        {
+            return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+        }
+
+        let cow = branch.take_cow().map_err(SandboxRuntimeError::Branch)?;
+        self.rt_mut().shared_cow = Some(SharedCow::new(cow));
+        Ok(())
+    }
+
+    /// Recover the filesystem branch attached with
+    /// [`Sandbox::attach_fs_branch`] after the process has stopped.
+    pub async fn take_attached_fs_branch(
+        &mut self,
+    ) -> Result<crate::branch::FsBranch, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        if !(matches!(runtime.state, RuntimeState::Stopped(_))
+            || matches!(runtime.state, RuntimeState::Created) && runtime.child_pid.is_none())
+        {
+            return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+        }
+        let shared = runtime
+            .shared_cow
+            .clone()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        let branch = shared
+            .take_branch()
+            .await
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        let upper_dir = branch.upper_dir().to_path_buf();
+        self.fs_readable.retain(|path| path != &upper_dir);
+        self.runtime = None;
+        Ok(crate::branch::FsBranch::new(branch))
+    }
+
     /// Run one command against an existing filesystem branch.
     ///
     /// The branch remains reusable after the command exits, so later commands

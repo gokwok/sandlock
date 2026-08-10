@@ -64,10 +64,12 @@ While the branch is `Pending`:
 - staged file contents remain in the on-disk COW upper directory;
 - the owner retains only the branch handle and metadata in memory.
 
-`Pending` is not a durable, reopenable state. The Rust handle must remain
-alive, or the `sandlock run` process must remain alive in CLI mode. There is
-no branch id, daemon, or persisted registry that lets a later process reopen
-the branch.
+`Pending` normally remains owned by its Rust handle. A controller that needs
+to stop may call `FsBranch::persist`, retain the returned `PreservedBranch`
+record, and pass it to `FsBranch::reopen` in a later process. Persistence is
+available only before a commit attempt and records the conflict-detection
+baseline as well as the upper and deletions. Sandlock still provides no branch
+registry or daemon; the controller owns the durable record and storage path.
 
 ## Filesystem boundary
 
@@ -189,13 +191,15 @@ The retained branch exposes:
 
 | Method | Result |
 |---|---|
-| `state()` | `BranchState::Pending`, `Committed`, or `Aborted` |
+| `state()` | `BranchState::Pending`, `Committed`, `Aborted`, or `Persisted` |
 | `workdir()` | Lower directory that receives a successful commit |
 | `upper_dir()` | On-disk staging directory; removed after resolution |
 | `changes()` | Added, modified, and deleted paths relative to `workdir` |
 | `conflicts()` | Modified paths whose lower-layer state has changed |
 | `commit()` | Merge the branch into `workdir` |
 | `abort()` | Discard the branch |
+| `persist()` | Release the branch into durable storage for a later process |
+| `reopen()` | Recover a branch returned by `persist()` |
 
 Change inspection is optional:
 
@@ -211,6 +215,14 @@ unless the controller actually needs the path list.
 Calling `changes`, `commit`, or `abort` after the branch has been resolved
 returns `BranchError::AlreadyResolved`. A failed commit or abort leaves the
 handle in `BranchState::Pending`.
+
+### Live process attachment
+
+`Sandbox::attach_fs_branch` moves an existing pending branch into the next
+process created by that sandbox. This works with the ordinary interactive and
+PTY lifecycle APIs. After the process has stopped,
+`Sandbox::take_attached_fs_branch` returns the same branch with its accumulated
+changes. The caller must recover that handle before reusing the sandbox.
 
 ### Drop behavior
 

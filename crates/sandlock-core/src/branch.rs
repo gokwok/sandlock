@@ -3,6 +3,7 @@
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::dry_run::Change;
 use crate::error::BranchError;
+use crate::recovery::PreservedBranch;
 use crate::result::RunResult;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ pub enum BranchState {
     Committed,
     /// The branch was discarded.
     Aborted,
+    /// The branch was persisted for a later process to reopen.
+    Persisted,
 }
 
 /// A completed sandbox run whose COW filesystem changes await an explicit
@@ -127,6 +130,23 @@ impl FsBranch {
         self.inner = None;
         self.state = BranchState::Aborted;
         Ok(())
+    }
+
+    /// Persist this branch so another process can reopen it.
+    ///
+    /// The branch must not have started a commit. On success this handle is
+    /// resolved and [`FsBranch::reopen`] becomes the only supported way to
+    /// continue using its staged changes.
+    pub fn persist(&mut self) -> Result<PreservedBranch, BranchError> {
+        let preserved = self.pending_mut()?.persist_for_reopen()?;
+        self.inner = None;
+        self.state = BranchState::Persisted;
+        Ok(preserved)
+    }
+
+    /// Reopen a branch previously resolved with [`FsBranch::persist`].
+    pub fn reopen(preserved: PreservedBranch) -> Result<Self, BranchError> {
+        SeccompCowBranch::reopen(preserved).map(Self::new)
     }
 
     fn pending(&self) -> Result<&SeccompCowBranch, BranchError> {
@@ -249,5 +269,59 @@ mod tests {
         );
         assert!(!workdir.path().join("added.txt").exists());
         assert!(!upper.exists());
+    }
+
+    #[test]
+    fn persisted_branch_reopens_with_its_conflict_baseline() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("changed.txt"), "original").unwrap();
+        fs::write(workdir.path().join("deleted.txt"), "original").unwrap();
+
+        let cow = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = FsBranch::new(cow);
+        let upper = branch
+            .pending_mut()
+            .unwrap()
+            .ensure_cow_copy("changed.txt")
+            .unwrap();
+        fs::write(upper, "staged").unwrap();
+        branch.pending_mut().unwrap().mark_deleted("deleted.txt");
+        fs::write(workdir.path().join("changed.txt"), "lower changed").unwrap();
+
+        let preserved = branch.persist().unwrap();
+        assert_eq!(branch.state(), BranchState::Persisted);
+        fs::write(preserved.branch_dir.join("deleted.log"), "").unwrap();
+
+        let mut reopened = FsBranch::reopen(preserved).unwrap();
+        assert_eq!(reopened.state(), BranchState::Pending);
+        assert_eq!(
+            reopened.conflicts().unwrap(),
+            vec![PathBuf::from("changed.txt")]
+        );
+        assert!(reopened
+            .changes()
+            .unwrap()
+            .iter()
+            .any(|change| change.path == Path::new("deleted.txt")));
+        reopened.abort().unwrap();
+    }
+
+    #[test]
+    fn failed_persist_can_be_retried() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cow = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = FsBranch::new(cow);
+        let obstruction = branch.upper_dir().parent().unwrap().join(".PRESERVED.tmp");
+        fs::create_dir(&obstruction).unwrap();
+
+        assert!(branch.persist().is_err());
+        assert_eq!(branch.state(), BranchState::Pending);
+
+        fs::remove_dir(obstruction).unwrap();
+        let preserved = branch.persist().unwrap();
+        let mut reopened = FsBranch::reopen(preserved).unwrap();
+        reopened.abort().unwrap();
     }
 }

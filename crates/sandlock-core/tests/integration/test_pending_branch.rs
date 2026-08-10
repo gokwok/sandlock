@@ -160,3 +160,32 @@ async fn fs_branch_reuses_changes_and_detects_write_conflicts() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+#[tokio::test]
+async fn attached_branch_returns_after_the_process_stops() {
+    let workdir = temp_dir("attached");
+    let mut sandbox = sandbox(&workdir);
+    let mut branch = sandbox.create_fs_branch().unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+
+    let path = workdir.join("attached.txt");
+    let command = format!("printf attached > {}", path.display());
+    let result = sandbox.run(&["sh", "-c", &command]).await;
+    if let Err(error) = result {
+        eprintln!("Attached FsBranch test skipped: {error}");
+        let _ = fs::remove_dir_all(&workdir);
+        return;
+    }
+
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    assert!(!path.exists());
+    assert!(branch
+        .changes()
+        .unwrap()
+        .iter()
+        .any(|change| change.path == PathBuf::from("attached.txt")));
+    branch.commit().unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), "attached");
+
+    let _ = fs::remove_dir_all(&workdir);
+}

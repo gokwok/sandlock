@@ -12,6 +12,8 @@ use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::BranchError;
 
 /// O_* flags for detecting writes. These differ across Linux architectures.
@@ -108,6 +110,10 @@ const PRESERVED_MARKER: &str = "PRESERVED";
 /// only descends directories.
 const PRESERVED_TMP: &str = ".PRESERVED.tmp";
 
+/// Metadata required to reopen a deliberately persisted branch.
+const REOPEN_MARKER: &str = "REOPEN.json";
+const REOPEN_TMP: &str = ".REOPEN.json.tmp";
+
 /// `fsync` a directory, so a name created or removed in it survives a power
 /// loss. Mirrors `deletions::sync_parent_dir`, but returns the error: the
 /// caller here has a decision to make on it.
@@ -158,9 +164,10 @@ fn sync_dir_in_root(root: &Path, rel: &str) -> Result<(), i32> {
 
 /// Why a branch's private storage was preserved instead of reclaimed.
 ///
-/// Every preserved branch is storage that nothing in this process will free
-/// again — see [`SeccompCowBranch::preserve`]. What it holds is the upper plus
-/// the marker's deletions, together: see [`PreservedBranch`].
+/// A preserved branch has left the ordinary live-branch lifecycle. Most
+/// reasons require out-of-band recovery; [`PreserveReason::Detached`] is an
+/// explicit handoff that can be reopened. What it holds is the upper plus the
+/// marker's deletions, together: see [`PreservedBranch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreserveReason {
     /// A merge into the workdir was started and did not finish. The workdir may
@@ -175,6 +182,8 @@ pub enum PreserveReason {
     /// The caller asked for the changes to be kept for inspection rather than
     /// merged or discarded ([`crate::sandbox::BranchAction::Keep`]).
     Kept,
+    /// The explicit branch owner persisted it for a later process to reopen.
+    Detached,
 }
 
 impl PreserveReason {
@@ -184,6 +193,7 @@ impl PreserveReason {
             PreserveReason::MergeInterrupted => "merge-interrupted",
             PreserveReason::CommitDeferred => "commit-deferred",
             PreserveReason::Kept => "kept",
+            PreserveReason::Detached => "detached",
         }
     }
 
@@ -192,6 +202,7 @@ impl PreserveReason {
             b"merge-interrupted" => Some(PreserveReason::MergeInterrupted),
             b"commit-deferred" => Some(PreserveReason::CommitDeferred),
             b"kept" => Some(PreserveReason::Kept),
+            b"detached" => Some(PreserveReason::Detached),
             _ => None,
         }
     }
@@ -199,9 +210,9 @@ impl PreserveReason {
 
 /// A branch whose storage was preserved, as read back off disk.
 ///
-/// This is what an out-of-band recovery works from: the process that created
-/// the branch is gone, so the only thing tying an upper on disk to the workdir
-/// it belongs to is the marker this was parsed from.
+/// This is what out-of-band recovery and explicit branch handoff work from.
+/// The marker ties an upper on disk to the workdir it belongs to after its live
+/// branch handle has gone away.
 ///
 /// A change set is the upper **and** [`deleted`](Self::deleted) together.
 /// Deletions are tracked in RAM while the branch is live (there are no whiteout
@@ -635,7 +646,7 @@ pub struct SeccompCowBranch {
     base: Option<HashMap<String, BaseStamp>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 enum BaseStamp {
     Absent { parent: Option<(u64, u64)> },
     Present {
@@ -648,6 +659,13 @@ enum BaseStamp {
         ctime: i64,
         ctime_nsec: i64,
     },
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReopenMetadata {
+    schema_version: u32,
+    max_disk_bytes: u64,
+    base: HashMap<String, BaseStamp>,
 }
 
 impl BaseStamp {
@@ -723,6 +741,135 @@ impl SeccompCowBranch {
             disk_used: 0,
             base: None,
         })
+    }
+
+    pub(crate) fn persist_for_reopen(&mut self) -> Result<PreservedBranch, BranchError> {
+        if self.state != BranchState::Open {
+            return Err(BranchError::Operation(
+                "only an uncommitted branch can be persisted for reopening".to_string(),
+            ));
+        }
+        let metadata = ReopenMetadata {
+            schema_version: 1,
+            max_disk_bytes: self.max_disk_bytes,
+            base: self.base.clone().unwrap_or_default(),
+        };
+        self.write_reopen_metadata(&metadata)?;
+        if let Err(error) = self.preserve_durable(PreserveReason::Detached) {
+            self.state = BranchState::Open;
+            return Err(BranchError::Operation(format!(
+                "persist branch marker: {error}"
+            )));
+        }
+        match read_preserved(&self.storage_dir) {
+            Some(preserved) => Ok(preserved),
+            None => {
+                self.state = BranchState::Open;
+                Err(BranchError::Operation(
+                    "persisted branch marker could not be read back".to_string(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn reopen(preserved: PreservedBranch) -> Result<Self, BranchError> {
+        if preserved.reason != PreserveReason::Detached {
+            return Err(BranchError::Operation(
+                "branch was not persisted for reopening".to_string(),
+            ));
+        }
+        let recorded = read_preserved(&preserved.branch_dir).ok_or_else(|| {
+            BranchError::Operation("persisted branch marker is unavailable".to_string())
+        })?;
+        if recorded != preserved {
+            return Err(BranchError::Operation(
+                "persisted branch marker changed before reopen".to_string(),
+            ));
+        }
+        let upper_type = fs::symlink_metadata(&recorded.upper)
+            .map(|metadata| metadata.file_type())
+            .map_err(|e| BranchError::Operation(format!("inspect persisted upper: {e}")))?;
+        if recorded.upper != recorded.branch_dir.join("upper") || !upper_type.is_dir() {
+            return Err(BranchError::Operation(
+                "persisted branch upper is invalid".to_string(),
+            ));
+        }
+        let workdir = recorded
+            .workdir
+            .canonicalize()
+            .map_err(|e| BranchError::Operation(format!("canonicalize workdir: {e}")))?;
+        if workdir != recorded.workdir {
+            return Err(BranchError::Operation(
+                "persisted branch workdir is not canonical".to_string(),
+            ));
+        }
+        let metadata_path = recorded.branch_dir.join(REOPEN_MARKER);
+        let bytes = fs::read(&metadata_path)
+            .map_err(|e| BranchError::Operation(format!("read reopen metadata: {e}")))?;
+        let metadata: ReopenMetadata = serde_json::from_slice(&bytes)
+            .map_err(|e| BranchError::Operation(format!("parse reopen metadata: {e}")))?;
+        if metadata.schema_version != 1 {
+            return Err(BranchError::Operation(format!(
+                "unsupported reopen metadata schema {}",
+                metadata.schema_version
+            )));
+        }
+
+        let mut deleted =
+            crate::cow::deletions::DeletionSet::load(&recorded.branch_dir.join("deleted.log"));
+        for path in &recorded.deleted {
+            let path = path.to_str().ok_or_else(|| {
+                BranchError::Operation("persisted deletion is not valid UTF-8".to_string())
+            })?;
+            deleted.insert(path);
+        }
+        let has_changes = !metadata.base.is_empty()
+            || deleted.iter().next().is_some()
+            || fs::read_dir(&recorded.upper)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+        let disk_used = dir_size(&recorded.upper);
+        fs::remove_file(recorded.branch_dir.join(PRESERVED_MARKER))
+            .map_err(|e| BranchError::Operation(format!("claim persisted branch: {e}")))?;
+        let _ = sync_dir(&recorded.branch_dir);
+
+        Ok(Self {
+            workdir_str: workdir.to_string_lossy().into_owned(),
+            workdir,
+            upper: recorded.upper,
+            storage_dir: recorded.branch_dir,
+            deleted,
+            applied_deletions: HashSet::new(),
+            has_changes,
+            state: BranchState::Open,
+            keep_if_abandoned: false,
+            max_disk_bytes: metadata.max_disk_bytes,
+            disk_used,
+            base: Some(metadata.base),
+        })
+    }
+
+    fn write_reopen_metadata(&self, metadata: &ReopenMetadata) -> Result<(), BranchError> {
+        use std::io::Write;
+
+        let temporary = self.storage_dir.join(REOPEN_TMP);
+        let path = self.storage_dir.join(REOPEN_MARKER);
+        let result = (|| -> std::io::Result<()> {
+            let bytes = serde_json::to_vec(metadata)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let mut file = fs::File::create(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)?;
+            sync_dir(&self.storage_dir)
+        })();
+        if let Err(e) = result {
+            let _ = fs::remove_file(temporary);
+            return Err(BranchError::Operation(format!(
+                "persist reopen metadata: {e}"
+            )));
+        }
+        Ok(())
     }
 
     /// The upper directory where writes are stored.
@@ -2378,7 +2525,8 @@ impl SeccompCowBranch {
     /// rewrite from truncating a marker that was already valid. It is not made
     /// DURABLE, because on these paths the workdir is untouched and there is
     /// nothing half-done for a crash to leave behind. See
-    /// [`Self::preserve_durable`] for the path where there is.
+    /// [`Self::preserve_durable`] for merge recovery and explicit durable
+    /// handoff.
     pub(crate) fn preserve(&mut self, reason: PreserveReason) {
         self.state = BranchState::Preserved(reason);
         let _ = self.write_preserved_marker(reason, false);
@@ -2386,12 +2534,11 @@ impl SeccompCowBranch {
 
     /// [`Self::preserve`], but the marker is fsynced and its error propagates.
     ///
-    /// Used only by the merge, where the marker is the crash record for work in
-    /// flight: it is written immediately before the first destructive step, so
-    /// a marker that never reached disk over a half-merged workdir is precisely
-    /// the failure it exists to prevent. The state is set BEFORE the write, so
-    /// a caller that returns on the error still leaves `Drop` preserving the
-    /// storage.
+    /// Used by the merge, where the marker is the crash record for work in
+    /// flight, and by explicit branch persistence, where it completes the
+    /// cross-process handoff. The state is set BEFORE the write so callers can
+    /// choose whether a failure remains preserved or is returned to the live
+    /// branch lifecycle.
     pub(crate) fn preserve_durable(&mut self, reason: PreserveReason) -> std::io::Result<()> {
         self.state = BranchState::Preserved(reason);
         self.write_preserved_marker(reason, true)
@@ -2414,8 +2561,7 @@ impl SeccompCowBranch {
 
     /// Write (or replace) this branch's PRESERVED marker.
     ///
-    /// Atomicity and durability are separate properties with separate costs,
-    /// and only one caller needs both:
+    /// Atomicity and durability are separate properties with separate costs:
     ///
     /// - **Atomic** (temp + rename) for everyone, unconditionally. `preserve`
     ///   REWRITES an existing marker — the merge calls it on every attempt and
@@ -2423,8 +2569,8 @@ impl SeccompCowBranch {
     ///   `fs::write` truncates in place, so a crash inside a rewrite loses a
     ///   marker that was already valid, over a workdir that may be half merged.
     /// - **Durable** (`fsync` of the file, then of the storage dir, then
-    ///   best-effort of the base) only when `durable`, i.e. only from the
-    ///   merge, where the marker is the crash record for work in flight.
+    ///   best-effort of the base) when `durable`, for merge recovery and
+    ///   explicit cross-process handoff.
     ///
     /// The file is fsynced BEFORE the rename: delayed allocation can otherwise
     /// persist the new name over blocks that were never written. The storage

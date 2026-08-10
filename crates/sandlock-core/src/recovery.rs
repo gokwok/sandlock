@@ -53,8 +53,8 @@
 //! the append-only `deleted.log` beside the upper and must NOT be used here: a
 //! `MergeInterrupted` branch may have had part of its upper published and
 //! drained already, and re-applying a whiteout over a path that landed destroys
-//! it. That is why this module is report-only today — the supported route to
-//! finish an interrupted merge is to re-run `commit()` on the branch, which
-//! knows which deletions it already applied.
+//! it. That is why interrupted-merge recovery remains report-only. The
+//! exception is a [`PreserveReason::Detached`] branch, which was persisted
+//! before any commit attempt and can be passed to [`crate::FsBranch::reopen`].
 
 pub use crate::cow::seccomp::{list_preserved, read_preserved, PreserveReason, PreservedBranch};

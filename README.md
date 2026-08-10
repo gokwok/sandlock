@@ -586,12 +586,13 @@ if action_was_selected && result.success() {
 ```
 
 The retained handle is lightweight: staged file contents stay in the
-on-disk upper directory rather than process memory. This API is
-in-process only; it does not persist a branch for another process to
-reopen. It shares Sandlock's COW merge, commit lock, and recovery
-machinery with `Transaction`; unlike `Transaction`, publication is
-controlled externally instead of happening automatically after a fixed
-stage list.
+on-disk upper directory rather than process memory. `FsBranch::persist`
+can release an uncommitted branch into durable storage for a later process
+to recover with `FsBranch::reopen`; the persisted metadata includes the
+conflict-detection baseline. It shares Sandlock's COW merge, commit lock,
+and recovery machinery with `Transaction`; unlike `Transaction`,
+publication is controlled externally instead of happening automatically
+after a fixed stage list.
 
 Run the complete two-candidate example on Linux:
 
