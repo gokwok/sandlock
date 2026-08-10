@@ -63,6 +63,10 @@ async fn pending_branch_commit_is_explicit() {
             assert!(changes
                 .iter()
                 .any(|c| c.kind == ChangeKind::Added && c.path == PathBuf::from("added.txt")));
+            let inspection = branch.inspect(1).unwrap();
+            assert_eq!(inspection.changed_paths, 2);
+            assert_eq!(inspection.changes.len(), 1);
+            assert_eq!(inspection.conflicting_paths, 0);
 
             branch.commit().unwrap();
             assert_eq!(branch.state(), BranchState::Committed);
@@ -221,7 +225,7 @@ async fn fs_branch_reuses_changes_and_detects_write_conflicts() {
     );
     assert!(matches!(
         conflicting.commit(),
-        Err(BranchError::Conflict(_))
+        Err(BranchError::ConflictingPaths { count: 1 })
     ));
     conflicting.abort().unwrap();
 

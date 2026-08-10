@@ -2842,7 +2842,11 @@ impl Drop for Sandbox {
                     // DROP_COMMIT_LOCK_WAIT (5s) on a contended workdir before
                     // deferring (bounded, no CPU spin). Do not drop a committing
                     // Sandbox on an async runtime worker.
-                    BranchAction::Commit => { let _ = cow.commit(); }
+                    BranchAction::Commit => {
+                        if cow.commit().is_err() {
+                            cow.preserve_deferred_unless_interrupted();
+                        }
+                    }
                     BranchAction::Abort => { let _ = cow.abort(); }
                     // Mark kept so the branch's Drop backstop preserves the upper
                     // instead of cleaning it as an undisposed leak.

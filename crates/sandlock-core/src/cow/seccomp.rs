@@ -42,6 +42,8 @@ fn branch_errno(e: BranchError) -> i32 {
         BranchError::Operation(_)
         | BranchError::Published { .. }
         | BranchError::Conflict(_)
+        | BranchError::ConflictingPaths { .. }
+        | BranchError::CommitDeferred(_)
         | BranchError::NotReady
         | BranchError::Unavailable
         | BranchError::AlreadyResolved => libc::EIO,
@@ -791,9 +793,13 @@ impl SeccompCowBranch {
     }
 
     pub(crate) fn persist_for_reopen(&mut self) -> Result<PreservedBranch, BranchError> {
-        if self.state != BranchState::Open {
+        let previous = self.state;
+        if !matches!(
+            previous,
+            BranchState::Open | BranchState::Preserved(PreserveReason::CommitDeferred)
+        ) {
             return Err(BranchError::Operation(
-                "only an uncommitted branch can be persisted for reopening".to_string(),
+                "only a reusable branch can be persisted for reopening".to_string(),
             ));
         }
         let metadata = ReopenMetadata {
@@ -813,7 +819,7 @@ impl SeccompCowBranch {
                 message: error.error.to_string(),
             }),
             Err(error) => {
-                self.state = BranchState::Open;
+                self.state = previous;
                 Err(BranchError::Operation(format!(
                     "persist branch marker: {}",
                     error.error
@@ -861,9 +867,13 @@ impl SeccompCowBranch {
     }
 
     pub(crate) fn prepare_attachment(&mut self) -> Result<(), BranchError> {
-        if self.state != BranchState::Open {
+        let previous = self.state;
+        if !matches!(
+            previous,
+            BranchState::Open | BranchState::Preserved(PreserveReason::CommitDeferred)
+        ) {
             return Err(BranchError::Operation(
-                "only an uncommitted branch can be attached".to_string(),
+                "only a reusable branch can be attached".to_string(),
             ));
         }
         sync_tree(&self.upper)
@@ -875,7 +885,15 @@ impl SeccompCowBranch {
             }
             Err(error) => {
                 if error.published {
-                    let _ = fs::remove_file(self.storage_dir.join(PRESERVED_MARKER));
+                    match previous {
+                        BranchState::Open => {
+                            let _ = fs::remove_file(self.storage_dir.join(PRESERVED_MARKER));
+                        }
+                        BranchState::Preserved(reason) => {
+                            let _ = self.write_preserved_marker(reason, true);
+                        }
+                        BranchState::Finished => unreachable!("validated reusable branch"),
+                    }
                 }
                 Err(BranchError::Operation(format!(
                     "prepare attached branch marker: {}",
@@ -1147,17 +1165,26 @@ impl SeccompCowBranch {
     }
 
     pub fn conflicts(&self) -> Vec<PathBuf> {
+        self.bounded_conflicts(usize::MAX).0
+    }
+
+    fn bounded_conflicts(&self, max_paths: usize) -> (Vec<PathBuf>, usize) {
+        let mut total = 0;
         let mut conflicts = self
             .base
             .as_ref()
             .into_iter()
             .flat_map(|base| base.iter())
             .filter_map(|(path, stamp)| {
-                (self.lower_stamp(path) != *stamp).then(|| PathBuf::from(path))
+                if self.lower_stamp(path) == *stamp {
+                    return None;
+                }
+                total += 1;
+                (total <= max_paths).then(|| PathBuf::from(path))
             })
             .collect::<Vec<_>>();
         conflicts.sort();
-        conflicts
+        (conflicts, total)
     }
 
     /// Check whether `additional` bytes would exceed the disk quota.
@@ -1999,9 +2026,34 @@ impl SeccompCowBranch {
 
     /// List all filesystem changes in the COW layer.
     pub fn changes(&self) -> Result<Vec<crate::dry_run::Change>, BranchError> {
+        self.bounded_changes(usize::MAX).map(|(changes, _)| changes)
+    }
+
+    pub(crate) fn inspect(
+        &self,
+        max_paths: usize,
+    ) -> Result<
+        (
+            Vec<crate::dry_run::Change>,
+            usize,
+            Vec<PathBuf>,
+            usize,
+        ),
+        BranchError,
+    > {
+        let (changes, changed_paths) = self.bounded_changes(max_paths)?;
+        let (conflicts, conflicting_paths) = self.bounded_conflicts(max_paths);
+        Ok((changes, changed_paths, conflicts, conflicting_paths))
+    }
+
+    fn bounded_changes(
+        &self,
+        max_paths: usize,
+    ) -> Result<(Vec<crate::dry_run::Change>, usize), BranchError> {
         use crate::dry_run::{Change, ChangeKind};
 
         let mut result = Vec::new();
+        let mut total = 0;
 
         // Walk upper directory for added/modified files
         for entry in walkdir::WalkDir::new(&self.upper).min_depth(1) {
@@ -2020,7 +2072,10 @@ impl SeccompCowBranch {
             } else {
                 ChangeKind::Added
             };
-            result.push(Change { kind, path: rel.to_path_buf() });
+            total += 1;
+            if result.len() < max_paths {
+                result.push(Change { kind, path: rel.to_path_buf() });
+            }
         }
 
         // Deletions from the whiteout set; an entry re-created in the upper
@@ -2034,13 +2089,16 @@ impl SeccompCowBranch {
             if self.upper_has(rel_path) {
                 continue;
             }
-            result.push(Change {
-                kind: ChangeKind::Deleted,
-                path: std::path::PathBuf::from(rel_path),
-            });
+            total += 1;
+            if result.len() < max_paths {
+                result.push(Change {
+                    kind: ChangeKind::Deleted,
+                    path: std::path::PathBuf::from(rel_path),
+                });
+            }
         }
 
-        Ok(result)
+        Ok((result, total))
     }
 
     /// List merged directory entries (upper + lower - deleted).
@@ -2200,9 +2258,15 @@ impl SeccompCowBranch {
                      upper preserved for recovery",
                     self.workdir_str, waited
                 );
-                Err(BranchError::Operation(
-                    "commit deferred: workdir lock contended".into(),
-                ))
+                if matches!(self.state, BranchState::Preserved(PreserveReason::CommitDeferred)) {
+                    Err(BranchError::CommitDeferred(
+                        "workdir lock contended".into(),
+                    ))
+                } else {
+                    Err(BranchError::Operation(
+                        "commit deferred after an interrupted merge".into(),
+                    ))
+                }
             }
             Err(CommitError::Lock(e)) => {
                 eprintln!(
@@ -2210,9 +2274,15 @@ impl SeccompCowBranch {
                      upper preserved for recovery",
                     self.workdir_str, e
                 );
-                Err(BranchError::Operation(format!(
-                    "commit deferred: workdir lock error: {e}"
-                )))
+                if matches!(self.state, BranchState::Preserved(PreserveReason::CommitDeferred)) {
+                    Err(BranchError::CommitDeferred(format!(
+                        "workdir lock error: {e}"
+                    )))
+                } else {
+                    Err(BranchError::Operation(format!(
+                        "commit deferred after an interrupted merge: {e}"
+                    )))
+                }
             }
         }
     }
@@ -2264,15 +2334,11 @@ impl SeccompCowBranch {
             }
         };
         // `_lock` is held across the merge and released when this scope ends.
-        let conflicts = self.conflicts();
-        if !conflicts.is_empty() {
-            return Err(CommitError::Merge(BranchError::Conflict(
-                conflicts
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )));
+        let conflicts = self.bounded_conflicts(0).1;
+        if conflicts != 0 {
+            return Err(CommitError::Merge(BranchError::ConflictingPaths {
+                count: conflicts,
+            }));
         }
         self.commit_merge().map_err(CommitError::Merge)
     }
@@ -2711,7 +2777,7 @@ impl SeccompCowBranch {
     /// merge must not overwrite the stronger, half-merged marker with the weaker
     /// untouched one — that would tell a recovery sweep to re-apply a change set
     /// that has already partly landed.
-    fn preserve_deferred_unless_interrupted(&mut self) {
+    pub(crate) fn preserve_deferred_unless_interrupted(&mut self) {
         if !matches!(self.state, BranchState::Preserved(PreserveReason::MergeInterrupted)) {
             self.preserve(PreserveReason::CommitDeferred);
         }
@@ -6679,6 +6745,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_deferred_commit_remains_attachable_and_persistable() {
+        use std::os::unix::io::AsRawFd;
+
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
+
+        let defer = |branch: &mut SeccompCowBranch| {
+            let held = std::fs::File::open(workdir.path()).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            assert!(matches!(
+                branch.commit_inner(Duration::ZERO, |_| {}),
+                Err(BranchError::CommitDeferred(_))
+            ));
+        };
+
+        defer(&mut branch);
+        branch.prepare_attachment().unwrap();
+        branch.finish_attachment().unwrap();
+
+        defer(&mut branch);
+        let preserved = branch.persist_for_reopen().unwrap();
+        let reopened = SeccompCowBranch::reopen(preserved).unwrap();
+        assert_eq!(reopened.state, BranchState::Open);
+        assert_eq!(
+            std::fs::read_to_string(reopened.upper.join("a.txt")).unwrap(),
+            "plan\n"
+        );
+    }
+
     /// S3: a contended RETRY of a commit that already failed part way through the
     /// merge must NOT downgrade the on-disk `MergeInterrupted` marker to
     /// `CommitDeferred`. `CommitDeferred` means "workdir untouched, whole set
@@ -6922,9 +7024,8 @@ mod tests {
         }
     }
 
-    /// GAP-9: the `commit()` wrapper maps an Io lock failure to a message DISTINCT
-    /// from the contended one ("commit deferred: workdir lock error:" vs
-    /// "... lock contended"), and preserves as CommitDeferred. Collapsing the two
+    /// GAP-9: the `commit()` wrapper maps an Io lock failure to a message distinct
+    /// from the contended one and preserves as CommitDeferred. Collapsing the two
     /// arms into one message would fail this.
     #[test]
     fn wrapper_maps_lock_io_to_distinct_message() {
@@ -6941,10 +7042,11 @@ mod tests {
         let err = branch
             .commit_inner(Duration::from_millis(20), |_| {})
             .expect_err("a workdir that cannot be opened fails the commit");
-        assert!(
-            err.to_string().contains("commit deferred: workdir lock error:"),
-            "the Io lock failure must map to its own distinct message, got: {err}",
-        );
+        assert!(matches!(
+            &err,
+            BranchError::CommitDeferred(message)
+                if message.contains("workdir lock error:")
+        ));
         assert!(
             !err.to_string().contains("lock contended"),
             "the Io message must not be the contended one, got: {err}",

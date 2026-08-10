@@ -121,6 +121,12 @@ pub enum BranchError {
     #[error("branch conflict: {0}")]
     Conflict(String),
 
+    #[error("branch has {count} conflicting path(s)")]
+    ConflictingPaths { count: usize },
+
+    #[error("branch publication was deferred: {0}")]
+    CommitDeferred(String),
+
     #[error("COW branch is still attached to a running sandbox")]
     NotReady,
 

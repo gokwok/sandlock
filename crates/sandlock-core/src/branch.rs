@@ -25,6 +25,19 @@ pub enum BranchState {
     Kept,
 }
 
+/// Bounded view of a pending branch.
+#[derive(Debug)]
+pub struct BranchInspection {
+    /// Retained changed paths, up to the caller's per-list limit.
+    pub changes: Vec<Change>,
+    /// Total number of changed paths in the branch.
+    pub changed_paths: usize,
+    /// Retained conflicting paths, up to the caller's per-list limit.
+    pub conflicts: Vec<PathBuf>,
+    /// Total number of conflicting paths in the branch.
+    pub conflicting_paths: usize,
+}
+
 /// A completed sandbox run whose COW filesystem changes await an explicit
 /// commit or abort decision.
 #[derive(Debug)]
@@ -105,6 +118,19 @@ impl FsBranch {
         self.pending()?.changes()
     }
 
+    /// Inspect the branch while retaining at most `max_paths` entries from
+    /// each list. Total counts always cover the complete branch.
+    pub fn inspect(&self, max_paths: usize) -> Result<BranchInspection, BranchError> {
+        let (changes, changed_paths, conflicts, conflicting_paths) =
+            self.pending()?.inspect(max_paths)?;
+        Ok(BranchInspection {
+            changes,
+            changed_paths,
+            conflicts,
+            conflicting_paths,
+        })
+    }
+
     /// Paths whose lower-layer state changed after this branch first modified
     /// them. An empty result means no write conflict was detected.
     pub fn conflicts(&self) -> Result<Vec<PathBuf>, BranchError> {
@@ -138,9 +164,10 @@ impl FsBranch {
 
     /// Persist this branch so another process can reopen it.
     ///
-    /// The branch must not have started a commit. On success this handle is
-    /// resolved and [`FsBranch::reopen`] becomes the only supported way to
-    /// continue using its staged changes.
+    /// Accepts an open branch or a commit deferred before publication. A branch
+    /// whose merge may have started requires recovery instead. On success this
+    /// handle is resolved and [`FsBranch::reopen`] becomes the only supported
+    /// way to continue using its staged changes.
     pub fn persist(&mut self) -> Result<PreservedBranch, BranchError> {
         match self.pending_mut()?.persist_for_reopen() {
             Ok(preserved) => {

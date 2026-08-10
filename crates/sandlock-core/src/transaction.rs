@@ -656,6 +656,9 @@ fn finish_branch(
     // The lock (and preserve-on-contention) lives inside the branch now, so both
     // this coordinator and a plain Sandbox serialize on the one workdir flock.
     let r = branch.commit_with_lock_polling(commit_lock_wait, std::thread::sleep);
+    if r.is_err() {
+        branch.preserve_deferred_unless_interrupted();
+    }
     Finished { changes, commit: Some(r) }
 }
 
@@ -2151,6 +2154,43 @@ mod tests {
             preserved.reason,
             crate::cow::seccomp::PreserveReason::CommitDeferred,
             "the workdir is untouched and the whole change set is here: that is CommitDeferred"
+        );
+    }
+
+    #[test]
+    fn finish_branch_preserves_the_upper_when_the_lower_conflicts() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(workdir.path().join("a.txt"), "base\n").unwrap();
+        let mut branch = crate::cow::seccomp::SeccompCowBranch::create(
+            workdir.path(),
+            Some(storage.path()),
+            0,
+        )
+        .unwrap();
+        branch.track_conflicts();
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+        let upper = branch.ensure_cow_copy("a.txt").unwrap();
+        std::fs::write(upper, "staged\n").unwrap();
+        std::fs::write(workdir.path().join("a.txt"), "external\n").unwrap();
+
+        let finished = finish_branch(branch, Duration::from_secs(30), true);
+
+        assert!(matches!(
+            finished.commit,
+            Some(Err(CommitError::Merge(
+                crate::error::BranchError::ConflictingPaths { count: 1 }
+            )))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(branch_dir.join("upper/a.txt")).unwrap(),
+            "staged\n"
+        );
+        assert_eq!(
+            crate::cow::seccomp::read_preserved(&branch_dir)
+                .unwrap()
+                .reason,
+            crate::cow::seccomp::PreserveReason::CommitDeferred
         );
     }
 

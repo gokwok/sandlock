@@ -45,7 +45,7 @@ pub use sandbox::{
     StdioMode,
 };
 pub use result::{RunResult, ExitStatus};
-pub use branch::{BranchState, FsBranch, PendingBranch, PendingRunResult};
+pub use branch::{BranchInspection, BranchState, FsBranch, PendingBranch, PendingRunResult};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
