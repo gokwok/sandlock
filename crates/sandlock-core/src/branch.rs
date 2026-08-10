@@ -158,6 +158,10 @@ impl FsBranch {
     }
 
     /// Preserve staged changes for manual recovery without merging them.
+    ///
+    /// This is a terminal disposition. If durable publication fails, the
+    /// branch storage is still retained and this handle is resolved so that
+    /// dropping it cannot discard the only remaining copy.
     pub fn keep(&mut self) -> Result<PreservedBranch, BranchError> {
         match self.pending_mut()?.keep_for_recovery() {
             Ok(preserved) => {
@@ -170,7 +174,13 @@ impl FsBranch {
                 self.state = BranchState::Kept;
                 Err(error)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                if self.pending()?.is_preserved() {
+                    self.inner = None;
+                    self.state = BranchState::Kept;
+                }
+                Err(error)
+            }
         }
     }
 
@@ -386,14 +396,29 @@ mod tests {
             .preserve_durable(crate::recovery::PreserveReason::MergeInterrupted)
             .unwrap();
 
-        assert!(branch.keep().is_err());
-        assert_eq!(branch.state(), BranchState::Pending);
+        branch.keep().unwrap();
+        assert_eq!(branch.state(), BranchState::Kept);
         let preserved =
             crate::recovery::read_preserved(branch.upper_dir().parent().unwrap()).unwrap();
         assert_eq!(
             preserved.reason,
             crate::recovery::PreserveReason::MergeInterrupted
         );
+    }
+
+    #[test]
+    fn failed_keep_still_retains_the_branch_storage() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cow = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = FsBranch::new(cow);
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+        fs::create_dir(branch_dir.join(".PRESERVED.tmp")).unwrap();
+
+        assert!(branch.keep().is_err());
+        assert_eq!(branch.state(), BranchState::Kept);
+        drop(branch);
+        assert!(branch_dir.exists());
     }
 
     #[test]

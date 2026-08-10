@@ -823,29 +823,41 @@ impl SeccompCowBranch {
     }
 
     pub(crate) fn keep_for_recovery(&mut self) -> Result<PreservedBranch, BranchError> {
-        if self.state != BranchState::Open {
-            return Err(BranchError::Operation(
-                "only an uncommitted branch can be kept for recovery".to_string(),
-            ));
-        }
+        let previous = self.state;
+        let reason = match previous {
+            BranchState::Open => PreserveReason::Kept,
+            BranchState::Preserved(reason) => reason,
+            BranchState::Finished => {
+                return Err(BranchError::Operation(
+                    "only an unresolved branch can be kept for recovery".to_string(),
+                ));
+            }
+        };
+        self.state = BranchState::Preserved(reason);
         sync_tree(&self.upper)
-            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")))?;
-        let preserved = self.preserved_record(PreserveReason::Kept);
-        self.state = BranchState::Preserved(PreserveReason::Kept);
-        match self.write_preserved_marker(PreserveReason::Kept, true) {
+            .map_err(|error| {
+                BranchError::Operation(format!(
+                    "sync branch upper in {}: {error}",
+                    self.storage_dir.display()
+                ))
+            })?;
+        let preserved = self.preserved_record(reason);
+        match self.write_preserved_marker(reason, true) {
             Ok(()) => Ok(preserved),
             Err(error) if error.published => Err(BranchError::Published {
                 preserved: Box::new(preserved),
                 message: error.error.to_string(),
             }),
-            Err(error) => {
-                self.state = BranchState::Open;
-                Err(BranchError::Operation(format!(
-                    "keep branch marker: {}",
-                    error.error
-                )))
-            }
+            Err(error) => Err(BranchError::Operation(format!(
+                "keep branch marker in {}: {}",
+                self.storage_dir.display(),
+                error.error
+            ))),
         }
+    }
+
+    pub(crate) fn is_preserved(&self) -> bool {
+        matches!(self.state, BranchState::Preserved(_))
     }
 
     pub(crate) fn prepare_attachment(&mut self) -> Result<(), BranchError> {
