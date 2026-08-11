@@ -2049,7 +2049,6 @@ impl Sandbox {
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
         let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
-            .await
             .map_err(SandboxRuntimeError::Io)?;
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private

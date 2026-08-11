@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs as _};
 
 use serde::{Deserialize, Serialize};
 
@@ -408,9 +408,7 @@ pub struct ResolvedNetAllowSet {
 /// sets — the on-behalf check routes ICMP through the IP-only path
 /// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
 /// which the handler reads as "no destination check."
-pub async fn resolve_net_allow(
-    rules: &[NetAllow],
-) -> io::Result<ResolvedNetAllowSet> {
+pub fn resolve_net_allow(rules: &[NetAllow]) -> io::Result<ResolvedNetAllowSet> {
     use crate::seccomp::notif::PortAllow;
 
     // Resolve each unique hostname once, up front. A scheme-less spec
@@ -425,11 +423,10 @@ pub async fn resolve_net_allow(
             if host_ips.contains_key(host.as_str()) {
                 continue;
             }
-            let addr = format!("{}:0", host);
-            let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
+            let resolved = (host.as_str(), 0).to_socket_addrs().map_err(|error| {
                 io::Error::new(
-                    e.kind(),
-                    format!("failed to resolve host '{}': {}", host, e),
+                    error.kind(),
+                    format!("failed to resolve host '{}': {}", host, error),
                 )
             })?;
             let ips: Vec<IpAddr> = resolved.map(|sa| sa.ip()).collect();
@@ -794,15 +791,15 @@ mod tests {
         assert!(r.all_ports);
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_cidr_no_dns() {
+    #[test]
+    fn test_resolve_net_allow_cidr_no_dns() {
         // A CIDR / IP-literal target resolves into `cidrs` directly, with
         // no DNS lookup and no `per_ip` / `/etc/hosts` entry.
         let rules = vec![
             NetAllow { protocol: Protocol::Tcp, target: NetTarget::Cidr(IpCidr::parse("10.0.0.0/8").unwrap()), ports: vec![80], all_ports: false },
             NetAllow { protocol: Protocol::Tcp, target: NetTarget::Cidr(IpCidr::parse("1.2.3.4").unwrap()), ports: vec![], all_ports: true },
         ];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert_eq!(resolved.tcp.cidrs.len(), 2);
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.concrete_host_entries.is_empty());
@@ -898,9 +895,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_empty() {
-        let resolved = resolve_net_allow(&[]).await.unwrap();
+    #[test]
+    fn test_resolve_net_allow_empty() {
+        let resolved = resolve_net_allow(&[]).unwrap();
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.any_ip_ports.is_empty());
         assert!(resolved.udp.per_ip.is_empty());
@@ -909,15 +906,15 @@ mod tests {
         assert!(resolved.concrete_host_entries.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_concrete_host() {
+    #[test]
+    fn test_resolve_net_allow_concrete_host() {
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::Host("localhost".to_string()),
             ports: vec![80, 443],
             all_ports: false,
         }];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         // localhost should resolve to at least one loopback addr; only
         // the TCP set has entries.
         assert!(!resolved.tcp.per_ip.is_empty());
@@ -931,15 +928,15 @@ mod tests {
         assert!(resolved.concrete_host_entries.contains("127.0.0.1 localhost"));
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_any_ip() {
+    #[test]
+    fn test_resolve_net_allow_any_ip() {
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::AnyIp,
             ports: vec![8080],
             all_ports: false,
         }];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.any_ip_ports.contains(&8080));
         assert!(!resolved.tcp.any_ip_all_ports);
@@ -947,8 +944,8 @@ mod tests {
         assert!(resolved.concrete_host_entries.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_any_ip_all_ports() {
+    #[test]
+    fn test_resolve_net_allow_any_ip_all_ports() {
         // `:*` — fully unrestricted egress, TCP-only.
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
@@ -956,7 +953,7 @@ mod tests {
             ports: vec![],
             all_ports: true,
         }];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.tcp.any_ip_all_ports);
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.per_ip_all_ports.is_empty());
@@ -966,8 +963,8 @@ mod tests {
         assert!(!resolved.icmp.any_ip_all_ports);
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_concrete_host_all_ports() {
+    #[test]
+    fn test_resolve_net_allow_concrete_host_all_ports() {
         // `localhost:*` — every port to localhost only, TCP.
         let rules = vec![NetAllow {
             protocol: Protocol::Tcp,
@@ -975,7 +972,7 @@ mod tests {
             ports: vec![],
             all_ports: true,
         }];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(!resolved.tcp.any_ip_all_ports);
         assert!(
             !resolved.tcp.per_ip_all_ports.is_empty(),
@@ -987,8 +984,8 @@ mod tests {
         assert!(resolved.concrete_host_entries.contains("localhost"));
     }
 
-    #[tokio::test]
-    async fn test_resolve_net_allow_mixed_wildcard_and_concrete() {
+    #[test]
+    fn test_resolve_net_allow_mixed_wildcard_and_concrete() {
         // Wildcard rule alongside concrete: wildcard sets the global
         // any-host any-port flag for TCP; concrete rule still resolves
         // into per_ip (the runtime layer chooses Unrestricted, ignoring
@@ -1007,7 +1004,7 @@ mod tests {
                 all_ports: false,
             },
         ];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.tcp.any_ip_all_ports);
         assert!(!resolved.tcp.per_ip.is_empty());
     }
@@ -1016,8 +1013,8 @@ mod tests {
     // Per-protocol resolution — UDP / ICMP slices stay isolated
     // ============================================================
 
-    #[tokio::test]
-    async fn test_resolve_per_protocol_isolation() {
+    #[test]
+    fn test_resolve_per_protocol_isolation() {
         // A UDP rule should not appear in the TCP set, and vice versa.
         // This is the property Phase 2 relies on for protocol routing.
         let rules = vec![
@@ -1034,7 +1031,7 @@ mod tests {
                 all_ports: false,
             },
         ];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(
             !resolved.tcp.per_ip.is_empty(),
             "TCP rule should populate tcp set"
@@ -1051,8 +1048,8 @@ mod tests {
         assert!(!resolved.udp.any_ip_ports.contains(&443), "TCP port leaked into UDP set");
     }
 
-    #[tokio::test]
-    async fn test_resolve_icmp_no_ports() {
+    #[test]
+    fn test_resolve_icmp_no_ports() {
         // ICMP rules carry no ports; concrete hosts go into per_ip with
         // PortAllow::Any-style empty port set, plus per_ip_all_ports.
         let rules = vec![NetAllow {
@@ -1061,7 +1058,7 @@ mod tests {
             ports: vec![],
             all_ports: false,
         }];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(
             !resolved.icmp.per_ip.is_empty(),
             "icmp host should populate per_ip"
@@ -1076,8 +1073,8 @@ mod tests {
         assert!(resolved.udp.per_ip.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_resolve_icmp_wildcard() {
+    #[test]
+    fn test_resolve_icmp_wildcard() {
         // `icmp://*` — any ICMP destination.
         let rules = vec![NetAllow {
             protocol: Protocol::Icmp,
@@ -1085,7 +1082,7 @@ mod tests {
             ports: vec![],
             all_ports: false,
         }];
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.icmp.any_ip_all_ports);
         assert!(!resolved.tcp.any_ip_all_ports);
     }
@@ -1374,47 +1371,47 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn resolve_net_allow_schemeless_star_unrestricts_tcp_and_udp() {
+    #[test]
+    fn resolve_net_allow_schemeless_star_unrestricts_tcp_and_udp() {
         // Issue #132: `--net-allow '*'` alone now grants full TCP and
         // UDP egress; ICMP still requires an explicit `icmp://` rule.
         let rules = NetRule::parse_allow("*").unwrap();
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.tcp.any_ip_all_ports);
         assert!(resolved.udp.any_ip_all_ports);
         assert!(!resolved.icmp.any_ip_all_ports);
     }
 
-    #[tokio::test]
-    async fn resolve_net_allow_explicit_tcp_scheme_leaves_udp_closed() {
+    #[test]
+    fn resolve_net_allow_explicit_tcp_scheme_leaves_udp_closed() {
         let rules = NetRule::parse_allow("tcp://*").unwrap();
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.tcp.any_ip_all_ports);
         assert!(!resolved.udp.any_ip_all_ports);
         assert!(resolved.udp.any_ip_ports.is_empty());
         assert!(resolved.udp.cidrs.is_empty());
     }
 
-    #[tokio::test]
-    async fn resolve_net_allow_schemeless_port_populates_both_sets() {
+    #[test]
+    fn resolve_net_allow_schemeless_port_populates_both_sets() {
         // `:53` grants port 53 over both TCP and UDP, so plain DNS
         // works without a separate `udp://` rule.
         let rules = NetRule::parse_allow(":53").unwrap();
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         assert!(resolved.tcp.any_ip_ports.contains(&53));
         assert!(resolved.udp.any_ip_ports.contains(&53));
         assert!(!resolved.tcp.any_ip_all_ports);
         assert!(!resolved.udp.any_ip_all_ports);
     }
 
-    #[tokio::test]
-    async fn resolve_net_allow_schemeless_host_resolves_once() {
+    #[test]
+    fn resolve_net_allow_schemeless_host_resolves_once() {
         // A scheme-less host spec expands to a TCP + UDP rule pair; the
         // host must resolve once and share the IP set (independent
         // lookups could disagree under DNS round-robin) and each
         // /etc/hosts line must appear exactly once.
         let rules = NetRule::parse_allow("localhost:443").unwrap();
-        let resolved = resolve_net_allow(&rules).await.unwrap();
+        let resolved = resolve_net_allow(&rules).unwrap();
         let tcp_ips: HashSet<&IpAddr> = resolved.tcp.per_ip.keys().collect();
         let udp_ips: HashSet<&IpAddr> = resolved.udp.per_ip.keys().collect();
         assert_eq!(tcp_ips, udp_ips);
