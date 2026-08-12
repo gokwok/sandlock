@@ -342,11 +342,32 @@ impl SharedCow {
     }
 
     pub(crate) async fn take_branch(&self) -> Option<crate::cow::seccomp::SeccompCowBranch> {
+        let operation_gate = {
+            let state = self.state.lock().await;
+            std::sync::Arc::clone(&state.operation_gate)
+        };
+        let _quiesced = operation_gate.write_owned().await;
         self.state.lock().await.branch.take()
     }
 
     pub(crate) async fn replace_branch(&self, branch: crate::cow::seccomp::SeccompCowBranch) {
         self.state.lock().await.branch = Some(branch);
+    }
+
+    async fn checkpoint(
+        &self,
+        snapshot_storage: &std::path::Path,
+    ) -> Result<crate::snapshot::FsSnapshot, crate::error::BranchError> {
+        let operation_gate = {
+            let state = self.state.lock().await;
+            std::sync::Arc::clone(&state.operation_gate)
+        };
+        // Handler copy-up may continue outside the CowState mutex. Taking the
+        // exclusive gate drains that complete operation before reading upper.
+        let _quiesced = operation_gate.write_owned().await;
+        let state = self.state.lock().await;
+        let branch = state.branch.as_ref().ok_or(crate::error::BranchError::Unavailable)?;
+        branch.checkpoint(snapshot_storage)
     }
 }
 
@@ -702,13 +723,52 @@ impl Clone for Sandbox {
 pub struct PauseGuard<'a> {
     sandbox: &'a mut Sandbox,
     active: bool,
+    restart_throttle: bool,
 }
 
 impl PauseGuard<'_> {
+    /// Capture the attached branch's quiescent merged view as an immutable
+    /// snapshot without detaching or resuming the branch.
+    ///
+    /// This operation is only available for branches attached through
+    /// [`Sandbox::attach_fs_branch`]. The process group remains stopped for
+    /// the complete copy and is resumed when this guard is resumed or dropped.
+    pub async fn checkpoint_attached_fs_branch(
+        &self,
+        snapshot_storage: impl AsRef<std::path::Path>,
+    ) -> Result<crate::snapshot::FsSnapshot, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        if !self.active {
+            return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+        }
+        let runtime = self.sandbox.runtime.as_ref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        if !runtime.attached_execution || !matches!(runtime.state, RuntimeState::Paused) {
+            return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+        }
+        let shared = runtime.shared_cow.clone()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        // The process group is stopped, so once existing handlers drain no
+        // new branch operation can begin.
+        shared.checkpoint(snapshot_storage.as_ref()).await
+            .map_err(SandboxRuntimeError::Branch)
+            .map_err(Into::into)
+    }
+
     /// Resume the process group explicitly.
     pub fn resume(mut self) -> Result<(), crate::error::SandlockError> {
-        self.sandbox.resume()?;
+        self.resume_inner()?;
         self.active = false;
+        Ok(())
+    }
+
+    fn resume_inner(&mut self) -> Result<(), crate::error::SandlockError> {
+        self.sandbox.resume()?;
+        if self.restart_throttle {
+            self.sandbox.restart_cpu_throttle();
+            self.restart_throttle = false;
+        }
         Ok(())
     }
 }
@@ -716,7 +776,7 @@ impl PauseGuard<'_> {
 impl Drop for PauseGuard<'_> {
     fn drop(&mut self) {
         if self.active {
-            let _ = self.sandbox.resume();
+            let _ = self.resume_inner();
         }
     }
 }
@@ -865,7 +925,13 @@ impl Sandbox {
             .as_ref()
             .and_then(|rt| rt.child_pid)
             .ok_or(SandboxRuntimeError::NotRunning)?;
-        self.pause()?;
+        let restart_throttle = self.stop_cpu_throttle().await;
+        if let Err(error) = self.pause() {
+            if restart_throttle {
+                self.restart_cpu_throttle();
+            }
+            return Err(error);
+        }
         let deadline = std::time::Instant::now() + timeout;
         let mut stable_samples = 0_u8;
         loop {
@@ -876,6 +942,7 @@ impl Sandbox {
                         return Ok(PauseGuard {
                             sandbox: self,
                             active: true,
+                            restart_throttle,
                         });
                     }
                 }
@@ -885,11 +952,17 @@ impl Sandbox {
                 }
                 Err(error) => {
                     let _ = self.resume();
+                    if restart_throttle {
+                        self.restart_cpu_throttle();
+                    }
                     return Err(SandboxRuntimeError::Io(error).into());
                 }
             }
             if std::time::Instant::now() >= deadline {
                 let _ = self.resume();
+                if restart_throttle {
+                    self.restart_cpu_throttle();
+                }
                 return Err(SandboxRuntimeError::Child(
                     "process group did not stop before the pause deadline".into(),
                 )
@@ -897,6 +970,33 @@ impl Sandbox {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    async fn stop_cpu_throttle(&mut self) -> bool {
+        let handle = self.runtime.as_mut()
+            .and_then(|runtime| runtime.throttle_handle.take());
+        let Some(handle) = handle else {
+            return false;
+        };
+        handle.abort();
+        let _ = handle.await;
+        true
+    }
+
+    fn restart_cpu_throttle(&mut self) {
+        let Some(cpu_pct) = self.max_cpu.filter(|percent| *percent < 100) else {
+            return;
+        };
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        if runtime.throttle_handle.is_some() || !matches!(runtime.state, RuntimeState::Running) {
+            return;
+        }
+        let Some(child_pid) = runtime.child_pid else {
+            return;
+        };
+        runtime.throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
     }
 
     /// Send SIGKILL to the child's process group.
@@ -1476,6 +1576,59 @@ impl Sandbox {
         )
         .map_err(SandboxRuntimeError::Branch)?;
         Ok(crate::branch::FsBranch::new(branch))
+    }
+
+    /// Create a reusable branch from an immutable snapshot using this
+    /// sandbox's storage directory and disk quota.
+    ///
+    /// The configured workdir must be the snapshot root. The resulting branch
+    /// cannot be committed back into that immutable lower; checkpoint it to
+    /// produce a successor snapshot.
+    pub fn create_fs_branch_from_snapshot(
+        &self,
+        snapshot: &crate::snapshot::FsSnapshot,
+    ) -> Result<crate::branch::FsBranch, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        let workdir = self.workdir.as_deref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?
+            .canonicalize()
+            .map_err(SandboxRuntimeError::Io)?;
+        if workdir != snapshot.root_dir() {
+            return Err(SandboxRuntimeError::Branch(BranchError::Conflict(format!(
+                "snapshot lower {} does not match workdir {}",
+                snapshot.root_dir().display(),
+                workdir.display(),
+            ))).into());
+        }
+        for path in &self.fs_writable {
+            let path = path.canonicalize().map_err(SandboxRuntimeError::Io)?;
+            if path.starts_with(snapshot.root_dir()) || snapshot.root_dir().starts_with(&path) {
+                return Err(SandboxRuntimeError::Branch(BranchError::Denied).into());
+            }
+        }
+        for path in &self.fs_readable {
+            let path = path.canonicalize().map_err(SandboxRuntimeError::Io)?;
+            if path != snapshot.root_dir() && snapshot.root_dir().starts_with(&path) {
+                return Err(SandboxRuntimeError::Branch(BranchError::Denied).into());
+            }
+        }
+        if let Some(storage) = &self.fs_storage {
+            let storage = storage.canonicalize().map_err(SandboxRuntimeError::Io)?;
+            if storage.starts_with(snapshot.root_dir()) || snapshot.root_dir().starts_with(&storage) {
+                return Err(SandboxRuntimeError::Branch(BranchError::Denied).into());
+            }
+        }
+        if self.no_supervisor {
+            return Err(SandboxRuntimeError::Branch(BranchError::Unavailable).into());
+        }
+        crate::branch::FsBranch::from_snapshot_options(
+            snapshot,
+            self.fs_storage.as_deref(),
+            self.max_disk.map(|size| size.0).unwrap_or(0),
+        )
+        .map_err(SandboxRuntimeError::Branch)
+        .map_err(Into::into)
     }
 
     /// Attach an existing filesystem branch to the next process created by

@@ -58,6 +58,9 @@ mod test_dry_run;
 #[path = "integration/test_pending_branch.rs"]
 mod test_pending_branch;
 
+#[path = "integration/test_workspace_snapshot.rs"]
+mod test_workspace_snapshot;
+
 #[path = "integration/test_http_acl.rs"]
 mod test_http_acl;
 

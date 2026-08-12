@@ -24,6 +24,7 @@ const O_TRUNC: u64 = libc::O_TRUNC as u64;
 const O_APPEND: u64 = libc::O_APPEND as u64;
 const O_EXCL: u64 = libc::O_EXCL as u64;
 const O_DIRECTORY: u64 = libc::O_DIRECTORY as u64;
+const O_NOFOLLOW: u64 = libc::O_NOFOLLOW as u64;
 const WRITE_FLAGS: u64 = O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND;
 
 /// Parent of a relative path, or None if it has no parent component.
@@ -40,6 +41,7 @@ fn branch_errno(e: BranchError) -> i32 {
         BranchError::Deleted => libc::ENOENT,
         BranchError::Exists => libc::EEXIST,
         BranchError::Operation(_)
+        | BranchError::Snapshot(_)
         | BranchError::Published { .. }
         | BranchError::Conflict(_)
         | BranchError::ConflictingPaths { .. }
@@ -85,6 +87,9 @@ pub enum CowOpenPlan {
     /// Upper path ready (already exists in upper, or new file placeholder).
     UpperReady {
         upper: PathBuf,
+        /// The leaf did not exist when the plan was made. Dispatch must use
+        /// an atomic O_EXCL probe to decide which racing opener created it.
+        create_candidate: bool,
     },
 }
 
@@ -688,6 +693,16 @@ pub struct SeccompCowBranch {
     max_disk_bytes: u64,
     disk_used: u64,
     base: Option<HashMap<String, BaseStamp>>,
+    /// Logical directory modes of a snapshot lower whose physical backend
+    /// tree remains owner-traversable.
+    lower_directory_modes: HashMap<String, u32>,
+    /// Intended modes for directories that are real entries in the upper,
+    /// rather than mkdirp-created parents used only to reach a changed child.
+    /// The distinction is required when checkpointing a merged view: applying
+    /// placeholder modes would silently chmod unchanged lower directories.
+    directory_modes: HashMap<String, u32>,
+    /// Durable reference keeping an immutable snapshot lower alive.
+    snapshot_lease: Option<crate::snapshot::SnapshotLease>,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -710,7 +725,16 @@ struct ReopenMetadata {
     schema_version: u32,
     max_disk_bytes: u64,
     base: HashMap<String, BaseStamp>,
+    #[serde(default)]
+    directory_modes: HashMap<String, u32>,
+    #[serde(default)]
+    lower_directory_modes: HashMap<String, u32>,
+    #[serde(default)]
+    snapshot_lease: Option<crate::snapshot::SnapshotLeaseRecord>,
 }
+
+const REOPEN_SCHEMA_LEGACY: u32 = 1;
+const REOPEN_SCHEMA_SNAPSHOT: u32 = 2;
 
 struct MarkerWriteError {
     error: std::io::Error,
@@ -748,7 +772,12 @@ impl SeccompCowBranch {
     /// [`crate::recovery`].
     pub fn create(workdir: &Path, storage: Option<&Path>, max_disk_bytes: u64) -> Result<Self, BranchError> {
         let storage_base = match storage {
-            Some(p) => p.to_path_buf(),
+            Some(p) => {
+                fs::create_dir_all(p)
+                    .map_err(|e| BranchError::Operation(format!("create branch storage: {e}")))?;
+                p.canonicalize()
+                    .map_err(|e| BranchError::Operation(format!("canonicalize branch storage: {e}")))?
+            }
             None => resolve_default_storage_base(
                 std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
                 &std::env::temp_dir(),
@@ -789,6 +818,9 @@ impl SeccompCowBranch {
             max_disk_bytes,
             disk_used: 0,
             base: None,
+            lower_directory_modes: HashMap::new(),
+            directory_modes: HashMap::new(),
+            snapshot_lease: None,
         })
     }
 
@@ -803,12 +835,18 @@ impl SeccompCowBranch {
             ));
         }
         let metadata = ReopenMetadata {
-            schema_version: 1,
+            schema_version: if self.snapshot_lease.is_some() {
+                REOPEN_SCHEMA_SNAPSHOT
+            } else {
+                REOPEN_SCHEMA_LEGACY
+            },
             max_disk_bytes: self.max_disk_bytes,
             base: self.base.clone().unwrap_or_default(),
+            directory_modes: self.directory_modes.clone(),
+            lower_directory_modes: self.lower_directory_modes.clone(),
+            snapshot_lease: self.snapshot_lease.as_ref().map(|lease| lease.record().clone()),
         };
-        sync_tree(&self.upper)
-            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")))?;
+        self.sync_upper_tree()?;
         self.write_reopen_metadata(&metadata)?;
         let preserved = self.preserved_record(PreserveReason::Detached);
         self.state = BranchState::Preserved(PreserveReason::Detached);
@@ -840,13 +878,7 @@ impl SeccompCowBranch {
             }
         };
         self.state = BranchState::Preserved(reason);
-        sync_tree(&self.upper)
-            .map_err(|error| {
-                BranchError::Operation(format!(
-                    "sync branch upper in {}: {error}",
-                    self.storage_dir.display()
-                ))
-            })?;
+        self.sync_upper_tree()?;
         let preserved = self.preserved_record(reason);
         match self.write_preserved_marker(reason, true) {
             Ok(()) => Ok(preserved),
@@ -876,8 +908,7 @@ impl SeccompCowBranch {
                 "only a reusable branch can be attached".to_string(),
             ));
         }
-        sync_tree(&self.upper)
-            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")))?;
+        self.sync_upper_tree()?;
         match self.write_preserved_marker(PreserveReason::Attached, true) {
             Ok(()) => {
                 self.state = BranchState::Preserved(PreserveReason::Attached);
@@ -951,6 +982,13 @@ impl SeccompCowBranch {
                 "persisted branch marker changed before reopen".to_string(),
             ));
         }
+        let branch_dir = recorded.branch_dir.canonicalize()
+            .map_err(|e| BranchError::Operation(format!("canonicalize branch storage: {e}")))?;
+        if branch_dir != recorded.branch_dir {
+            return Err(BranchError::Operation(
+                "persisted branch storage is not canonical".to_string(),
+            ));
+        }
         let upper_type = fs::symlink_metadata(&recorded.upper)
             .map(|metadata| metadata.file_type())
             .map_err(|e| BranchError::Operation(format!("inspect persisted upper: {e}")))?;
@@ -973,11 +1011,21 @@ impl SeccompCowBranch {
             .map_err(|e| BranchError::Operation(format!("read reopen metadata: {e}")))?;
         let metadata: ReopenMetadata = serde_json::from_slice(&bytes)
             .map_err(|e| BranchError::Operation(format!("parse reopen metadata: {e}")))?;
-        if metadata.schema_version != 1 {
+        if !matches!(metadata.schema_version, REOPEN_SCHEMA_LEGACY | REOPEN_SCHEMA_SNAPSHOT) {
             return Err(BranchError::Operation(format!(
                 "unsupported reopen metadata schema {}",
                 metadata.schema_version
             )));
+        }
+        if metadata.schema_version == REOPEN_SCHEMA_SNAPSHOT && metadata.snapshot_lease.is_none() {
+            return Err(BranchError::Operation(
+                "snapshot branch reopen metadata is missing its lease".to_string(),
+            ));
+        }
+        if metadata.schema_version == REOPEN_SCHEMA_LEGACY && metadata.snapshot_lease.is_some() {
+            return Err(BranchError::Operation(
+                "legacy branch reopen metadata unexpectedly contains a snapshot lease".to_string(),
+            ));
         }
 
         let deleted = recorded
@@ -999,6 +1047,10 @@ impl SeccompCowBranch {
                 .map(|mut entries| entries.next().is_some())
                 .unwrap_or(false);
         let disk_used = dir_size(&recorded.upper);
+        let snapshot_lease = metadata.snapshot_lease.clone()
+            .map(crate::snapshot::SnapshotLease::from_record)
+            .transpose()
+            .map_err(BranchError::Snapshot)?;
         fs::remove_file(recorded.branch_dir.join(PRESERVED_MARKER))
             .map_err(|e| BranchError::Operation(format!("claim persisted branch: {e}")))?;
         let _ = sync_dir(&recorded.branch_dir);
@@ -1016,6 +1068,9 @@ impl SeccompCowBranch {
             max_disk_bytes: metadata.max_disk_bytes,
             disk_used,
             base: Some(metadata.base),
+            lower_directory_modes: metadata.lower_directory_modes,
+            directory_modes: metadata.directory_modes,
+            snapshot_lease,
         })
     }
 
@@ -1052,6 +1107,299 @@ impl SeccompCowBranch {
         &self.workdir
     }
 
+    /// Private storage directory for this branch.
+    pub(crate) fn storage_dir(&self) -> &Path {
+        &self.storage_dir
+    }
+
+    pub(crate) fn set_snapshot_lease(&mut self, lease: crate::snapshot::SnapshotLease) {
+        self.snapshot_lease = Some(lease);
+    }
+
+    pub(crate) fn set_lower_directory_modes(
+        &mut self,
+        modes: std::collections::BTreeMap<PathBuf, u32>,
+    ) {
+        self.lower_directory_modes = modes
+            .into_iter()
+            .map(|(path, mode)| (path.to_string_lossy().into_owned(), mode))
+            .collect();
+    }
+
+    pub(crate) fn is_snapshot_backed(&self) -> bool {
+        self.snapshot_lease.is_some()
+    }
+
+    pub(crate) fn logical_directory_mode(&self, path: &str) -> Option<u32> {
+        if !self.is_snapshot_backed() {
+            return None;
+        }
+        let rel = self.safe_rel(path)?;
+        self.merged_directory_mode(&rel)
+    }
+
+    /// Logical directory mode after following a final symlink inside the
+    /// confined layer.  The resolved target is looked up in the merged view,
+    /// so an upper chmod/whiteout wins over the immutable lower target.
+    pub(crate) fn logical_directory_mode_follow(&self, path: &str) -> Option<u32> {
+        if !self.is_snapshot_backed() {
+            return None;
+        }
+        let rel = self.safe_rel(path)?;
+        if let Some(mode) = self.merged_directory_mode(&rel) {
+            return Some(mode);
+        }
+        self.resolve_merged_rel(&rel, true)
+            .and_then(|resolved| self.merged_directory_mode(&resolved))
+    }
+
+    /// Logical mode for a directory handle pinned to the immutable lower.
+    /// Unlike `logical_directory_mode`, this deliberately ignores whiteouts
+    /// and renames in the merged namespace: an already-open fd continues to
+    /// name its original inode after either operation.
+    pub(crate) fn logical_directory_mode_for_handle(&self, real_path: &Path) -> Option<u32> {
+        if !self.is_snapshot_backed() {
+            return None;
+        }
+        if let Ok(rel) = real_path.strip_prefix(&self.workdir) {
+            return self.lower_directory_modes.get(rel.to_str()?).copied();
+        }
+        let rel = real_path.strip_prefix(&self.upper).ok()?.to_str()?;
+        self.directory_modes.get(rel).copied().or_else(|| {
+            if self.deleted.covers(rel) {
+                return None;
+            }
+            crate::sys::fs::statat_in_root(&self.workdir, rel, false)
+                .ok()
+                .filter(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                .and_then(|stat| {
+                    self.lower_directory_modes
+                        .get(rel)
+                        .copied()
+                        .or(Some(stat.st_mode & 0o7777))
+                })
+        })
+    }
+
+    pub(crate) fn contains_layer_path(&self, real_path: &Path) -> bool {
+        real_path.starts_with(&self.workdir) || real_path.starts_with(&self.upper)
+    }
+
+    fn merged_directory_mode(&self, rel: &str) -> Option<u32> {
+        if let Ok(stat) = crate::sys::fs::statat_in_root(&self.upper, rel, false) {
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                return None;
+            }
+            if let Some(mode) = self.directory_modes.get(rel).copied() {
+                return Some(mode);
+            }
+            // A private 0700 upper directory can be only a placeholder for a
+            // lower directory.  It must retain the lower view's logical mode.
+            if !self.deleted.covers(rel) {
+                if let Ok(lower) = crate::sys::fs::statat_in_root(&self.workdir, rel, false) {
+                    if lower.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                        return self
+                            .lower_directory_modes
+                            .get(rel)
+                            .copied()
+                            .or(Some(lower.st_mode & 0o7777));
+                    }
+                }
+            }
+            return Some(stat.st_mode & 0o7777);
+        }
+        if self.deleted.covers(rel) {
+            return None;
+        }
+        let stat = crate::sys::fs::statat_in_root(&self.workdir, rel, false).ok()?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return None;
+        }
+        self.lower_directory_modes
+            .get(rel)
+            .copied()
+            .or(Some(stat.st_mode & 0o7777))
+    }
+
+    /// Enforce owner traversal semantics for the logical snapshot view. The
+    /// private backend keeps directories owner-traversable for safe immutable
+    /// inspection, so seccomp must not expose those backend permissions.
+    pub(crate) fn check_logical_path_access(
+        &self,
+        path: &str,
+        leaf_directory_bits: u32,
+    ) -> Result<(), i32> {
+        if !self.is_snapshot_backed() {
+            return Ok(());
+        }
+        let rel = self.safe_rel(path).ok_or(libc::EACCES)?;
+        let components = Path::new(&rel)
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let root_required = if components.is_empty() {
+            leaf_directory_bits
+        } else {
+            0o100
+        };
+        if self
+            .merged_directory_mode("")
+            .is_some_and(|mode| mode & root_required != root_required)
+        {
+            return Err(libc::EACCES);
+        }
+        let mut prefix = PathBuf::new();
+        for (index, component) in components.iter().enumerate() {
+            prefix.push(component);
+            let key = prefix.to_string_lossy();
+            let required = if index + 1 == components.len() {
+                leaf_directory_bits
+            } else {
+                0o100
+            };
+            if let Some(mode) = self.merged_directory_mode(key.as_ref()) {
+                if mode & required != required {
+                    return Err(libc::EACCES);
+                }
+            }
+            // Follow the exact confined path the kernel will traverse so a
+            // symlink alias cannot skip a restrictive target directory.  All
+            // target ancestors matter: `alias -> locked/subdir` must still be
+            // denied when `locked` is 0000 and `subdir` itself is 0755.
+            if let Some(resolved) = self.resolve_merged_rel(key.as_ref(), true) {
+                if resolved != key {
+                    let resolved = Path::new(&resolved);
+                    let resolved_depth = resolved.components().count();
+                    let mut target = PathBuf::new();
+                    for (target_index, component) in resolved.components().enumerate() {
+                        target.push(component);
+                        let target_required = if target_index + 1 == resolved_depth {
+                            required
+                        } else {
+                            0o100
+                        };
+                        if self
+                            .merged_directory_mode(target.to_string_lossy().as_ref())
+                            .is_some_and(|mode| mode & target_required != target_required)
+                        {
+                            return Err(libc::EACCES);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn elevate_upper_directories(&self) -> Result<Vec<(String, u32)>, BranchError> {
+        let mut elevated = self
+            .directory_modes
+            .iter()
+            .filter(|(_, mode)| **mode & 0o700 != 0o700)
+            .map(|(path, mode)| (path.clone(), *mode))
+            .collect::<Vec<_>>();
+        elevated.sort_by_key(|(path, _)| Path::new(path).components().count());
+        let mut elevated_count = 0;
+        for (path, mode) in &elevated {
+            if let Err(errno) = crate::sys::fs::chmod_in_root(&self.upper, path, *mode | 0o700) {
+                for (restore_path, restore_mode) in elevated[..elevated_count].iter().rev() {
+                    let _ = crate::sys::fs::chmod_in_root(
+                        &self.upper,
+                        restore_path,
+                        *restore_mode,
+                    );
+                }
+                return Err(BranchError::Operation(format!(
+                    "temporarily open upper directory {path}: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                )));
+            }
+            elevated_count += 1;
+        }
+        Ok(elevated)
+    }
+
+    fn restore_upper_directories(
+        &self,
+        elevated: Vec<(String, u32)>,
+    ) -> Option<BranchError> {
+        let mut restore_error = None;
+        for (path, mode) in elevated.into_iter().rev() {
+            if let Err(errno) = crate::sys::fs::chmod_in_root(&self.upper, &path, mode) {
+                restore_error.get_or_insert_with(|| {
+                    BranchError::Operation(format!(
+                        "restore upper directory {path}: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    ))
+                });
+            }
+        }
+        restore_error
+    }
+
+    fn sync_upper_tree(&self) -> Result<(), BranchError> {
+        let elevated = self.elevate_upper_directories()?;
+        let result = sync_tree(&self.upper)
+            .map_err(|error| BranchError::Operation(format!("sync branch upper: {error}")));
+        let restore_error = self.restore_upper_directories(elevated);
+        match (result, restore_error) {
+            (Ok(()), None) => Ok(()),
+            (Err(error), _) => Err(error),
+            (Ok(()), Some(error)) => Err(error),
+        }
+    }
+
+    pub(crate) fn checkpoint(
+        &self,
+        snapshot_storage: &Path,
+    ) -> Result<crate::snapshot::FsSnapshot, BranchError> {
+        if !matches!(
+            self.state,
+            BranchState::Open
+                | BranchState::Preserved(PreserveReason::CommitDeferred)
+                | BranchState::Preserved(PreserveReason::Attached)
+        ) {
+            return Err(BranchError::AlreadyResolved);
+        }
+        // A tracee may legitimately create a 0000/0400 directory. Its merged
+        // view must keep that mode, but Sandlock still needs to traverse the
+        // private upper while producing a checkpoint. Temporarily grant the
+        // owner traversal rights while the branch operation gate guarantees
+        // quiescence, then restore exact modes on every exit. Ancestors are
+        // elevated first and restored last.
+        let elevated = self.elevate_upper_directories()?;
+        let lower_directory_modes = self
+            .lower_directory_modes
+            .iter()
+            .map(|(path, mode)| (PathBuf::from(path), *mode))
+            .collect();
+        let result = crate::snapshot::FsSnapshot::checkpoint_branch(
+            &self.workdir,
+            &lower_directory_modes,
+            &self.upper,
+            self.deleted.iter().map(str::to_owned),
+            self.directory_modes
+                .iter()
+                .map(|(path, mode)| (path.clone(), *mode)),
+            snapshot_storage,
+        )
+        .map_err(BranchError::Snapshot);
+        let restore_error = self.restore_upper_directories(elevated);
+        match (result, restore_error) {
+            (Ok(snapshot), None) => Ok(snapshot),
+            (Err(error), _) => Err(error),
+            (Ok(snapshot), Some(error)) => Err(BranchError::Snapshot(
+                crate::error::SnapshotError::Published {
+                    descriptor: Box::new(snapshot.descriptor().clone()),
+                    message: error.to_string(),
+                },
+            )),
+        }
+    }
+
     /// The workdir as a string (for fast prefix matching).
     pub fn workdir_str(&self) -> &str {
         &self.workdir_str
@@ -1074,7 +1422,15 @@ impl SeccompCowBranch {
     /// read must be redirected there, never fall through to the lower file.
     pub fn needs_read_intercept(&self, path: &str) -> bool {
         if let Some(rel) = self.safe_rel(path) {
-            self.deleted.covers(&rel) || self.upper.join(&rel).exists()
+            let resolved = self.resolve_merged_rel(&rel, true);
+            match resolved {
+                Some(resolved) => {
+                    resolved != rel
+                        || self.deleted.covers(&resolved)
+                        || self.upper_has(&resolved)
+                }
+                None => true,
+            }
         } else {
             false
         }
@@ -1130,6 +1486,39 @@ impl SeccompCowBranch {
                 .unwrap()
                 .insert(rel_path.to_string(), stamp);
         }
+    }
+
+    fn forget_directory_modes_under(&mut self, rel_path: &str) {
+        let root = Path::new(rel_path);
+        self.directory_modes
+            .retain(|path, _| !Path::new(path).starts_with(root));
+    }
+
+    fn remap_directory_modes(&mut self, old_rel: &str, new_rel: &str) {
+        if old_rel == new_rel {
+            return;
+        }
+        let old_root = Path::new(old_rel);
+        let new_root = Path::new(new_rel);
+        let moved = self
+            .directory_modes
+            .iter()
+            .filter_map(|(path, mode)| {
+                Path::new(path)
+                    .strip_prefix(old_root)
+                    .ok()
+                    .map(|suffix| (new_root.join(suffix), *mode))
+            })
+            .collect::<Vec<_>>();
+        self.directory_modes.retain(|path, _| {
+            let path = Path::new(path);
+            !path.starts_with(old_root) && !path.starts_with(new_root)
+        });
+        self.directory_modes.extend(
+            moved
+                .into_iter()
+                .map(|(path, mode)| (path.to_string_lossy().into_owned(), mode)),
+        );
     }
 
     pub(crate) fn track_conflicts(&mut self) {
@@ -1288,9 +1677,15 @@ impl SeccompCowBranch {
         // Directory — create immediately (no data copy)
         if kind == libc::S_IFDIR {
             self.check_quota(4096)?;
-            crate::sys::fs::mkdirp_in_root(&self.upper, rel_path, st.st_mode & 0o7777)
+            let mode = self
+                .lower_directory_modes
+                .get(rel_path)
+                .copied()
+                .unwrap_or(st.st_mode & 0o7777);
+            crate::sys::fs::mkdirp_in_root(&self.upper, rel_path, mode)
                 .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
-            let _ = crate::sys::fs::chmod_in_root(&self.upper, rel_path, st.st_mode & 0o7777);
+            let _ = crate::sys::fs::chmod_in_root(&self.upper, rel_path, mode);
+            self.directory_modes.insert(rel_path.to_string(), mode);
             self.disk_used += 4096;
             return Ok(CowCopyPlan::Ready(upper_file));
         }
@@ -1423,6 +1818,7 @@ impl SeccompCowBranch {
     /// created is removed again and the quota re-derived.
     fn copy_up_tree(&mut self, rel: &str) -> Result<(), i32> {
         let mut created: Vec<String> = Vec::new();
+        let directory_modes_before = self.directory_modes.clone();
         let result = self.stage_tree(rel, &mut created);
         if result.is_err() {
             for c in created.iter().rev() {
@@ -1435,6 +1831,7 @@ impl SeccompCowBranch {
                     let _ = crate::sys::fs::unlinkat_in_root(&self.upper, c, false);
                 }
             }
+            self.directory_modes = directory_modes_before;
             self.recalc_disk_used();
         }
         result
@@ -1461,6 +1858,16 @@ impl SeccompCowBranch {
             if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
                 continue;
             }
+            // `ensure_cow_copy` returns early for an existing upper
+            // directory. Such an entry may merely be a mkdirp placeholder;
+            // a directory rename nevertheless materializes it as a real
+            // member of the moved tree, with the lower directory's mode.
+            let mode = self
+                .lower_directory_modes
+                .get(&rel)
+                .copied()
+                .unwrap_or(st.st_mode & 0o7777);
+            self.directory_modes.insert(rel.clone(), mode);
             let rd = fs::read_dir(self.workdir.join(&rel))
                 .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
             for entry in rd {
@@ -1476,14 +1883,237 @@ impl SeccompCowBranch {
         Ok(())
     }
 
+    /// Resolve symlinks against the merged namespace, selecting an upper
+    /// component whenever present and otherwise falling back to the immutable
+    /// lower.  This avoids resolving an entire path inside only one physical
+    /// layer, which makes `lower alias -> target` miss an upper target.
+    fn resolve_merged_rel_with_symlink(
+        &self,
+        rel: &str,
+        follow_final: bool,
+    ) -> Option<(String, bool, bool)> {
+        use std::collections::VecDeque;
+
+        fn components(path: &Path) -> Option<Vec<String>> {
+            let mut out = Vec::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::RootDir => out.push("/".to_string()),
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => out.push("..".to_string()),
+                    std::path::Component::Normal(value) => {
+                        out.push(value.to_str()?.to_string())
+                    }
+                    std::path::Component::Prefix(_) => return None,
+                }
+            }
+            Some(out)
+        }
+
+        let mut pending = VecDeque::from(components(Path::new(rel))?);
+        let mut resolved: Vec<String> = Vec::new();
+        let mut symlink_hops = 0usize;
+        let mut used_symlink = false;
+        let mut used_absolute_symlink = false;
+        while let Some(component) = pending.pop_front() {
+            match component.as_str() {
+                "/" => {
+                    resolved.clear();
+                    continue;
+                }
+                ".." => {
+                    resolved.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            let candidate = if resolved.is_empty() {
+                component.clone()
+            } else {
+                format!("{}/{}", resolved.join("/"), component)
+            };
+            let should_follow = follow_final || !pending.is_empty();
+            if should_follow {
+                let layer = if crate::sys::fs::statat_in_root(&self.upper, &candidate, false)
+                    .is_ok()
+                {
+                    Some(&self.upper)
+                } else if self.deleted.covers(&candidate) {
+                    return None;
+                } else if crate::sys::fs::statat_in_root(&self.workdir, &candidate, false)
+                    .is_ok()
+                {
+                    Some(&self.workdir)
+                } else {
+                    None
+                };
+                if let Some(layer) = layer {
+                    let stat = crate::sys::fs::statat_in_root(layer, &candidate, false).ok()?;
+                    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                        used_symlink = true;
+                        symlink_hops += 1;
+                        if symlink_hops > 40 {
+                            return None;
+                        }
+                        let target = crate::sys::fs::readlink_in_root(layer, &candidate).ok()?;
+                        let target = PathBuf::from(std::ffi::OsString::from_vec(target));
+                        used_absolute_symlink |= target.is_absolute();
+                        let target_components = components(&target)?;
+                        for target_component in target_components.into_iter().rev() {
+                            pending.push_front(target_component);
+                        }
+                        continue;
+                    }
+                }
+            }
+            resolved.push(component);
+        }
+        Some((resolved.join("/"), used_symlink, used_absolute_symlink))
+    }
+
+    fn resolve_merged_rel(&self, rel: &str, follow_final: bool) -> Option<String> {
+        self.resolve_merged_rel_with_symlink(rel, follow_final)
+            .map(|(resolved, _, _)| resolved)
+    }
+
+    pub(crate) fn merged_path_uses_symlink(&self, path: &str, follow_final: bool) -> bool {
+        self.safe_rel(path)
+            .and_then(|rel| self.resolve_merged_rel_with_symlink(&rel, follow_final))
+            .is_some_and(|(_, used_symlink, _)| used_symlink)
+    }
+
+    pub(crate) fn merged_path_uses_absolute_symlink(
+        &self,
+        path: &str,
+        follow_final: bool,
+    ) -> bool {
+        self.safe_rel(path)
+            .and_then(|rel| self.resolve_merged_rel_with_symlink(&rel, follow_final))
+            .is_some_and(|(_, _, used_absolute)| used_absolute)
+    }
+
+    /// Resolve a syscall path through the merged namespace and return the
+    /// corresponding logical path below the branch root. Mutation dispatch
+    /// uses this before staging so lower symlink parents and targets select
+    /// the same entry that reads and checkpoints observe.
+    pub(crate) fn resolve_merged_path(
+        &self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<String, i32> {
+        let rel = self.safe_rel(path).ok_or(libc::EACCES)?;
+        let resolved = self.resolve_merged_rel(&rel, follow_final).ok_or(libc::ENOENT)?;
+        Ok(self
+            .workdir
+            .join(resolved)
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    /// Resolve below an openat2 caller-selected dirfd root. Absolute symlink
+    /// targets and leading `..` are interpreted relative to that root for
+    /// IN_ROOT, while BENEATH reports EXDEV for either escape form.
+    pub(crate) fn resolve_merged_path_bounded(
+        &self,
+        path: &str,
+        base_path: &str,
+        follow_final: bool,
+        in_root: bool,
+        beneath: bool,
+    ) -> Result<String, i32> {
+        use std::collections::VecDeque;
+
+        fn parts(path: &Path) -> Result<Vec<String>, i32> {
+            path.components()
+                .filter_map(|component| match component {
+                    std::path::Component::RootDir | std::path::Component::CurDir => None,
+                    std::path::Component::ParentDir => Some(Ok("..".to_string())),
+                    std::path::Component::Normal(value) => value
+                        .to_str()
+                        .map(|value| Ok(value.to_string()))
+                        .or(Some(Err(libc::EINVAL))),
+                    std::path::Component::Prefix(_) => Some(Err(libc::EINVAL)),
+                })
+                .collect()
+        }
+
+        let path_rel = self.safe_rel(path).ok_or(libc::EACCES)?;
+        let base_rel = self.safe_rel(base_path).ok_or(libc::EACCES)?;
+        let boundary = parts(Path::new(&base_rel))?;
+        let mut resolved = boundary.clone();
+        let path_parts = parts(Path::new(&path_rel))?;
+        if path_parts.len() < boundary.len() || path_parts[..boundary.len()] != boundary {
+            return Err(libc::EXDEV);
+        }
+        let mut pending = VecDeque::from(path_parts[boundary.len()..].to_vec());
+        let mut hops = 0usize;
+        while let Some(component) = pending.pop_front() {
+            if component == ".." {
+                if resolved.len() > boundary.len() {
+                    resolved.pop();
+                } else if beneath {
+                    return Err(libc::EXDEV);
+                }
+                continue;
+            }
+            let candidate = if resolved.is_empty() {
+                component.clone()
+            } else {
+                format!("{}/{}", resolved.join("/"), component)
+            };
+            if follow_final || !pending.is_empty() {
+                let layer = if crate::sys::fs::statat_in_root(&self.upper, &candidate, false).is_ok() {
+                    Some(&self.upper)
+                } else if self.deleted.covers(&candidate) {
+                    return Err(libc::ENOENT);
+                } else if crate::sys::fs::statat_in_root(&self.workdir, &candidate, false).is_ok() {
+                    Some(&self.workdir)
+                } else {
+                    None
+                };
+                if let Some(layer) = layer {
+                    let stat = crate::sys::fs::statat_in_root(layer, &candidate, false)
+                        .map_err(|_| libc::ENOENT)?;
+                    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                        hops += 1;
+                        if hops > 40 {
+                            return Err(libc::ELOOP);
+                        }
+                        let target = crate::sys::fs::readlink_in_root(layer, &candidate)
+                            .map_err(|_| libc::ENOENT)?;
+                        let target = PathBuf::from(std::ffi::OsString::from_vec(target));
+                        if target.is_absolute() {
+                            if beneath {
+                                return Err(libc::EXDEV);
+                            }
+                            resolved = if in_root { boundary.clone() } else { Vec::new() };
+                        }
+                        for part in parts(&target)?.into_iter().rev() {
+                            pending.push_front(part);
+                        }
+                        continue;
+                    }
+                }
+            }
+            resolved.push(component);
+        }
+        Ok(self.workdir.join(resolved.join("/")).to_string_lossy().into_owned())
+    }
+
+    fn resolve_read_with_follow(&self, rel_path: &str, follow_final: bool) -> Option<PathBuf> {
+        let resolved = self.resolve_merged_rel(rel_path, follow_final)?;
+        let upper_file = self.upper.join(&resolved);
+        if upper_file.exists() || upper_file.is_symlink() {
+            Some(upper_file)
+        } else {
+            Some(self.workdir.join(resolved))
+        }
+    }
+
     /// Resolve a read path: upper if modified, else lower.
     pub fn resolve_read(&self, rel_path: &str) -> PathBuf {
-        let upper_file = self.upper.join(rel_path);
-        if upper_file.exists() || upper_file.is_symlink() {
-            upper_file
-        } else {
-            self.workdir.join(rel_path)
-        }
+        self.resolve_read_with_follow(rel_path, true)
+            .unwrap_or_else(|| self.upper.join(rel_path))
     }
 
     // ---- Syscall handlers (called by cow::dispatch) ----
@@ -1498,9 +2128,14 @@ impl SeccompCowBranch {
     /// seccomp supervisor) and prevents new opens once the quota is
     /// exhausted.
     pub fn handle_open(&mut self, path: &str, flags: u64) -> Result<Option<PathBuf>, BranchError> {
-        let rel = match self.safe_rel(path) {
+        let lexical_rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(None),
+        };
+        let rel = match self.resolve_merged_rel(&lexical_rel, flags & O_NOFOLLOW == 0) {
+            Some(rel) => rel,
+            None if flags & O_CREAT != 0 => lexical_rel.clone(),
+            None => return Err(BranchError::Deleted),
         };
         if flags & O_DIRECTORY != 0 {
             // A whiteouted directory must not fall through to the kernel:
@@ -1551,7 +2186,9 @@ impl SeccompCowBranch {
         if is_write {
             self.ensure_cow_copy(&rel).map(Some)
         } else {
-            let resolved = self.resolve_read(&rel);
+            let resolved = self
+                .resolve_read_with_follow(&lexical_rel, flags & O_NOFOLLOW == 0)
+                .ok_or(BranchError::Deleted)?;
             if resolved.exists() || resolved.is_symlink() {
                 Ok(Some(resolved))
             } else {
@@ -1565,13 +2202,18 @@ impl SeccompCowBranch {
     /// Returns a plan that describes what I/O needs to happen after the lock
     /// is released. This keeps the lock held only for metadata checks.
     pub fn prepare_open(&mut self, path: &str, flags: u64) -> Result<CowOpenPlan, BranchError> {
+        let lexical_rel = match self.safe_rel(path) {
+            Some(rel) => rel,
+            None => return Ok(CowOpenPlan::Skip),
+        };
+        let rel = match self.resolve_merged_rel(&lexical_rel, flags & O_NOFOLLOW == 0) {
+            Some(rel) => rel,
+            None if flags & O_CREAT != 0 => lexical_rel.clone(),
+            None => return Ok(CowOpenPlan::Deleted),
+        };
         if flags & O_DIRECTORY != 0 {
             // Resolve O_DIRECTORY opens to the upper layer if the directory
             // was created by COW and doesn't exist on the real filesystem.
-            let rel = match self.safe_rel(path) {
-                Some(r) => r,
-                None => return Ok(CowOpenPlan::Skip),
-            };
             // Same whiteout gate as the non-directory path: Skip would let
             // the kernel open the still-existing lower directory where the
             // merged answer is ENOENT.
@@ -1579,17 +2221,14 @@ impl SeccompCowBranch {
                 return Ok(CowOpenPlan::Deleted);
             }
             let upper_dir = self.upper.join(&rel);
-            let lower_dir = self.workdir.join(&rel);
-            if upper_dir.is_dir() && !lower_dir.is_dir() {
+            // Any upper entry shadows the lower one.  In particular, a
+            // chmod'd directory can exist in both layers; falling through to
+            // the lower would bypass the upper's mode (or even its type).
+            if self.upper_has(&rel) {
                 return Ok(CowOpenPlan::Resolved(upper_dir));
             }
             return Ok(CowOpenPlan::Skip);
         }
-        let rel = match self.safe_rel(path) {
-            Some(r) => r,
-            None => return Ok(CowOpenPlan::Skip),
-        };
-
         let is_write = flags & WRITE_FLAGS != 0;
 
         // Resync quota accounting before any write open.
@@ -1625,7 +2264,13 @@ impl SeccompCowBranch {
         if is_write {
             self.prepare_cow_copy(&rel)
         } else {
-            let resolved = self.resolve_read(&rel);
+            let resolved = match self.resolve_read_with_follow(
+                &lexical_rel,
+                flags & O_NOFOLLOW == 0,
+            ) {
+                Some(path) => path,
+                None => return Ok(CowOpenPlan::Deleted),
+            };
             if resolved.exists() || resolved.is_symlink() {
                 Ok(CowOpenPlan::Resolved(resolved))
             } else {
@@ -1637,7 +2282,11 @@ impl SeccompCowBranch {
     /// Prepare a COW copy for openat — wraps `prepare_copy` into `CowOpenPlan`.
     fn prepare_cow_copy(&mut self, rel_path: &str) -> Result<CowOpenPlan, BranchError> {
         match self.prepare_copy(rel_path)? {
-            CowCopyPlan::Ready(upper) => Ok(CowOpenPlan::UpperReady { upper }),
+            CowCopyPlan::Ready(upper) => Ok(CowOpenPlan::UpperReady {
+                create_candidate: crate::sys::fs::statat_in_root(&self.upper, rel_path, false)
+                    .is_err(),
+                upper,
+            }),
             CowCopyPlan::NeedsCopy { upper, lower, file_size } => {
                 Ok(CowOpenPlan::NeedsCopy {
                     upper,
@@ -1722,6 +2371,7 @@ impl SeccompCowBranch {
             }
             self.recalc_disk_used();
         }
+        self.forget_directory_modes_under(&rel);
 
         if lower_file.exists() || lower_file.is_symlink() {
             self.mark_deleted(&rel);
@@ -1734,7 +2384,7 @@ impl SeccompCowBranch {
     /// Handle mkdirat.
     ///
     /// Returns `Err(QuotaExceeded)` when the directory would exceed `max_disk`.
-    pub fn handle_mkdir(&mut self, path: &str) -> Result<bool, BranchError> {
+    pub fn handle_mkdir(&mut self, path: &str, mode: u32) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(path) {
             Some(r) => r,
             None => return Ok(false),
@@ -1742,8 +2392,21 @@ impl SeccompCowBranch {
         self.record_base(&rel);
         self.check_quota(4096)?; // directory metadata
         self.has_changes = true;
-        let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
+        let mode = mode & 0o7777;
+        if let Some(parent) = parent_rel(&rel) {
+            if crate::sys::fs::mkdirp_in_root(&self.upper, parent, 0o700).is_err() {
+                // A symlinked or otherwise unresolvable parent is not an
+                // invitation to let the kernel retry against the lower.
+                return Ok(false);
+            }
+        }
+        let ok = match crate::sys::fs::mkdir_in_root(&self.upper, &rel, 0o700) {
+            Ok(()) => true,
+            Err(_) => false,
+        };
         if ok {
+            let _ = crate::sys::fs::chmod_in_root(&self.upper, &rel, mode);
+            self.directory_modes.insert(rel, mode);
             self.disk_used += 4096;
         }
         Ok(ok)
@@ -1801,6 +2464,42 @@ impl SeccompCowBranch {
             .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
     }
 
+    pub(crate) fn merged_entry_exists_path(&self, path: &str) -> bool {
+        self.safe_rel(path)
+            .is_some_and(|rel| self.merged_entry_is_dir(&rel).is_some())
+    }
+
+    /// Validate the parent directory exactly as the merged namespace sees it.
+    /// Upper materialization may mirror an existing lower parent, but it must
+    /// never synthesize a parent that is absent from the logical filesystem.
+    pub(crate) fn check_merged_parent_path(&self, path: &str) -> Result<(), i32> {
+        let rel = self.safe_rel(path).ok_or(libc::EACCES)?;
+        let Some(parent) = parent_rel(&rel).filter(|parent| !parent.is_empty()) else {
+            return Ok(());
+        };
+        let resolved = self
+            .resolve_merged_rel(parent, true)
+            .ok_or(libc::ENOENT)?;
+        match self.merged_entry_is_dir(&resolved) {
+            Some(true) => Ok(()),
+            Some(false) => Err(libc::ENOTDIR),
+            None => Err(libc::ENOENT),
+        }
+    }
+
+    pub(crate) fn merged_entry_is_symlink_path(&self, path: &str) -> bool {
+        let Some(rel) = self.safe_rel(path) else {
+            return false;
+        };
+        let stat = crate::sys::fs::statat_in_root(&self.upper, &rel, false).or_else(|_| {
+            if self.deleted.covers(&rel) {
+                return Err(libc::ENOENT);
+            }
+            crate::sys::fs::statat_in_root(&self.workdir, &rel, false)
+        });
+        stat.is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFLNK)
+    }
+
     /// Handle rename.
     ///
     /// Returns `Ok(true)` on success, `Ok(false)` when the branch does not
@@ -1809,6 +2508,21 @@ impl SeccompCowBranch {
     /// non-empty directory destination, EISDIR/ENOTDIR for type mismatches,
     /// ENOSPC for quota).
     pub fn handle_rename(&mut self, old_path: &str, new_path: &str) -> Result<bool, i32> {
+        self.handle_rename_with_flags(old_path, new_path, 0)
+    }
+
+    pub fn handle_rename_with_flags(
+        &mut self,
+        old_path: &str,
+        new_path: &str,
+        flags: u32,
+    ) -> Result<bool, i32> {
+        let known = libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT;
+        if flags & !known != 0 || flags & (libc::RENAME_EXCHANGE | libc::RENAME_WHITEOUT) != 0 {
+            // Exchange/whiteout need two-entry atomic staging. Refuse rather
+            // than silently degrading them to destructive plain rename.
+            return Err(libc::EINVAL);
+        }
         let old_rel = match self.safe_rel(old_path) {
             Some(r) => r,
             None => return Ok(false),
@@ -1822,6 +2536,9 @@ impl SeccompCowBranch {
             Some(d) => d,
             None => return Err(libc::ENOENT),
         };
+        if flags & libc::RENAME_NOREPLACE != 0 && self.merged_entry_is_dir(&new_rel).is_some() {
+            return Err(libc::EEXIST);
+        }
         // Destination semantics come from the merged view: renaming onto an
         // existing directory must replace it or refuse, never publish the
         // union of the renamed tree and the pre-existing one (issue #160
@@ -1844,6 +2561,7 @@ impl SeccompCowBranch {
         if crate::sys::fs::renameat_in_root(&self.upper, &old_rel, &new_rel).is_err() {
             return Ok(false);
         }
+        self.remap_directory_modes(&old_rel, &new_rel);
         // A surviving lower entry under either name gets a whiteout: the
         // source so it stops existing, the destination so commit removes it
         // before publishing the renamed entry instead of merging into it.
@@ -1859,11 +2577,19 @@ impl SeccompCowBranch {
 
     /// Handle stat: resolve path to upper or lower.
     pub fn handle_stat(&self, path: &str) -> Option<PathBuf> {
+        self.handle_stat_with_follow(path, true)
+    }
+
+    pub(crate) fn handle_stat_with_follow(
+        &self,
+        path: &str,
+        follow_final: bool,
+    ) -> Option<PathBuf> {
         let rel = self.safe_rel(path)?;
         if self.is_deleted(&rel) {
             return None;
         }
-        let resolved = self.resolve_read(&rel);
+        let resolved = self.resolve_read_with_follow(&rel, follow_final)?;
         if resolved.exists() || resolved.is_symlink() {
             Some(resolved)
         } else {
@@ -1879,8 +2605,23 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        if std::path::Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
+        let target_path = Path::new(target);
+        if target_path.is_absolute() {
             return Ok(false);
+        }
+        let mut depth = parent_rel(&rel)
+            .map(|parent| Path::new(parent).components().count())
+            .unwrap_or(0);
+        for component in target_path.components() {
+            match component {
+                std::path::Component::ParentDir if depth == 0 => return Ok(false),
+                std::path::Component::ParentDir => depth -= 1,
+                std::path::Component::Normal(_) => depth += 1,
+                std::path::Component::CurDir => {}
+                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                    return Ok(false)
+                }
+            }
         }
         self.record_base(&rel);
         self.check_quota(256)?;
@@ -1936,7 +2677,15 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         let _ = self.ensure_cow_copy(&rel)?;
-        Ok(crate::sys::fs::chmod_in_root(&self.upper, &rel, mode).is_ok())
+        let changed = crate::sys::fs::chmod_in_root(&self.upper, &rel, mode).is_ok();
+        if changed
+            && crate::sys::fs::statat_in_root(&self.upper, &rel, false)
+                .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                .unwrap_or(false)
+        {
+            self.directory_modes.insert(rel, mode & 0o7777);
+        }
+        Ok(changed)
     }
 
     /// Handle fchownat.
@@ -2003,7 +2752,8 @@ impl SeccompCowBranch {
 
     /// Handle readlink.
     pub fn handle_readlink(&self, path: &str) -> Option<String> {
-        let rel = self.safe_rel(path)?;
+        let lexical_rel = self.safe_rel(path)?;
+        let rel = self.resolve_merged_rel(&lexical_rel, false)?;
         if self.is_deleted(&rel) {
             return None;
         }
@@ -2231,6 +2981,9 @@ impl SeccompCowBranch {
     /// Entries are merged in sorted order, so a partial merge is a prefix of a
     /// deterministic sequence rather than an arbitrary subset.
     pub fn commit(&mut self) -> Result<(), BranchError> {
+        if self.is_snapshot_backed() {
+            return Err(BranchError::Denied);
+        }
         self.commit_inner(DROP_COMMIT_LOCK_WAIT, std::thread::sleep)
     }
 
@@ -2310,6 +3063,9 @@ impl SeccompCowBranch {
         lock_wait: Duration,
         sleep: impl FnMut(Duration),
     ) -> Result<(), CommitError> {
+        if self.is_snapshot_backed() {
+            return Err(CommitError::Merge(BranchError::Denied));
+        }
         if self.is_disposed() {
             return Ok(());
         }
@@ -2694,7 +3450,7 @@ impl SeccompCowBranch {
     /// unmerged remainder away; the workdir stays as the partial merge left it.
     pub fn abort(&mut self) -> Result<(), BranchError> {
         if self.is_disposed() { return Ok(()); }
-        self.cleanup();
+        self.cleanup_explicit()?;
         self.state = BranchState::Finished;
         Ok(())
     }
@@ -2887,6 +3643,31 @@ impl SeccompCowBranch {
         )
     }
 
+    fn cleanup_explicit(&self) -> Result<(), BranchError> {
+        match fs::remove_file(self.storage_dir.join(PRESERVED_MARKER)) {
+            Ok(()) => sync_dir(&self.storage_dir)
+                .map_err(|error| BranchError::Operation(format!("retire branch marker: {error}")))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BranchError::Operation(format!("retire branch marker: {error}"))),
+        }
+        crate::snapshot::make_tree_removable(&self.storage_dir).map_err(|error| {
+            BranchError::Operation(format!("prepare branch storage removal: {error}"))
+        })?;
+        match fs::remove_dir_all(&self.storage_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(BranchError::Operation(format!("destroy branch storage: {error}"))),
+        }
+        if let Some(base) = self.storage_dir.parent() {
+            sync_dir(base)
+                .map_err(|error| BranchError::Operation(format!("sync branch storage: {error}")))?;
+        }
+        if let Some(lease) = &self.snapshot_lease {
+            lease.release().map_err(BranchError::Snapshot)?;
+        }
+        Ok(())
+    }
+
     fn cleanup(&self) {
         // Retire the record before the storage it describes, durably.
         //
@@ -2903,7 +3684,17 @@ impl SeccompCowBranch {
         if fs::remove_file(self.storage_dir.join(PRESERVED_MARKER)).is_ok() {
             let _ = sync_dir(&self.storage_dir);
         }
-        let _ = fs::remove_dir_all(&self.storage_dir);
+        let _ = crate::snapshot::make_tree_removable(&self.storage_dir);
+        let storage_removed = match fs::remove_dir_all(&self.storage_dir) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if storage_removed {
+            if let Some(lease) = &self.snapshot_lease {
+                let _ = lease.release();
+            }
+        }
     }
 }
 
@@ -4297,7 +5088,7 @@ mod tests {
         // mkdir adds 4096 bytes of metadata accounting.
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         let path = abs(&branch, "newdir");
-        let err = branch.handle_mkdir(&path).unwrap_err();
+        let err = branch.handle_mkdir(&path, 0o755).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
 
@@ -4306,7 +5097,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5000).unwrap();
         let path = abs(&branch, "newdir");
-        assert!(matches!(branch.handle_mkdir(&path), Ok(true)));
+        assert!(matches!(branch.handle_mkdir(&path, 0o755), Ok(true)));
     }
 
     #[test]
@@ -4706,7 +5497,7 @@ mod tests {
 
         // Create a directory in the upper layer via handle_mkdir.
         let dir_path = abs(&branch, "mydir");
-        assert!(branch.handle_mkdir(&dir_path).unwrap());
+        assert!(branch.handle_mkdir(&dir_path, 0o755).unwrap());
 
         // unlink (is_dir=false) on a directory must fail with EISDIR.
         let err = branch.handle_unlink(&dir_path, false).unwrap_err();
@@ -4720,7 +5511,7 @@ mod tests {
 
         // Create a directory in the upper layer.
         let dir_path = abs(&branch, "mydir");
-        assert!(branch.handle_mkdir(&dir_path).unwrap());
+        assert!(branch.handle_mkdir(&dir_path, 0o755).unwrap());
 
         // rmdir (is_dir=true) on a real directory should succeed.
         assert!(branch.handle_unlink(&dir_path, true).unwrap());
@@ -4849,7 +5640,7 @@ mod tests {
         let escape_path = format!("{}/evil/sandlock_escape_dir", wd.display());
         // Confined: the write is clamped to the upper root and must be refused.
         assert!(
-            !branch.handle_mkdir(&escape_path).unwrap(),
+            !branch.handle_mkdir(&escape_path, 0o755).unwrap(),
             "handle_mkdir reported success writing through an escaping symlink"
         );
         assert!(
@@ -4933,7 +5724,7 @@ mod tests {
         ));
         // Re-created in the upper: the shadow makes it visible again and the
         // open goes back to the normal resolution.
-        assert!(branch.handle_mkdir(&path).unwrap());
+        assert!(branch.handle_mkdir(&path, 0o755).unwrap());
         assert!(matches!(branch.handle_open(&path, dirflag), Ok(None)));
         assert!(!matches!(
             branch.prepare_open(&path, dirflag),
@@ -4987,7 +5778,9 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         branch.mark_deleted("d");
         let wd = branch.workdir_str().to_string();
-        assert!(branch.handle_mkdir(&format!("{}/d", wd)).unwrap());
+        assert!(branch
+            .handle_mkdir(&format!("{}/d", wd), 0o755)
+            .unwrap());
 
         assert!(!branch.is_deleted("d"));
         assert!(branch.is_deleted("d/old.txt"));
@@ -5057,7 +5850,9 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = branch.workdir_str().to_string();
-        assert!(branch.handle_mkdir(&format!("{}/newdir", wd)).unwrap());
+        assert!(branch
+            .handle_mkdir(&format!("{}/newdir", wd), 0o755)
+            .unwrap());
         fs::write(branch.upper_dir().join("newdir/f.txt"), "x").unwrap();
         assert_eq!(
             branch.handle_unlink(&format!("{}/newdir", wd), true),
@@ -5823,7 +6618,10 @@ mod tests {
         // it is what makes `upper_has("link/d")` true while the deletion is
         // still outstanding.
         let recreated = format!("{}/link/d", branch.workdir.display());
-        assert!(branch.handle_mkdir(&recreated).unwrap(), "the upper mkdir must succeed");
+        assert!(
+            branch.handle_mkdir(&recreated, 0o755).unwrap(),
+            "the upper mkdir must succeed"
+        );
         fs::write(branch.upper.join("link/d/new.txt"), "fresh").unwrap();
         assert!(branch.upper_has("link/d"), "the upper must hold the re-created path");
 

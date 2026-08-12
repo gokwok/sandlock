@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock as AsyncRwLock};
 
 /// Resource-limit runtime state shared across notification handlers.
 pub struct ResourceState {
@@ -303,6 +303,16 @@ impl ProcessIndex {
         }
     }
 
+    /// Forget a synthetic cwd so the next path operation re-reads the
+    /// kernel's successfully installed cwd from `/proc`.
+    pub fn clear_virtual_cwd(&self, pid: i32) {
+        if let Some(cell) = self.cwd_cell(pid) {
+            if let Ok(mut slot) = cell.lock() {
+                *slot = None;
+            }
+        }
+    }
+
     /// Look up the canonical PidKey for a notification's raw pid.
     /// Returns None if this pid was never registered (e.g. pidfd_open
     /// failed at fork) — callers should fall back to a no-op.
@@ -428,12 +438,30 @@ impl Default for ProcessIndex {
 pub struct CowState {
     /// Seccomp-based COW branch (None if COW disabled).
     pub branch: Option<crate::cow::seccomp::SeccompCowBranch>,
+    /// Spans complete notification operations, including blocking copy-up I/O.
+    /// A checkpoint takes the exclusive side after stopping the process group.
+    pub(crate) operation_gate: Arc<AsyncRwLock<()>>,
 }
 
 impl CowState {
     pub fn new() -> Self {
-        Self { branch: None }
+        Self {
+            branch: None,
+            operation_gate: Arc::new(AsyncRwLock::new(())),
+        }
     }
+}
+
+/// Enter one notification operation that can observe or mutate COW state.
+///
+/// The returned owned guard deliberately outlives the short `CowState` mutex
+/// acquisition and stays held while handlers perform copy-up I/O outside that
+/// mutex. Attached checkpoint takes the exclusive side of the same gate.
+pub(crate) async fn enter_cow_operation(
+    cow: &Arc<AsyncMutex<CowState>>,
+) -> OwnedRwLockReadGuard<()> {
+    let gate = Arc::clone(&cow.lock().await.operation_gate);
+    gate.read_owned().await
 }
 
 // ============================================================

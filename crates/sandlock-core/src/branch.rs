@@ -5,6 +5,7 @@ use crate::dry_run::Change;
 use crate::error::BranchError;
 use crate::recovery::PreservedBranch;
 use crate::result::RunResult;
+use crate::snapshot::FsSnapshot;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +80,46 @@ impl FsBranch {
         SeccompCowBranch::create(workdir.as_ref(), None, 0).map(Self::new)
     }
 
+    /// Create a branch whose immutable lower is `snapshot`.
+    ///
+    /// The branch holds a durable lease on the snapshot until it is aborted,
+    /// dropped, or otherwise disposed. Snapshot-backed branches cannot be
+    /// committed into their lower; use [`FsBranch::checkpoint`] to publish a
+    /// new immutable snapshot instead.
+    pub fn from_snapshot(
+        snapshot: &FsSnapshot,
+        storage: impl AsRef<Path>,
+    ) -> Result<Self, BranchError> {
+        Self::from_snapshot_options(snapshot, Some(storage.as_ref()), 0)
+    }
+
+    /// Create a quota-limited branch whose immutable lower is `snapshot`.
+    pub fn from_snapshot_with_quota(
+        snapshot: &FsSnapshot,
+        storage: impl AsRef<Path>,
+        max_disk_bytes: u64,
+    ) -> Result<Self, BranchError> {
+        Self::from_snapshot_options(snapshot, Some(storage.as_ref()), max_disk_bytes)
+    }
+
+    pub(crate) fn from_snapshot_options(
+        snapshot: &FsSnapshot,
+        storage: Option<&Path>,
+        max_disk_bytes: u64,
+    ) -> Result<Self, BranchError> {
+        let mut branch = SeccompCowBranch::create(snapshot.root_dir(), storage, max_disk_bytes)?;
+        branch.set_lower_directory_modes(
+            snapshot
+                .directory_modes()
+                .map_err(BranchError::Snapshot)?,
+        );
+        let lease = snapshot
+            .acquire_branch_lease(branch.storage_dir())
+            .map_err(BranchError::Snapshot)?;
+        branch.set_snapshot_lease(lease);
+        Ok(Self::new(branch))
+    }
+
     pub(crate) fn new(mut branch: SeccompCowBranch) -> Self {
         branch.track_conflicts();
         Self {
@@ -135,6 +176,24 @@ impl FsBranch {
     /// them. An empty result means no write conflict was detected.
     pub fn conflicts(&self) -> Result<Vec<PathBuf>, BranchError> {
         Ok(self.pending()?.conflicts())
+    }
+
+    /// Capture the branch's current merged view as a new immutable snapshot.
+    ///
+    /// This is non-terminal: the branch and its staged changes remain usable,
+    /// and later changes do not affect the returned snapshot.
+    pub fn checkpoint(
+        &self,
+        snapshot_storage: impl AsRef<Path>,
+    ) -> Result<FsSnapshot, BranchError> {
+        self.pending()?.checkpoint(snapshot_storage.as_ref())
+    }
+
+    /// Whether this branch uses an immutable snapshot as its lower.
+    pub fn is_snapshot_backed(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(SeccompCowBranch::is_snapshot_backed)
     }
 
     /// Merge this branch into its workdir.
@@ -264,6 +323,7 @@ pub type PendingBranch = FsBranch;
 mod tests {
     use super::*;
     use crate::dry_run::ChangeKind;
+    use crate::error::SnapshotError;
     use std::fs;
 
     fn pending_branch() -> (tempfile::TempDir, tempfile::TempDir, PendingBranch) {
@@ -339,6 +399,258 @@ mod tests {
         );
         assert!(!workdir.path().join("added.txt").exists());
         assert!(!upper.exists());
+    }
+
+    #[test]
+    fn snapshot_branch_checkpoint_is_non_terminal_and_holds_a_lease() {
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        let checkpoint_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("existing.txt"), b"original").unwrap();
+        fs::write(source.path().join("deleted.txt"), b"remove me").unwrap();
+        let mut base = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+
+        let mut branch = FsBranch::from_snapshot(&base, branch_storage.path()).unwrap();
+        fs::write(branch.upper_dir().join("existing.txt"), b"checkpointed").unwrap();
+        fs::write(branch.upper_dir().join("added.txt"), b"added").unwrap();
+        branch.inner.as_mut().unwrap().mark_deleted("deleted.txt");
+
+        assert!(matches!(
+            base.destroy(),
+            Err(SnapshotError::InUse { count: 1 })
+        ));
+        assert!(matches!(branch.commit(), Err(BranchError::Denied)));
+        assert_eq!(branch.state(), BranchState::Pending);
+
+        let checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+        fs::write(branch.upper_dir().join("existing.txt"), b"later").unwrap();
+        assert_eq!(
+            checkpoint.read_range("existing.txt", 0, 64).unwrap(),
+            b"checkpointed"
+        );
+        assert_eq!(checkpoint.read_range("added.txt", 0, 64).unwrap(), b"added");
+        assert!(checkpoint.stat("deleted.txt").is_err());
+
+        branch.abort().unwrap();
+        base.destroy().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_does_not_publish_placeholder_parent_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        let checkpoint_storage = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("private")).unwrap();
+        fs::set_permissions(
+            source.path().join("private"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(source.path().join("private/file"), b"base").unwrap();
+        let base = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+        let mut branch = FsBranch::from_snapshot(&base, branch_storage.path()).unwrap();
+
+        let upper = branch
+            .pending_mut()
+            .unwrap()
+            .ensure_cow_copy("private/file")
+            .unwrap();
+        fs::write(upper, b"changed").unwrap();
+        let checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+
+        assert_eq!(
+            checkpoint.stat("private").unwrap().mode,
+            0o700
+        );
+    }
+
+    #[test]
+    fn checkpoint_does_not_publish_placeholder_descendant_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        let checkpoint_storage = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("a/b")).unwrap();
+        fs::set_permissions(source.path().join("a/b"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(source.path().join("a/b/file"), b"base").unwrap();
+        let base = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+        let mut branch = FsBranch::from_snapshot(&base, branch_storage.path()).unwrap();
+        let lower_a = base.root_dir().join("a");
+        branch
+            .pending_mut()
+            .unwrap()
+            .handle_chmod(lower_a.to_str().unwrap(), 0o711)
+            .unwrap();
+        let upper = branch
+            .pending_mut()
+            .unwrap()
+            .ensure_cow_copy("a/b/file")
+            .unwrap();
+        fs::write(upper, b"changed").unwrap();
+
+        let checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+        assert_eq!(
+            checkpoint.stat("a").unwrap().mode,
+            0o711
+        );
+        assert_eq!(
+            checkpoint.stat("a/b").unwrap().mode,
+            0o700
+        );
+    }
+
+    #[test]
+    fn checkpoint_preserves_modes_in_a_renamed_directory_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        let checkpoint_storage = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("old/child/grandchild")).unwrap();
+        fs::set_permissions(
+            source.path().join("old"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        fs::set_permissions(
+            source.path().join("old/child"),
+            fs::Permissions::from_mode(0o711),
+        )
+        .unwrap();
+        fs::set_permissions(
+            source.path().join("old/child/grandchild"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let base = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+        let mut branch = FsBranch::from_snapshot(&base, branch_storage.path()).unwrap();
+        let old = base.root_dir().join("old");
+        let new = base.root_dir().join("new");
+
+        assert!(branch
+            .pending_mut()
+            .unwrap()
+            .handle_rename(old.to_str().unwrap(), new.to_str().unwrap())
+            .unwrap());
+        let checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+
+        for (path, expected) in [
+            ("new", 0o750),
+            ("new/child", 0o711),
+            ("new/child/grandchild", 0o700),
+        ] {
+            assert_eq!(
+                checkpoint.stat(path).unwrap().mode,
+                expected,
+                "mode mismatch for {path}"
+            );
+        }
+        assert!(!checkpoint.root_dir().join("old").exists());
+    }
+
+    #[test]
+    fn snapshot_lower_modes_follow_merged_type_and_metadata_copy_up() {
+        let source = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let first_branch_storage = tempfile::tempdir().unwrap();
+        let first_checkpoint_storage = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("restricted")).unwrap();
+        let base = FsSnapshot::capture(source.path(), storage.path()).unwrap();
+        let mut first = FsBranch::from_snapshot(&base, first_branch_storage.path()).unwrap();
+        let restricted = base.root_dir().join("restricted");
+        first
+            .pending_mut()
+            .unwrap()
+            .handle_chmod(restricted.to_str().unwrap(), 0o000)
+            .unwrap();
+        let restricted_snapshot = first.checkpoint(first_checkpoint_storage.path()).unwrap();
+        assert_eq!(restricted_snapshot.stat("restricted").unwrap().mode, 0o000);
+
+        let copy_branch_storage = tempfile::tempdir().unwrap();
+        let copy_checkpoint_storage = tempfile::tempdir().unwrap();
+        let mut copied =
+            FsBranch::from_snapshot(&restricted_snapshot, copy_branch_storage.path()).unwrap();
+        let restricted = restricted_snapshot.root_dir().join("restricted");
+        copied
+            .pending_mut()
+            .unwrap()
+            .handle_chown(restricted.to_str().unwrap(), 0, 0)
+            .unwrap();
+        let copied_checkpoint = copied.checkpoint(copy_checkpoint_storage.path()).unwrap();
+        assert_eq!(copied_checkpoint.stat("restricted").unwrap().mode, 0o000);
+
+        let replace_branch_storage = tempfile::tempdir().unwrap();
+        let replace_checkpoint_storage = tempfile::tempdir().unwrap();
+        let mut replaced =
+            FsBranch::from_snapshot(&restricted_snapshot, replace_branch_storage.path()).unwrap();
+        assert!(replaced
+            .pending_mut()
+            .unwrap()
+            .handle_unlink(restricted.to_str().unwrap(), true)
+            .unwrap());
+        assert!(replaced
+            .pending_mut()
+            .unwrap()
+            .handle_mknod(restricted.to_str().unwrap(), libc::S_IFREG as u32 | 0o600, 0)
+            .unwrap());
+        assert!(replaced
+            .pending()
+            .unwrap()
+            .logical_directory_mode(restricted.to_str().unwrap())
+            .is_none());
+        let replaced_checkpoint = replaced.checkpoint(replace_checkpoint_storage.path()).unwrap();
+        assert_eq!(
+            replaced_checkpoint.stat("restricted").unwrap().kind,
+            crate::snapshot::SnapshotEntryKind::File
+        );
+    }
+
+    #[test]
+    fn persisted_snapshot_branch_reopens_with_its_lease() {
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("file.txt"), b"base").unwrap();
+        let mut snapshot = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+        let mut branch = FsBranch::from_snapshot(&snapshot, branch_storage.path()).unwrap();
+        fs::write(branch.upper_dir().join("file.txt"), b"staged").unwrap();
+
+        let preserved = branch.persist().unwrap();
+        assert!(matches!(
+            snapshot.destroy(),
+            Err(SnapshotError::InUse { count: 1 })
+        ));
+        let mut reopened = FsBranch::reopen(preserved).unwrap();
+        assert!(reopened.is_snapshot_backed());
+        reopened.abort().unwrap();
+        snapshot.destroy().unwrap();
+    }
+
+    #[test]
+    fn snapshot_branch_uses_canonical_storage_and_schema_two() {
+        let source = tempfile::tempdir().unwrap();
+        let snapshot_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("file.txt"), b"base").unwrap();
+        let snapshot = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+        let mut branch = FsBranch::from_snapshot(&snapshot, branch_storage.path()).unwrap();
+
+        let storage_dir = branch.pending().unwrap().storage_dir().to_path_buf();
+        assert!(storage_dir.is_absolute());
+        let preserved = branch.persist().unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(preserved.branch_dir.join("REOPEN.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["schema_version"], 2);
+
+        FsBranch::reopen(preserved).unwrap().abort().unwrap();
     }
 
     #[test]

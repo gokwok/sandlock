@@ -516,36 +516,51 @@ pub(crate) struct OpenArgs {
 
 /// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
 /// `struct open_how` in child memory, so its decode reads child memory and
-/// can fail; `None` means "could not decode" and the caller soft-falls-through
-/// (the kernel's own re-read fails the same way).
-pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
+/// can fail. Malformed layouts return the same errno class the kernel uses so
+/// an earlier supervisor handler cannot bypass the later COW validation.
+pub(crate) fn decode_open_args(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+) -> Result<OpenArgs, i32> {
     let a = &notif.data.args;
     let nr = notif.data.nr as i64;
     if nr == libc::SYS_openat {
-        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags: a[2], mode: a[3], resolve: 0 })
+        Ok(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags: a[2], mode: a[3], resolve: 0 })
     } else if nr == arch::SYS_OPENAT2 {
         // openat2(dirfd, pathname, struct open_how *how, size_t size),
         // open_how = { u64 flags, u64 mode, u64 resolve }.
         let how_ptr = a[2];
-        let want = (a[3] as usize).min(std::mem::size_of::<OpenHow>());
-        if how_ptr == 0 || want < 16 {
-            return None; // need at least flags + mode
+        let want = usize::try_from(a[3]).map_err(|_| libc::E2BIG)?;
+        if how_ptr == 0 {
+            return Err(libc::EFAULT);
         }
-        let bytes = read_child_mem(notif_fd, notif.id, notif.pid, how_ptr, want).ok()?;
-        if bytes.len() < 16 {
-            return None;
+        if want < std::mem::size_of::<OpenHow>() {
+            return Err(libc::EINVAL);
         }
-        let flags = u64::from_ne_bytes(bytes[0..8].try_into().ok()?);
-        let mode = u64::from_ne_bytes(bytes[8..16].try_into().ok()?);
-        let resolve = if bytes.len() >= 24 {
-            u64::from_ne_bytes(bytes[16..24].try_into().ok()?)
-        } else {
-            0
-        };
-        Some(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags, mode, resolve })
+        // Linux rejects implausibly large extensible structs rather than
+        // attempting an unbounded copy from userspace.
+        if want > 4096 {
+            return Err(libc::E2BIG);
+        }
+        let bytes = read_child_mem(notif_fd, notif.id, notif.pid, how_ptr, want)
+            .map_err(|_| libc::EFAULT)?;
+        if bytes.len() < std::mem::size_of::<OpenHow>() {
+            return Err(libc::EFAULT);
+        }
+        let flags = u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| libc::EFAULT)?);
+        let mode = u64::from_ne_bytes(bytes[8..16].try_into().map_err(|_| libc::EFAULT)?);
+        let resolve = u64::from_ne_bytes(bytes[16..24].try_into().map_err(|_| libc::EFAULT)?);
+        if bytes[24..].iter().any(|byte| *byte != 0) {
+            return Err(libc::E2BIG);
+        }
+        const KNOWN_RESOLVE_FLAGS: u64 = 0x3f;
+        if resolve & !KNOWN_RESOLVE_FLAGS != 0 {
+            return Err(libc::EINVAL);
+        }
+        Ok(OpenArgs { dirfd: a[0] as i64, path_ptr: a[1], flags, mode, resolve })
     } else {
         // legacy open(path, flags, mode) — AT_FDCWD implied.
-        Some(OpenArgs { dirfd: libc::AT_FDCWD as i64, path_ptr: a[0], flags: a[1], mode: a[2], resolve: 0 })
+        Ok(OpenArgs { dirfd: libc::AT_FDCWD as i64, path_ptr: a[0], flags: a[1], mode: a[2], resolve: 0 })
     }
 }
 
@@ -678,8 +693,8 @@ fn on_behalf_open_for_deny(
 
     let OpenArgs { dirfd, path_ptr, flags, mode, resolve } =
         match decode_open_args(notif, notif_fd) {
-            Some(a) => a,
-            None => return NotifAction::Continue, // kernel's re-read fails the same way
+            Ok(a) => a,
+            Err(errno) => return NotifAction::Errno(errno),
         };
 
     let path = match read_child_cstr(notif_fd, notif.id, notif.pid, path_ptr, 4096) {
@@ -1997,7 +2012,7 @@ async fn emit_policy_event(
 
     // openat/openat2/open: resolved path + flags.
     if nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open() {
-        if let Some(open_args) = decode_open_args(notif, notif_fd) {
+        if let Ok(open_args) = decode_open_args(notif, notif_fd) {
             path = resolve_path_for_notif(notif, notif_fd)
                 .map(std::path::PathBuf::from);
             flags = Some(open_args.flags);

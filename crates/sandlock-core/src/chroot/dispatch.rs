@@ -574,8 +574,8 @@ pub(crate) async fn handle_chroot_open(
     // layout: openat2 keeps flags, mode and resolve in a struct open_how in
     // child memory, where args[2] is the pointer to it rather than the flags.
     let (dirfd, path_ptr, flags, resolve) = match decode_open_args(notif, notif_fd) {
-        Some(a) => (a.dirfd, a.path_ptr, a.flags, a.resolve),
-        None => return NotifAction::Continue,
+        Ok(a) => (a.dirfd, a.path_ptr, a.flags, a.resolve),
+        Err(errno) => return NotifAction::Errno(errno),
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
@@ -1147,17 +1147,22 @@ pub(crate) async fn handle_chroot_write(
             Err(a) => return a,
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
-        let mode = notif.data.args[2] as u32;
+        let requested_mode = notif.data.args[2] as u32;
+        let umask = crate::cow::dispatch::tracee_umask(notif.pid).unwrap_or(0o777);
+        let mode = (requested_mode & 0o7777) & !(umask & 0o777);
 
         {
             let mut cs = cow_state.lock().await;
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
-                    match cow.handle_mkdir(&s) {
+                    match cow.handle_mkdir(&s, mode) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        Ok(false) | Err(crate::error::BranchError::Exists) => {
+                            return NotifAction::Errno(libc::EEXIST)
+                        }
+                        Err(_) => return NotifAction::Errno(libc::EIO),
                     }
                 }
             }
@@ -2027,7 +2032,7 @@ pub(crate) async fn handle_chroot_chdir(
 pub(crate) async fn handle_chroot_fchdir(
     notif: &SeccompNotif,
     _chroot_state: &Arc<Mutex<ChrootState>>,
-    _cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     _notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -2036,8 +2041,23 @@ pub(crate) async fn handle_chroot_fchdir(
     // Only follow a target that is really a directory: anything else fails
     // the kernel's fchdir, and recording it would desync the tracked cwd.
     if let Some(host) = target.filter(|t| t.is_dir()) {
-        if let Some(virtual_cwd) = ctx.host_to_virtual(&host) {
-            set_virtual_cwd(notif, ctx, virtual_cwd);
+        // COW runs later in the handler chain and can still deny this fchdir
+        // based on a logical snapshot mode.  It also owns the workspace's
+        // logical cwd mapping, so do not update it prematurely here.
+        let cow_owned = {
+            let state = cow_state.lock().await;
+            state.branch.as_ref().is_some_and(|cow| {
+                let logical = crate::cow::dispatch::map_cow_upper_path(
+                    cow,
+                    host.to_string_lossy().as_ref(),
+                );
+                cow.matches(&logical)
+            })
+        };
+        if !cow_owned {
+            if let Some(virtual_cwd) = ctx.host_to_virtual(&host) {
+                set_virtual_cwd(notif, ctx, virtual_cwd);
+            }
         }
     }
     NotifAction::Continue

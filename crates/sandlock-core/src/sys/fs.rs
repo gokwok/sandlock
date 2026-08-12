@@ -75,10 +75,18 @@ pub(crate) fn openat2_in_root_with_resolve(
         libc::EINVAL
     })?;
 
+    const RESOLVE_BENEATH: u64 = 0x08;
+    let confined_resolve = if extra_resolve & (RESOLVE_BENEATH | RESOLVE_IN_ROOT) != 0 {
+        // Preserve the caller's mutually-exclusive choice. BENEATH itself is
+        // a confinement boundary when the supervisor starts from root_fd.
+        extra_resolve
+    } else {
+        RESOLVE_IN_ROOT | extra_resolve
+    };
     let how = OpenHow {
         flags: flags as u64,
         mode: mode as u64,
-        resolve: RESOLVE_IN_ROOT | extra_resolve,
+        resolve: confined_resolve,
     };
 
     let fd = unsafe {

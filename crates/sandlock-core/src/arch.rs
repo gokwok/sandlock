@@ -11,6 +11,7 @@ use syscalls::Sysno;
 // single definition resolves to the correct per-arch number at compile time.
 // The `tests` module pins the resolved values to the historical constants.
 pub const SYS_FACCESSAT2: i64 = Sysno::faccessat2 as i64;
+pub const SYS_FCHMODAT2: i64 = Sysno::fchmodat2 as i64;
 pub const SYS_OPENAT2: i64 = Sysno::openat2 as i64;
 pub const SYS_SECCOMP: i64 = Sysno::seccomp as i64;
 pub const SYS_MEMFD_CREATE: i64 = Sysno::memfd_create as i64;

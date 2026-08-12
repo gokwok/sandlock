@@ -24,7 +24,7 @@
 //! provided by Landlock (or by the chroot dispatcher, when chroot mode
 //! is active and runs before COW).
 
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -114,6 +114,9 @@ fn resolve_at_path_with_virtual(
     virtual_cwd: Option<&str>,
 ) -> String {
     if Path::new(path).is_absolute() {
+        if let Some(resolved) = resolve_tracee_magic_fd_path(notif, path) {
+            return resolved;
+        }
         return normalize_path(PathBuf::from(path)).to_string_lossy().into_owned();
     }
     // dirfd is stored as u64 in seccomp_data.args but AT_FDCWD is a negative i32.
@@ -139,7 +142,181 @@ fn resolve_at_path_with_virtual(
     }
 }
 
-fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
+/// Resolve procfs/devfs aliases for a tracee file descriptor in the tracee's
+/// namespace. Reading `/proc/self` from the supervisor would otherwise resolve
+/// its own descriptors and let aliases such as `/dev/fd/N` bypass COW policy.
+fn resolve_tracee_magic_fd_path(notif: &SeccompNotif, path: &str) -> Option<String> {
+    let (fd, tail) = if let Some(rest) = path.strip_prefix("/dev/fd/") {
+        let (fd, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        (fd.parse::<i32>().ok()?, tail)
+    } else if path == "/dev/stdin" || path == "/dev/stdout" || path == "/dev/stderr" {
+        let fd = match path {
+            "/dev/stdin" => 0,
+            "/dev/stdout" => 1,
+            _ => 2,
+        };
+        (fd, "")
+    } else if let Some(rest) = path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))
+    {
+        let (fd, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        (fd.parse::<i32>().ok()?, tail)
+    } else {
+        let components: Vec<_> = path.trim_start_matches('/').split('/').collect();
+        let fd_index = components.iter().position(|component| *component == "fd")?;
+        if components.first().copied() != Some("proc") || fd_index + 1 >= components.len() {
+            return None;
+        }
+        let _fd = components[fd_index + 1].parse::<i32>().ok()?;
+        let link_path = format!("/{}", components[..=fd_index + 1].join("/"));
+        let base = std::fs::read_link(link_path).ok()?;
+        let tail = components[fd_index + 2..].join("/");
+        return Some(normalize_path(base.join(tail)).to_string_lossy().into_owned());
+    };
+    let base = std::fs::read_link(format!("/proc/{}/fd/{fd}", notif.pid)).ok()?;
+    Some(normalize_path(base.join(tail)).to_string_lossy().into_owned())
+}
+
+fn is_magic_fd_path(path: &str) -> bool {
+    path.starts_with("/dev/fd/")
+        || matches!(path, "/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+        || (path.starts_with("/proc/")
+            && path
+                .trim_start_matches('/')
+                .split('/')
+                .any(|component| component == "fd"))
+}
+
+fn dirfd_base_path(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    virtual_cwd: Option<&str>,
+) -> Option<PathBuf> {
+    if dirfd as i32 == libc::AT_FDCWD {
+        virtual_cwd
+            .map(PathBuf::from)
+            .or_else(|| std::fs::read_link(format!("/proc/{}/cwd", notif.pid)).ok())
+    } else {
+        std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd as i32)).ok()
+    }
+}
+
+fn pin_resolution_base(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
+    if dirfd as i32 != libc::AT_FDCWD {
+        return crate::seccomp::notif::dup_fd_from_pid(pid, dirfd as i32)
+            .map_err(|error| error.raw_os_error().unwrap_or(libc::EBADF));
+    }
+    let path = std::ffi::CString::new(format!("/proc/{pid}/cwd")).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EBADF),
+        );
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Enforce execute/search permission on the exact directory inode selected by
+/// a relative *at syscall. Looking up `/proc/<pid>/fd/N` as a pathname alone
+/// is insufficient after that logical name has been copied up or chmod'd.
+async fn check_relative_resolution_base(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    raw_path: &str,
+    cow_state: &Arc<Mutex<CowState>>,
+) -> Result<(), i32> {
+    if Path::new(raw_path).is_absolute() {
+        return Ok(());
+    }
+    if cow_state.lock().await.branch.is_none() {
+        return Ok(());
+    }
+    let pinned = pin_resolution_base(notif.pid, dirfd)?;
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(pinned.as_raw_fd(), &mut metadata) } < 0 {
+        return Err(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EBADF),
+        );
+    }
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(libc::ENOTDIR);
+    }
+    let real_path = std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+        .map_err(|_| libc::EBADF)?;
+    let state = cow_state.lock().await;
+    let Some(cow) = state.branch.as_ref() else {
+        return Ok(());
+    };
+    if !cow.contains_layer_path(&real_path) {
+        return Ok(());
+    }
+    let mode = cow
+        .logical_directory_mode_for_handle(&real_path)
+        .unwrap_or(metadata.st_mode & 0o7777);
+    if mode & 0o100 == 0 {
+        Err(libc::EACCES)
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve the lexical part of an openat2 pathname relative to the caller's
+/// selected dirfd root. BENEATH rejects an attempted `..` escape; IN_ROOT
+/// clamps it and also treats an absolute pathname as relative to that dirfd.
+fn resolve_openat2_lexical_path(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    virtual_cwd: Option<&str>,
+    resolve: u64,
+) -> Result<(String, Option<PathBuf>), i32> {
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    let beneath = resolve & RESOLVE_BENEATH != 0;
+    let in_root = resolve & RESOLVE_IN_ROOT != 0;
+    if beneath && in_root {
+        return Err(libc::EINVAL);
+    }
+    if !beneath && !in_root {
+        return Ok((
+            resolve_at_path_with_virtual(notif, dirfd, path, virtual_cwd),
+            None,
+        ));
+    }
+    if beneath && Path::new(path).is_absolute() {
+        return Err(libc::EXDEV);
+    }
+    let base = dirfd_base_path(notif, dirfd, virtual_cwd).ok_or(libc::EBADF)?;
+    let mut joined = base.clone();
+    let mut relative_depth = 0usize;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(_) => return Err(libc::EINVAL),
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => {
+                joined.push(part);
+                relative_depth += 1;
+            }
+            Component::ParentDir if relative_depth > 0 => {
+                joined.pop();
+                relative_depth -= 1;
+            }
+            Component::ParentDir if beneath => return Err(libc::EXDEV),
+            Component::ParentDir => {
+                // RESOLVE_IN_ROOT gives `..` at the selected root the same
+                // semantics as `..` at `/`: it remains at the root.
+            }
+        }
+    }
+    Ok((normalize_path(joined).to_string_lossy().into_owned(), Some(base)))
+}
+
+pub(crate) fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
     let path = PathBuf::from(path);
     if let Ok(rel) = path.strip_prefix(cow.upper_dir()) {
         return normalize_path(cow.workdir().join(rel)).to_string_lossy().into_owned();
@@ -181,9 +358,10 @@ fn open_confined(
     real_path: &Path,
     flags: i32,
     mode: u32,
+    resolve: u64,
 ) -> Result<RawFd, i32> {
     let (root, rel) = pick_root_rel(upper_root, workdir_root, real_path)?;
-    crate::sys::fs::openat2_in_root(root, &rel, flags, mode)
+    crate::sys::fs::openat2_in_root_with_resolve(root, &rel, flags, mode, resolve)
 }
 
 /// Handle openat under workdir: redirect to COW upper/lower.
@@ -200,25 +378,83 @@ pub(crate) async fn handle_cow_open(
 
     // open(path, flags, mode):         args[0]=path, args[1]=flags, args[2]=mode
     // openat(dirfd, path, flags, mode): args[0]=dirfd, args[1]=path, args[2]=flags, args[3]=mode
-    let (path_ptr, dirfd, flags, mode) = if Some(nr) == arch::sys_open() {
-        (notif.data.args[0], libc::AT_FDCWD as i64, notif.data.args[1], notif.data.args[2])
+    let (path_ptr, dirfd, flags, mode, resolve) = if Some(nr) == arch::sys_open() {
+        (
+            notif.data.args[0],
+            libc::AT_FDCWD as i64,
+            notif.data.args[1],
+            notif.data.args[2],
+            0,
+        )
+    } else if nr == arch::SYS_OPENAT2 {
+        let size = usize::try_from(notif.data.args[3]).unwrap_or(0);
+        if size < 24 {
+            return NotifAction::Errno(libc::EINVAL);
+        }
+        if size > 4096 {
+            return NotifAction::Errno(libc::E2BIG);
+        }
+        let how = match read_child_mem(
+            notif_fd,
+            notif.id,
+            notif.pid,
+            notif.data.args[2],
+            size,
+        ) {
+            Ok(how) => how,
+            Err(_) => return NotifAction::Continue,
+        };
+        let mut flags = [0u8; 8];
+        let mut mode = [0u8; 8];
+        let mut resolve = [0u8; 8];
+        flags.copy_from_slice(&how[..8]);
+        mode.copy_from_slice(&how[8..16]);
+        resolve.copy_from_slice(&how[16..24]);
+        if how[24..].iter().any(|byte| *byte != 0) {
+            return NotifAction::Errno(libc::E2BIG);
+        }
+        (
+            notif.data.args[1],
+            notif.data.args[0] as i64,
+            u64::from_ne_bytes(flags),
+            u64::from_ne_bytes(mode),
+            u64::from_ne_bytes(resolve),
+        )
     } else {
-        (notif.data.args[1], notif.data.args[0] as i64, notif.data.args[2], notif.data.args[3])
+        (
+            notif.data.args[1],
+            notif.data.args[0] as i64,
+            notif.data.args[2],
+            notif.data.args[3],
+            0,
+        )
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+    if let Err(errno) = check_relative_resolution_base(notif, dirfd, &rel_path, cow_state).await {
+        return NotifAction::Errno(errno);
+    }
     let virtual_cwd = if (dirfd as i32) == libc::AT_FDCWD && !Path::new(&rel_path).is_absolute() {
         current_virtual_cwd(processes, notif.pid).await
     } else {
         None
     };
-    let mut path = resolve_at_path_with_virtual(notif, dirfd, &rel_path, virtual_cwd.as_deref());
+    let (mut path, resolve_base) = match resolve_openat2_lexical_path(
+        notif,
+        dirfd,
+        &rel_path,
+        virtual_cwd.as_deref(),
+        resolve,
+    ) {
+        Ok(value) => value,
+        Err(errno) => return NotifAction::Errno(errno),
+    };
 
     // Phase 1: determine plan under lock (no heavy I/O)
-    let (plan, upper_root, workdir_root) = {
+    let (plan, upper_root, workdir_root, bounded_revalidation) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
@@ -228,8 +464,75 @@ pub(crate) async fn handle_cow_open(
         let workdir_root = cow.workdir().to_path_buf();
 
         path = map_cow_upper_path(cow, &path);
+        let resolve_base = resolve_base
+            .as_ref()
+            .map(|base| map_cow_upper_path(cow, base.to_string_lossy().as_ref()));
+        let bounded_input_path = path.clone();
         if !cow.matches(&path) {
             return NotifAction::Continue;
+        }
+        const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+        const KNOWN_RESOLVE_FLAGS: u64 = 0x3f;
+        if resolve & !KNOWN_RESOLVE_FLAGS != 0 {
+            return NotifAction::Errno(libc::EINVAL);
+        }
+        if resolve & RESOLVE_NO_SYMLINKS != 0
+            && cow.merged_path_uses_symlink(&path, flags & libc::O_NOFOLLOW as u64 == 0)
+        {
+            return NotifAction::Errno(libc::ELOOP);
+        }
+        const RESOLVE_BENEATH: u64 = 0x08;
+        if resolve & RESOLVE_BENEATH != 0
+            && cow.merged_path_uses_absolute_symlink(
+                &path,
+                flags & libc::O_NOFOLLOW as u64 == 0,
+            )
+        {
+            return NotifAction::Errno(libc::EXDEV);
+        }
+        if let Some(base) = resolve_base.as_ref() {
+            let resolved = match cow.resolve_merged_path_bounded(
+                &path,
+                base,
+                flags & libc::O_NOFOLLOW as u64 == 0,
+                resolve & 0x10 != 0,
+                resolve & 0x08 != 0,
+            ) {
+                Ok(path) => path,
+                Err(errno) if flags & libc::O_CREAT as u64 != 0 && errno == libc::ENOENT => {
+                    path.clone()
+                }
+                Err(errno) => return NotifAction::Errno(errno),
+            };
+            path = resolved;
+        }
+        let bounded_revalidation = resolve_base
+            .map(|base| (bounded_input_path, base, path.clone()));
+        let logical_directory = if flags & libc::O_NOFOLLOW as u64 == 0 {
+            cow.logical_directory_mode_follow(&path)
+        } else {
+            cow.logical_directory_mode(&path)
+        };
+        let leaf_bits = if logical_directory.is_some() {
+            if flags & libc::O_PATH as u64 != 0 {
+                0
+            } else {
+                let mut bits = 0o100;
+                if flags & libc::O_ACCMODE as u64 != libc::O_WRONLY as u64 {
+                    bits |= 0o400;
+                }
+                bits
+            }
+        } else {
+            0
+        };
+        if let Err(errno) = cow.check_logical_path_access(&path, leaf_bits) {
+            return NotifAction::Errno(errno);
+        }
+        if flags & libc::O_CREAT as u64 != 0 {
+            if let Err(errno) = cow.check_merged_parent_path(&path) {
+                return NotifAction::Errno(errno);
+            }
         }
 
         // Read-only opens don't need interception unless the file was
@@ -248,20 +551,25 @@ pub(crate) async fn handle_cow_open(
             Ok(plan) => plan,
             Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
             Err(crate::error::BranchError::Exists) => return NotifAction::Errno(libc::EEXIST),
-            Err(_) => return NotifAction::Continue,
+            Err(crate::error::BranchError::Deleted) => return NotifAction::Errno(libc::ENOENT),
+            Err(_) => return NotifAction::Errno(libc::EIO),
         };
-        (plan, upper_root, workdir_root)
+        (plan, upper_root, workdir_root, bounded_revalidation)
     };
     // Lock is released here
 
     // Phase 2: execute I/O plan without holding the lock
-    let real_path = match plan {
+    let (real_path, create_candidate) = match plan {
         CowOpenPlan::Skip => return NotifAction::Continue,
         // Deleted in this branch (whiteout): the lower file still exists, so
         // Continue would read its pre-delete content. Return ENOENT, matching
         // the stat/access handlers.
         CowOpenPlan::Deleted => return NotifAction::Errno(libc::ENOENT),
-        CowOpenPlan::Resolved(p) | CowOpenPlan::UpperReady { upper: p } => p,
+        CowOpenPlan::Resolved(path) => (path, false),
+        CowOpenPlan::UpperReady {
+            upper,
+            create_candidate,
+        } => (upper, create_candidate),
         CowOpenPlan::NeedsCopy { upper, lower: _lower, file_size, rel_path } => {
             // Do the potentially-expensive copy on a blocking thread
             let root = workdir_root.clone();
@@ -272,32 +580,112 @@ pub(crate) async fn handle_cow_open(
             }).await;
 
             match copy_result {
-                Ok(Ok(())) => upper,
+                Ok(Ok(())) => (upper, false),
                 Ok(Err(_)) | Err(_) => {
-                    // Copy failed — roll back quota and let kernel handle it
+                    // Copy failed after this path was classified as COW.
+                    // Falling through would operate on the lower file.
                     let mut st = cow_state.lock().await;
                     if let Some(cow) = st.branch.as_mut() {
                         cow.rollback_copy(file_size);
                     }
-                    return NotifAction::Continue;
+                    return NotifAction::Errno(libc::EIO);
                 }
             }
         }
     };
 
-    // Phase 3: open the resolved path and inject fd
-    // Strip O_EXCL — the COW layer already verified exclusivity. Keeping it
-    // would fail because we may have just copied the file into upper.
-    let open_flags = (flags & !(libc::O_EXCL as u64)) as i32;
+    // Phase 3: open the resolved path and inject fd.
     // Honor the child's requested creation mode (masked to permission bits).
     // Hardcoding 0o666 dropped the execute bits, so a binary copied into the
     // workdir (e.g. `cp /bin/echo m`) landed in upper non-executable and
     // `./m` failed with EACCES. The kernel ignores mode unless O_CREAT is set.
-    let create_mode = (mode & 0o7777) as libc::c_uint;
-    let fd = match open_confined(&upper_root, &workdir_root, &real_path, open_flags, create_mode) {
-        Ok(fd) => fd,
-        Err(_) => return NotifAction::Continue,
+    let create_mode = if flags & libc::O_CREAT as u64 != 0 {
+        let umask = tracee_umask(notif.pid).unwrap_or(0o777);
+        ((mode as u32 & 0o7777) & !(umask & 0o777)) as libc::c_uint
+    } else {
+        (mode & 0o7777) as libc::c_uint
     };
+    // Keep the namespace plan and the kernel open in one COW mutation epoch.
+    // Every tracee rename/symlink replacement is mediated through this same
+    // mutex, so BENEATH/IN_ROOT cannot be invalidated between validation and
+    // the actual confined open.
+    let open_guard = cow_state.lock().await;
+    if let Some((input_path, base, expected_path)) = bounded_revalidation.as_ref() {
+        let Some(cow) = open_guard.branch.as_ref() else {
+            return NotifAction::Errno(libc::EIO);
+        };
+        let revalidated = match cow.resolve_merged_path_bounded(
+            input_path,
+            base,
+            flags & libc::O_NOFOLLOW as u64 == 0,
+            resolve & 0x10 != 0,
+            resolve & 0x08 != 0,
+        ) {
+            Ok(path) => path,
+            Err(errno) if flags & libc::O_CREAT as u64 != 0 && errno == libc::ENOENT => {
+                input_path.clone()
+            }
+            Err(errno) => return NotifAction::Errno(errno),
+        };
+        if &revalidated != expected_path {
+            return NotifAction::Errno(libc::EAGAIN);
+        }
+    }
+    let ordinary_flags = (flags & !(libc::O_EXCL as u64)) as i32;
+    let (fd, created_by_open) = if create_candidate && flags & libc::O_CREAT as u64 != 0 {
+        // The metadata plan cannot decide creation: another stopped tracee
+        // can race after the branch lock is released. O_EXCL is the actual
+        // linearization point, including for a caller that did not request it.
+        let exclusive_flags = ordinary_flags | libc::O_CREAT | libc::O_EXCL;
+        match open_confined(
+            &upper_root,
+            &workdir_root,
+            &real_path,
+            exclusive_flags,
+            create_mode,
+            resolve,
+        ) {
+            Ok(fd) => (fd, true),
+            Err(libc::EEXIST) if flags & libc::O_EXCL as u64 == 0 => {
+                match open_confined(
+                    &upper_root,
+                    &workdir_root,
+                    &real_path,
+                    ordinary_flags,
+                    create_mode,
+                    resolve,
+                ) {
+                    Ok(fd) => (fd, false),
+                    Err(errno) => return NotifAction::Errno(errno),
+                }
+            }
+            Err(errno) => return NotifAction::Errno(errno),
+        }
+    } else {
+        match open_confined(
+            &upper_root,
+            &workdir_root,
+            &real_path,
+            ordinary_flags,
+            create_mode,
+            resolve,
+        ) {
+            Ok(fd) => (fd, false),
+            // This is a resolved COW path. Continue would retry the original
+            // pathname against the lower layer and can expose old content.
+            Err(errno) => return NotifAction::Errno(errno),
+        }
+    };
+    if created_by_open && unsafe { libc::fchmod(fd, create_mode as libc::mode_t) } < 0 {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        unsafe { libc::close(fd) };
+        if let Ok((root, rel)) = pick_root_rel(&upper_root, &workdir_root, &real_path) {
+            let _ = crate::sys::fs::unlinkat_in_root(root, &rel, false);
+        }
+        return NotifAction::Errno(errno);
+    }
 
     // Preserve O_CLOEXEC from the original openat flags.
     let newfd_flags = if flags & libc::O_CLOEXEC as u64 != 0 {
@@ -316,29 +704,38 @@ pub(crate) async fn handle_cow_open(
 /// Parsed COW write operation with resolved paths and extracted arguments.
 enum CowWriteOp {
     Unlink { path: String, is_dir: bool },
-    Mkdir { path: String },
+    Mkdir { path: String, mode: u32 },
     Mknod { path: String, mode: u32, dev: u64 },
-    Rename { old_path: String, new_path: String },
+    Rename { old_path: String, new_path: String, flags: u32 },
     Symlink { target: String, linkpath: String },
-    Link { old_path: String, new_path: String },
-    Chmod { path: String, mode: u32 },
-    Chown { path: String, uid: u32, gid: u32 },
+    Link { old_path: String, new_path: String, follow_old: bool },
+    Chmod { path: String, mode: u32, follow_final: bool },
+    Chown { path: String, uid: u32, gid: u32, follow_final: bool },
     Truncate { path: String, length: i64 },
+}
+
+pub(crate) fn tracee_umask(tid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Umask:"))?
+        .trim();
+    u32::from_str_radix(value, 8).ok().filter(|mask| *mask <= 0o777)
 }
 
 impl CowWriteOp {
     fn remap_upper_paths(&mut self, cow: &SeccompCowBranch) {
         match self {
             CowWriteOp::Unlink { path, .. }
-            | CowWriteOp::Mkdir { path }
+            | CowWriteOp::Mkdir { path, .. }
             | CowWriteOp::Mknod { path, .. }
             | CowWriteOp::Chmod { path, .. }
             | CowWriteOp::Chown { path, .. }
             | CowWriteOp::Truncate { path, .. } => {
                 *path = map_cow_upper_path(cow, path);
             }
-            CowWriteOp::Rename { old_path, new_path }
-            | CowWriteOp::Link { old_path, new_path } => {
+            CowWriteOp::Rename { old_path, new_path, .. }
+            | CowWriteOp::Link { old_path, new_path, .. } => {
                 *old_path = map_cow_upper_path(cow, old_path);
                 *new_path = map_cow_upper_path(cow, new_path);
             }
@@ -346,6 +743,58 @@ impl CowWriteOp {
                 *linkpath = map_cow_upper_path(cow, linkpath);
             }
         }
+    }
+
+    fn paths(&self) -> Vec<&str> {
+        match self {
+            CowWriteOp::Unlink { path, .. }
+            | CowWriteOp::Mkdir { path, .. }
+            | CowWriteOp::Mknod { path, .. }
+            | CowWriteOp::Chmod { path, .. }
+            | CowWriteOp::Chown { path, .. }
+            | CowWriteOp::Truncate { path, .. } => vec![path],
+            CowWriteOp::Rename { old_path, new_path, .. }
+            | CowWriteOp::Link { old_path, new_path, .. } => vec![old_path, new_path],
+            CowWriteOp::Symlink { linkpath, .. } => vec![linkpath],
+        }
+    }
+
+    /// Apply each syscall's final-component following rules while always
+    /// following symlinked parents. This must happen before copy-up/whiteout
+    /// bookkeeping so the live merged view and a later checkpoint name the
+    /// same logical entries.
+    fn resolve_merged_paths(&mut self, cow: &SeccompCowBranch) -> Result<(), i32> {
+        let resolve = |path: &str, follow_final: bool| {
+            cow.resolve_merged_path(path, follow_final)
+        };
+        match self {
+            CowWriteOp::Unlink { path, .. }
+            | CowWriteOp::Mkdir { path, .. }
+            | CowWriteOp::Mknod { path, .. } => {
+                *path = resolve(path, false)?;
+            }
+            CowWriteOp::Rename { old_path, new_path, .. } => {
+                *old_path = resolve(old_path, false)?;
+                *new_path = resolve(new_path, false)?;
+            }
+            CowWriteOp::Symlink { linkpath, .. } => {
+                *linkpath = resolve(linkpath, false)?;
+            }
+            CowWriteOp::Link { old_path, new_path, follow_old } => {
+                *old_path = resolve(old_path, *follow_old)?;
+                *new_path = resolve(new_path, false)?;
+            }
+            CowWriteOp::Truncate { path, .. } => {
+                *path = resolve(path, true)?;
+            }
+            CowWriteOp::Chmod { path, follow_final, .. } => {
+                *path = resolve(path, *follow_final)?;
+            }
+            CowWriteOp::Chown { path, follow_final, .. } => {
+                *path = resolve(path, *follow_final)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -392,6 +841,7 @@ fn parse_cow_write(
     if nr == libc::SYS_mkdirat {
         return Some(CowWriteOp::Mkdir {
             path: read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?,
+            mode: notif.data.args[2] as u32,
         });
     }
     if nr == libc::SYS_mknodat {
@@ -405,7 +855,12 @@ fn parse_cow_write(
     if nr == libc::SYS_renameat2 {
         let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Rename { old_path, new_path });
+        return Some(CowWriteOp::Rename { old_path, new_path, flags: notif.data.args[4] as u32 });
+    }
+    if arch::sys_renameat() == Some(nr) {
+        let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
+        let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
+        return Some(CowWriteOp::Rename { old_path, new_path, flags: 0 });
     }
     if nr == libc::SYS_symlinkat {
         // symlinkat(target, newdirfd, linkpath): target is raw, linkpath is resolved
@@ -416,15 +871,23 @@ fn parse_cow_write(
     if nr == libc::SYS_linkat {
         let old_path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Link { old_path, new_path });
+        let follow_old = notif.data.args[4] & libc::AT_SYMLINK_FOLLOW as u64 != 0;
+        return Some(CowWriteOp::Link { old_path, new_path, follow_old });
     }
-    if nr == libc::SYS_fchmodat {
+    if nr == libc::SYS_fchmodat || nr == arch::SYS_FCHMODAT2 {
         let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32 });
+        let follow_final = nr != arch::SYS_FCHMODAT2
+            || notif.data.args[3] & libc::AT_SYMLINK_NOFOLLOW as u64 == 0;
+        return Some(CowWriteOp::Chmod {
+            path,
+            mode: (notif.data.args[2] & 0o7777) as u32,
+            follow_final,
+        });
     }
     if nr == libc::SYS_fchownat {
         let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Chown { path, uid: notif.data.args[2] as u32, gid: notif.data.args[3] as u32 });
+        let follow_final = notif.data.args[4] & libc::AT_SYMLINK_NOFOLLOW as u64 == 0;
+        return Some(CowWriteOp::Chown { path, uid: notif.data.args[2] as u32, gid: notif.data.args[3] as u32, follow_final });
     }
 
     // Legacy variants (path in args[0], no dirfd)
@@ -443,6 +906,7 @@ fn parse_cow_write(
     if Some(nr) == arch::sys_mkdir() {
         return Some(CowWriteOp::Mkdir {
             path: read_resolved(notif, 0, None, notif_fd, virtual_cwd)?,
+            mode: notif.data.args[1] as u32,
         });
     }
     if Some(nr) == arch::sys_mknod() {
@@ -456,7 +920,7 @@ fn parse_cow_write(
     if Some(nr) == arch::sys_rename() {
         let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Rename { old_path, new_path });
+        return Some(CowWriteOp::Rename { old_path, new_path, flags: 0 });
     }
     if Some(nr) == arch::sys_symlink() {
         let target = read_path(notif, notif.data.args[0], notif_fd)?;
@@ -466,15 +930,19 @@ fn parse_cow_write(
     if Some(nr) == arch::sys_link() {
         let old_path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
         let new_path = read_resolved(notif, 1, None, notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Link { old_path, new_path });
+        return Some(CowWriteOp::Link { old_path, new_path, follow_old: false });
     }
     if Some(nr) == arch::sys_chmod() {
         let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[1] & 0o7777) as u32 });
+        return Some(CowWriteOp::Chmod {
+            path,
+            mode: (notif.data.args[1] & 0o7777) as u32,
+            follow_final: true,
+        });
     }
     if Some(nr) == arch::sys_chown() || Some(nr) == arch::sys_lchown() {
         let path = read_resolved(notif, 0, None, notif_fd, virtual_cwd)?;
-        return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32 });
+        return Some(CowWriteOp::Chown { path, uid: notif.data.args[1] as u32, gid: notif.data.args[2] as u32, follow_final: Some(nr) == arch::sys_chown() });
     }
 
     // truncate (legacy only, path in args[0])
@@ -495,7 +963,10 @@ fn cow_result(r: Result<bool, crate::error::BranchError>) -> NotifAction {
         // Whiteouted source: Continue would let the kernel act on the lower
         // entry, which still exists with its pre-delete content.
         Err(crate::error::BranchError::Deleted) => NotifAction::Errno(libc::ENOENT),
-        _ => NotifAction::Continue,
+        Err(crate::error::BranchError::Exists) | Ok(false) => NotifAction::Errno(libc::EEXIST),
+        // This path is already known to be inside a COW lower. Never continue
+        // a failed virtualized mutation into the immutable lower.
+        Err(_) => NotifAction::Errno(libc::EIO),
     }
 }
 
@@ -504,7 +975,9 @@ fn unlink_result(r: Result<bool, i32>) -> NotifAction {
     match r {
         Ok(true) => NotifAction::ReturnValue(0),
         Err(errno) => NotifAction::Errno(errno),
-        _ => NotifAction::Continue,
+        // Callers only invoke this after the path matched the COW root. A
+        // staging failure must never fall through to the immutable lower.
+        Ok(false) => NotifAction::Errno(libc::EIO),
     }
 }
 
@@ -557,6 +1030,60 @@ async fn execute_deferred_copy(
     }
 }
 
+fn cow_write_resolution_bases(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+) -> Option<Vec<(i64, String)>> {
+    let nr = notif.data.nr as i64;
+    let at = |dirfd_arg: usize, path_arg: usize| {
+        Some((
+            notif.data.args[dirfd_arg] as i64,
+            read_path(notif, notif.data.args[path_arg], notif_fd)?,
+        ))
+    };
+    let cwd = |path_arg: usize| {
+        Some((
+            libc::AT_FDCWD as i64,
+            read_path(notif, notif.data.args[path_arg], notif_fd)?,
+        ))
+    };
+    if matches!(
+        nr,
+        libc::SYS_unlinkat
+            | libc::SYS_mkdirat
+            | libc::SYS_mknodat
+            | libc::SYS_fchmodat
+            | arch::SYS_FCHMODAT2
+            | libc::SYS_fchownat
+    ) {
+        return Some(vec![at(0, 1)?]);
+    }
+    if nr == libc::SYS_renameat2 || arch::sys_renameat() == Some(nr) || nr == libc::SYS_linkat {
+        return Some(vec![at(0, 1)?, at(2, 3)?]);
+    }
+    if nr == libc::SYS_symlinkat {
+        return Some(vec![at(1, 2)?]);
+    }
+    if Some(nr) == arch::sys_rename() || Some(nr) == arch::sys_link() {
+        return Some(vec![cwd(0)?, cwd(1)?]);
+    }
+    if Some(nr) == arch::sys_symlink() {
+        return Some(vec![cwd(1)?]);
+    }
+    if Some(nr) == arch::sys_unlink()
+        || Some(nr) == arch::sys_rmdir()
+        || Some(nr) == arch::sys_mkdir()
+        || Some(nr) == arch::sys_mknod()
+        || Some(nr) == arch::sys_chmod()
+        || Some(nr) == arch::sys_chown()
+        || Some(nr) == arch::sys_lchown()
+        || nr == libc::SYS_truncate
+    {
+        return Some(vec![cwd(0)?]);
+    }
+    Some(Vec::new())
+}
+
 /// Handle all write-type syscalls: both *at variants (unlinkat, mkdirat, etc.)
 /// and legacy variants (unlink, rmdir, mkdir, etc.).
 ///
@@ -571,11 +1098,79 @@ pub(crate) async fn handle_cow_write(
     processes: &Arc<ProcessIndex>,
     notif_fd: RawFd,
 ) -> NotifAction {
+    if notif.data.nr as i64 == arch::SYS_FCHMODAT2 {
+        let flags = notif.data.args[3] as i32;
+        let supported = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+        if flags & !supported != 0 {
+            return NotifAction::Errno(libc::EINVAL);
+        }
+        let path = match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(path) => path,
+            None => return NotifAction::Errno(libc::EFAULT),
+        };
+        if path.is_empty() {
+            if flags & libc::AT_EMPTY_PATH == 0 {
+                return NotifAction::Errno(libc::ENOENT);
+            }
+            // An fd-only metadata operation cannot be redirected to the upper
+            // inode without changing the syscall's descriptor semantics.
+            // Deny it for snapshot branches rather than permit an immutable
+            // lower mutation (or a concurrent fd-slot substitution).
+            let pinned = match crate::seccomp::notif::dup_fd_from_pid(
+                notif.pid,
+                notif.data.args[0] as i32,
+            ) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF))
+                }
+            };
+            let real_path = match std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                pinned.as_raw_fd()
+            )) {
+                Ok(path) => path,
+                Err(_) => return NotifAction::Errno(libc::EBADF),
+            };
+            let state = cow_state.lock().await;
+            return if state.branch.as_ref().is_some_and(|cow| {
+                cow.is_snapshot_backed() && real_path.starts_with(cow.workdir())
+            }) {
+                NotifAction::Errno(libc::EPERM)
+            } else {
+                NotifAction::Continue
+            };
+        }
+    }
+    let resolution_bases = match cow_write_resolution_bases(notif, notif_fd) {
+        Some(bases) => bases,
+        None => return NotifAction::Continue,
+    };
+    for (dirfd, path) in resolution_bases {
+        if is_magic_fd_path(&path) {
+            let state = cow_state.lock().await;
+            if state.branch.as_ref().is_some_and(|cow| cow.is_snapshot_backed()) {
+                return NotifAction::Errno(libc::EPERM);
+            }
+        }
+        if let Err(errno) = check_relative_resolution_base(notif, dirfd, &path, cow_state).await {
+            return NotifAction::Errno(errno);
+        }
+    }
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
     let mut op = match parse_cow_write(notif, notif_fd, virtual_cwd.as_deref()) {
         Some(op) => op,
         None => return NotifAction::Continue,
     };
+    if let CowWriteOp::Mkdir { mode, .. } = &mut op {
+        // The supervisor creates the upper entry, so the kernel cannot apply
+        // the tracee's umask for us. `/proc/<tid>/status` exposes the umask of
+        // the stopped task's shared fs context. If procfs is unavailable,
+        // fail closed on permission bits instead of accidentally widening a
+        // private directory.
+        let umask = tracee_umask(notif.pid).unwrap_or(0o777);
+        *mode = (*mode & 0o7777) & !(umask & 0o777);
+    }
 
     // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O).
     // Capture both layer roots here so Phase 2 needs no second lock.
@@ -587,6 +1182,36 @@ pub(crate) async fn handle_cow_write(
         };
 
         op.remap_upper_paths(cow);
+        if let Err(errno) = op.resolve_merged_paths(cow) {
+            return NotifAction::Errno(errno);
+        }
+        let creation_target = match &op {
+            CowWriteOp::Mkdir { path, .. }
+            | CowWriteOp::Mknod { path, .. }
+            | CowWriteOp::Symlink { linkpath: path, .. }
+            | CowWriteOp::Link { new_path: path, .. } => Some(path.as_str()),
+            _ => None,
+        };
+        if creation_target.is_some_and(|path| cow.merged_entry_exists_path(path)) {
+            return NotifAction::Errno(libc::EEXIST);
+        }
+        if let Some(path) = creation_target {
+            if let Err(errno) = cow.check_merged_parent_path(path) {
+                return NotifAction::Errno(errno);
+            }
+        }
+        if let CowWriteOp::Chmod { path, follow_final: false, .. } = &op {
+            if cow.merged_entry_is_symlink_path(path) {
+                return NotifAction::Errno(libc::EOPNOTSUPP);
+            }
+        }
+        for path in op.paths() {
+            if cow.matches(path) {
+                if let Err(errno) = cow.check_logical_path_access(path, 0) {
+                    return NotifAction::Errno(errno);
+                }
+            }
+        }
         match cow_copy_rel(&op, cow) {
             Some((_match_path, ref rel)) => {
                 let workdir = cow.workdir().to_path_buf();
@@ -594,7 +1219,7 @@ pub(crate) async fn handle_cow_write(
                 match cow.prepare_copy(rel) {
                     Ok(plan) => (Some(plan), workdir, upper, rel.clone()),
                     Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                    Err(_) => return NotifAction::Continue,
+                    Err(_) => return NotifAction::Errno(libc::EIO),
                 }
             }
             None => (None, std::path::PathBuf::new(), std::path::PathBuf::new(), String::new()),
@@ -605,7 +1230,7 @@ pub(crate) async fn handle_cow_write(
     // Phase 2: execute the file copy outside the lock (if needed)
     if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size }) = copy_plan {
         if execute_deferred_copy(cow_state, copy_workdir, copy_upper, copy_rel, upper, file_size).await.is_none() {
-            return NotifAction::Continue;
+            return NotifAction::Errno(libc::EIO);
         }
     }
 
@@ -616,29 +1241,41 @@ pub(crate) async fn handle_cow_write(
         Some(c) => c,
         None => return NotifAction::Continue,
     };
+    let creation_target = match &op {
+        CowWriteOp::Mkdir { path, .. }
+        | CowWriteOp::Mknod { path, .. }
+        | CowWriteOp::Symlink { linkpath: path, .. }
+        | CowWriteOp::Link { new_path: path, .. } => Some(path.as_str()),
+        _ => None,
+    };
+    if let Some(path) = creation_target {
+        if let Err(errno) = cow.check_merged_parent_path(path) {
+            return NotifAction::Errno(errno);
+        }
+    }
 
     match op {
         CowWriteOp::Unlink { ref path, is_dir } => {
             if !cow.matches(path) { return NotifAction::Continue; }
             unlink_result(cow.handle_unlink(path, is_dir))
         }
-        CowWriteOp::Mkdir { ref path } => {
+        CowWriteOp::Mkdir { ref path, mode } => {
             if !cow.matches(path) { return NotifAction::Continue; }
-            cow_result(cow.handle_mkdir(path))
+            cow_result(cow.handle_mkdir(path, mode))
         }
         CowWriteOp::Mknod { ref path, mode, dev } => {
             if !cow.matches(path) { return NotifAction::Continue; }
             cow_result(cow.handle_mknod(path, mode, dev))
         }
-        CowWriteOp::Rename { ref old_path, ref new_path } => {
+        CowWriteOp::Rename { ref old_path, ref new_path, flags } => {
             if !cow.matches(old_path) { return NotifAction::Continue; }
-            unlink_result(cow.handle_rename(old_path, new_path))
+            unlink_result(cow.handle_rename_with_flags(old_path, new_path, flags))
         }
         CowWriteOp::Symlink { ref target, ref linkpath } => {
             if !cow.matches(linkpath) { return NotifAction::Continue; }
             cow_result(cow.handle_symlink(target, linkpath))
         }
-        CowWriteOp::Link { ref old_path, ref new_path } => {
+        CowWriteOp::Link { ref old_path, ref new_path, .. } => {
             // A hard link cannot be half staged. With one name inside the
             // branch and the other below it there is nothing to stage: linking
             // in would create the name in the workdir the branch promised to
@@ -651,11 +1288,11 @@ pub(crate) async fn handle_cow_write(
             if !cow.matches(new_path) { return NotifAction::Continue; }
             link_result(cow.handle_link(old_path, new_path))
         }
-        CowWriteOp::Chmod { ref path, mode } => {
+        CowWriteOp::Chmod { ref path, mode, .. } => {
             if !cow.matches(path) { return NotifAction::Continue; }
             cow_result(cow.handle_chmod(path, mode))
         }
-        CowWriteOp::Chown { ref path, uid, gid } => {
+        CowWriteOp::Chown { ref path, uid, gid, .. } => {
             if !cow.matches(path) { return NotifAction::Continue; }
             cow_result(cow.handle_chown(path, uid, gid))
         }
@@ -685,29 +1322,30 @@ pub(crate) async fn handle_cow_access(
     // access(pathname, mode): args[0]=path, args[1]=mode
     // faccessat(dirfd, pathname, mode, flags): args[0]=dirfd, args[1]=path, args[2]=mode
     let (path, mode) = if Some(nr) == arch::sys_access() {
+        let dirfd = libc::AT_FDCWD as i64;
         let p = match read_path(notif, notif.data.args[0], notif_fd) {
-            Some(p) => resolve_at_path_with_virtual(
-                notif,
-                libc::AT_FDCWD as i64,
-                &p,
-                virtual_cwd.as_deref(),
-            ),
+            Some(p) => {
+                if let Err(errno) = check_relative_resolution_base(notif, dirfd, &p, cow_state).await {
+                    return NotifAction::Errno(errno);
+                }
+                resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref())
+            }
             None => return NotifAction::Continue,
         };
         (p, notif.data.args[1] as i32)
     } else {
         let dirfd = notif.data.args[0] as i64;
         let p = match read_path(notif, notif.data.args[1], notif_fd) {
-            Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+            Some(p) => {
+                if let Err(errno) = check_relative_resolution_base(notif, dirfd, &p, cow_state).await {
+                    return NotifAction::Errno(errno);
+                }
+                resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref())
+            }
             None => return NotifAction::Continue,
         };
         (p, notif.data.args[2] as i32)
     };
-
-    // Only intercept W_OK checks
-    if mode & libc::W_OK == 0 {
-        return NotifAction::Continue;
-    }
 
     let st = cow_state.lock().await;
     let cow = match st.branch.as_ref() {
@@ -717,6 +1355,29 @@ pub(crate) async fn handle_cow_access(
 
     let path = map_cow_upper_path(cow, &path);
     if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+    let mut leaf_bits = 0;
+    let follows_final_symlink = nr != crate::arch::SYS_FACCESSAT2
+        || notif.data.args[3] as i32 & libc::AT_SYMLINK_NOFOLLOW == 0;
+    let logical_directory = if follows_final_symlink {
+        cow.logical_directory_mode_follow(&path)
+    } else {
+        cow.logical_directory_mode(&path)
+    };
+    if logical_directory.is_some() {
+        if mode & libc::R_OK != 0 {
+            leaf_bits |= 0o400;
+        }
+        if mode & libc::X_OK != 0 {
+            leaf_bits |= 0o100;
+        }
+    }
+    if let Err(errno) = cow.check_logical_path_access(&path, leaf_bits) {
+        return NotifAction::Errno(errno);
+    }
+
+    if mode & libc::W_OK == 0 {
         return NotifAction::Continue;
     }
 
@@ -734,6 +1395,34 @@ pub(crate) async fn handle_cow_access(
 // utimensat handler
 // ============================================================
 
+/// fd-only metadata operations cannot be redirected to a copied-up inode:
+/// the child's fd would still name the immutable lower object. Permit upper
+/// handles, but fail closed for snapshot lower handles.
+pub(crate) async fn handle_cow_fd_metadata(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    _processes: &Arc<ProcessIndex>,
+    _notif_fd: RawFd,
+) -> NotifAction {
+    let pinned = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, notif.data.args[0] as i32) {
+        Ok(fd) => fd,
+        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let real_path = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+        Ok(path) => path,
+        Err(_) => return NotifAction::Errno(libc::EBADF),
+    };
+    let state = cow_state.lock().await;
+    let Some(cow) = state.branch.as_ref() else {
+        return NotifAction::Continue;
+    };
+    if real_path.starts_with(cow.workdir()) && cow.is_snapshot_backed() {
+        NotifAction::Errno(libc::EPERM)
+    } else {
+        NotifAction::Continue
+    }
+}
+
 /// Handle utimensat — resolve path to COW upper then set timestamps.
 /// utimensat(dirfd, pathname, times, flags)
 pub(crate) async fn handle_cow_utimensat(
@@ -748,14 +1437,34 @@ pub(crate) async fn handle_cow_utimensat(
     let flags = notif.data.args[3] as i32;
 
     if path_ptr == 0 {
-        return NotifAction::Continue;
+        let pinned = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, dirfd as i32) {
+            Ok(fd) => fd,
+            Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF)),
+        };
+        let real_path = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+            Ok(path) => path,
+            Err(_) => return NotifAction::Errno(libc::EBADF),
+        };
+        let state = cow_state.lock().await;
+        let Some(cow) = state.branch.as_ref() else {
+            return NotifAction::Continue;
+        };
+        return if real_path.starts_with(cow.workdir()) && cow.is_snapshot_backed() {
+            NotifAction::Errno(libc::EPERM)
+        } else {
+            NotifAction::Continue
+        };
     }
 
-    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, path_ptr, notif_fd) {
-        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+    let raw_path = match read_path(notif, path_ptr, notif_fd) {
+        Some(path) => path,
         None => return NotifAction::Continue,
     };
+    if let Err(errno) = check_relative_resolution_base(notif, dirfd, &raw_path, cow_state).await {
+        return NotifAction::Errno(errno);
+    }
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = resolve_at_path_with_virtual(notif, dirfd, &raw_path, virtual_cwd.as_deref());
 
     let (upper_path, upper_root, workdir_root) = {
         let mut st = cow_state.lock().await;
@@ -769,11 +1478,21 @@ pub(crate) async fn handle_cow_utimensat(
         if !cow.matches(&path) {
             return NotifAction::Continue;
         }
+        let path = match cow.resolve_merged_path(
+            &path,
+            (flags & libc::AT_SYMLINK_NOFOLLOW) == 0,
+        ) {
+            Ok(path) => path,
+            Err(errno) => return NotifAction::Errno(errno),
+        };
+        if let Err(errno) = cow.check_logical_path_access(&path, 0) {
+            return NotifAction::Errno(errno);
+        }
         let p = match cow.handle_utimensat(&path) {
             Ok(Some(p)) => p,
-            Ok(None) => return NotifAction::Continue,
+            Ok(None) => return NotifAction::Errno(libc::EIO),
             Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-            Err(_) => return NotifAction::Continue,
+            Err(_) => return NotifAction::Errno(libc::EIO),
         };
         (p, upper_root, workdir_root)
     };
@@ -810,6 +1529,66 @@ pub(crate) async fn handle_cow_utimensat(
 // Read operation handlers (stat, readlink, getdents)
 // ============================================================
 
+async fn handle_cow_fd_stat_into(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    fd: i32,
+    statbuf_addr: u64,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let pinned = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, fd) {
+        Ok(fd) => fd,
+        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    handle_cow_pinned_stat_into(notif, cow_state, pinned, statbuf_addr, notif_fd).await
+}
+
+async fn handle_cow_pinned_stat_into(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    pinned: OwnedFd,
+    statbuf_addr: u64,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let real_path = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+        Ok(path) => path,
+        Err(_) => return NotifAction::Errno(libc::EBADF),
+    };
+    let logical_mode = {
+        let state = cow_state.lock().await;
+        let cow = match state.branch.as_ref() {
+            Some(cow) => cow,
+            None => return NotifAction::Continue,
+        };
+        if !cow.contains_layer_path(&real_path) {
+            return NotifAction::Continue;
+        }
+        cow.logical_directory_mode_for_handle(&real_path)
+    };
+    let mut statbuf = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(pinned.as_raw_fd(), &mut statbuf) } < 0 {
+        return NotifAction::Errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        );
+    }
+    if let Some(mode) = logical_mode {
+        statbuf.st_mode =
+            (statbuf.st_mode & !(0o7777 as libc::mode_t)) | mode as libc::mode_t;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &statbuf as *const libc::stat as *const u8,
+            std::mem::size_of::<libc::stat>(),
+        )
+    };
+    if write_child_mem(notif_fd, notif.id, notif.pid, statbuf_addr, bytes).is_err() {
+        return NotifAction::Continue;
+    }
+    NotifAction::ReturnValue(0)
+}
+
 /// Handle newfstatat / faccessat — resolve path then Continue to let kernel stat.
 /// The trick: we rewrite the path pointer in child memory to point to the resolved path.
 /// Actually, simpler: for stat, we do the stat ourselves and write the result.
@@ -841,12 +1620,57 @@ pub(crate) async fn handle_cow_stat(
         (notif.data.args[0] as i64, notif.data.args[1])
     };
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, path_ptr, notif_fd) {
-        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
-        None => return NotifAction::Continue,
+    let at_flags = if legacy {
+        0
+    } else {
+        (notif.data.args[3] & 0xFFFF_FFFF) as i32
+    };
+    let raw_path = read_path(notif, path_ptr, notif_fd);
+    let empty_fd_path = nr == libc::SYS_newfstatat
+        && at_flags & libc::AT_EMPTY_PATH != 0
+        && (path_ptr == 0 || raw_path.as_deref() == Some(""));
+    if empty_fd_path {
+        if dirfd as i32 != libc::AT_FDCWD {
+            return handle_cow_fd_stat_into(
+                notif,
+                cow_state,
+                dirfd as i32,
+                notif.data.args[2],
+                notif_fd,
+            )
+            .await;
+        }
+        let pinned = match pin_resolution_base(notif.pid, dirfd) {
+            Ok(fd) => fd,
+            Err(errno) => return NotifAction::Errno(errno),
+        };
+        return handle_cow_pinned_stat_into(
+            notif,
+            cow_state,
+            pinned,
+            notif.data.args[2],
+            notif_fd,
+        )
+        .await;
+    }
+    let path = match (empty_fd_path, raw_path) {
+        (true, _) => unreachable!("AT_EMPTY_PATH handled above"),
+        (false, Some(path)) => {
+            if let Err(errno) = check_relative_resolution_base(notif, dirfd, &path, cow_state).await {
+                return NotifAction::Errno(errno);
+            }
+            resolve_at_path_with_virtual(notif, dirfd, &path, virtual_cwd.as_deref())
+        }
+        (false, None) => return NotifAction::Continue,
     };
 
-    let (real_path, upper_root, workdir_root) = {
+    let follow = if legacy {
+        arch::sys_lstat() != Some(nr)
+    } else {
+        at_flags & libc::AT_SYMLINK_NOFOLLOW == 0
+    };
+
+    let (real_path, upper_root, workdir_root, logical_mode) = {
         let st = cow_state.lock().await;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
@@ -855,14 +1679,22 @@ pub(crate) async fn handle_cow_stat(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.matches(&path) {
             return NotifAction::Continue;
         }
-        let real = match cow.handle_stat(&path) {
+        if let Err(errno) = cow.check_logical_path_access(&path, 0) {
+            return NotifAction::Errno(errno);
+        }
+        let real = match cow.handle_stat_with_follow(&path, follow) {
             Some(p) => p,
             None => return NotifAction::Errno(libc::ENOENT),
         };
-        (real, upper_root, workdir_root)
+        let logical_mode = if follow {
+            cow.logical_directory_mode_follow(&path)
+        } else {
+            cow.logical_directory_mode(&path)
+        };
+        (real, upper_root, workdir_root, logical_mode)
     };
 
     if nr == libc::SYS_faccessat
@@ -885,20 +1717,18 @@ pub(crate) async fn handle_cow_stat(
     // root) and write the native libc layout back to the child. Do not
     // hand-pack struct stat; its layout is architecture-specific.
     let statbuf_addr = if legacy { notif.data.args[1] } else { notif.data.args[2] };
-    let follow = if legacy {
-        arch::sys_lstat() != Some(nr)
-    } else {
-        let flags = (notif.data.args[3] & 0xFFFF_FFFF) as i32;
-        (flags & libc::AT_SYMLINK_NOFOLLOW) == 0
-    };
     let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
         Ok(v) => v,
         Err(e) => return NotifAction::Errno(e),
     };
-    let statbuf = match crate::sys::fs::statat_in_root(root, &rel, follow) {
+    let mut statbuf = match crate::sys::fs::statat_in_root(root, &rel, follow) {
         Ok(s) => s,
         Err(e) => return NotifAction::Errno(e),
     };
+    if let Some(mode) = logical_mode {
+        statbuf.st_mode = (statbuf.st_mode & !(0o7777 as libc::mode_t))
+            | mode as libc::mode_t;
+    }
     let buf = unsafe {
         std::slice::from_raw_parts(
             &statbuf as *const libc::stat as *const u8,
@@ -932,19 +1762,88 @@ pub(crate) async fn handle_cow_statx(
     let mask = notif.data.args[3] as u32;
     let statxbuf_addr = notif.data.args[4];
 
-    // AT_EMPTY_PATH stats the dirfd itself, no path resolution needed.
-    // The fd was already redirected at open time, so let the kernel handle it.
-    if (flags & libc::AT_EMPTY_PATH) != 0 {
-        return NotifAction::Continue;
+    // AT_EMPTY_PATH with an actually empty pathname operates on the fd's
+    // pinned inode.  Never turn it back into a pathname: rename, unlink, and
+    // fd reuse can make that name refer to a different merged entry.
+    let empty_path = if (flags & libc::AT_EMPTY_PATH) != 0 {
+        if notif.data.args[1] == 0 {
+            true
+        } else {
+            match read_path(notif, notif.data.args[1], notif_fd) {
+            Some(path) => path.is_empty(),
+            None => return NotifAction::Continue,
+            }
+        }
+    } else {
+        false
+    };
+    if empty_path {
+        let pinned = if dirfd as i32 == libc::AT_FDCWD {
+            match pin_resolution_base(notif.pid, dirfd) {
+                Ok(fd) => fd,
+                Err(errno) => return NotifAction::Errno(errno),
+            }
+        } else {
+            match crate::seccomp::notif::dup_fd_from_pid(notif.pid, dirfd as i32) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF))
+                }
+            }
+        };
+        let real_path = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+            Ok(path) => path,
+            Err(_) => return NotifAction::Errno(libc::EBADF),
+        };
+        let logical_mode = {
+            let st = cow_state.lock().await;
+            let cow = match st.branch.as_ref() {
+                Some(cow) => cow,
+                None => return NotifAction::Continue,
+            };
+            if !cow.contains_layer_path(&real_path) {
+                return NotifAction::Continue;
+            }
+            cow.logical_directory_mode_for_handle(&real_path)
+        };
+        let mut stx_buf = vec![0u8; 256];
+        let empty = b"\0";
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                pinned.as_raw_fd(),
+                empty.as_ptr() as *const libc::c_char,
+                flags,
+                mask,
+                stx_buf.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return NotifAction::Errno(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            );
+        }
+        patch_statx_mode(&mut stx_buf, logical_mode);
+        if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
+            return NotifAction::Continue;
+        }
+        return NotifAction::ReturnValue(0);
     }
 
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
     let path = match read_path(notif, notif.data.args[1], notif_fd) {
-        Some(p) if !p.is_empty() => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+        Some(path) if !path.is_empty() => {
+            if let Err(errno) = check_relative_resolution_base(notif, dirfd, &path, cow_state).await {
+                return NotifAction::Errno(errno);
+            }
+            resolve_at_path_with_virtual(notif, dirfd, &path, virtual_cwd.as_deref())
+        }
         _ => return NotifAction::Continue,
     };
 
-    let (real_path, upper_root, workdir_root) = {
+    let (real_path, upper_root, workdir_root, logical_mode) = {
         let st = cow_state.lock().await;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
@@ -953,14 +1852,25 @@ pub(crate) async fn handle_cow_statx(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.matches(&path) {
             return NotifAction::Continue;
         }
-        let real = match cow.handle_stat(&path) {
+        if let Err(errno) = cow.check_logical_path_access(&path, 0) {
+            return NotifAction::Errno(errno);
+        }
+        let real = match cow.handle_stat_with_follow(
+            &path,
+            flags & libc::AT_SYMLINK_NOFOLLOW == 0,
+        ) {
             Some(p) => p,
             None => return NotifAction::Errno(libc::ENOENT), // deleted or absent
         };
-        (real, upper_root, workdir_root)
+        let logical_mode = if flags & libc::AT_SYMLINK_NOFOLLOW == 0 {
+            cow.logical_directory_mode_follow(&path)
+        } else {
+            cow.logical_directory_mode(&path)
+        };
+        (real, upper_root, workdir_root, logical_mode)
     };
 
     let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
@@ -971,11 +1881,41 @@ pub(crate) async fn handle_cow_statx(
     if let Err(e) = crate::sys::fs::statx_in_root(root, &rel, flags, mask, &mut stx_buf) {
         return NotifAction::Errno(e);
     }
+    patch_statx_mode(&mut stx_buf, logical_mode);
 
     if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
         return NotifAction::Continue;
     }
     NotifAction::ReturnValue(0)
+}
+
+pub(crate) async fn handle_cow_fstat(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    _processes: &Arc<ProcessIndex>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    handle_cow_fd_stat_into(
+        notif,
+        cow_state,
+        notif.data.args[0] as i32,
+        notif.data.args[1],
+        notif_fd,
+    )
+    .await
+}
+
+fn patch_statx_mode(buffer: &mut [u8], logical_mode: Option<u32>) {
+    let Some(mode) = logical_mode else {
+        return;
+    };
+    // Linux `struct statx::stx_mode` is the u16 at byte offset 28 on every
+    // architecture using this syscall ABI.
+    if buffer.len() >= 30 {
+        let current = u16::from_ne_bytes([buffer[28], buffer[29]]);
+        let patched = (current & !0o7777) | mode as u16;
+        buffer[28..30].copy_from_slice(&patched.to_ne_bytes());
+    }
 }
 
 // ============================================================
@@ -1011,6 +1951,9 @@ pub(crate) async fn handle_cow_exec(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+    if let Err(errno) = check_relative_resolution_base(notif, dirfd, &rel_path, cow_state).await {
+        return NotifAction::Errno(errno);
+    }
 
     let virtual_cwd = if (dirfd as i32) == libc::AT_FDCWD && !Path::new(&rel_path).is_absolute() {
         current_virtual_cwd(processes, notif.pid).await
@@ -1028,8 +1971,11 @@ pub(crate) async fn handle_cow_exec(
         let upper_root = cow.upper_dir().to_path_buf();
         let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &resolved);
-        if !cow.has_changes() || !cow.matches(&path) {
+        if !cow.matches(&path) {
             return NotifAction::Continue;
+        }
+        if let Err(errno) = cow.check_logical_path_access(&path, 0) {
+            return NotifAction::Errno(errno);
         }
         let real = match cow.handle_stat(&path) {
             // Only redirect when the binary lives in the upper layer.
@@ -1048,6 +1994,7 @@ pub(crate) async fn handle_cow_exec(
         &workdir_root,
         &upper_path,
         libc::O_RDONLY | libc::O_CLOEXEC,
+        0,
         0,
     ) {
         Ok(fd) => fd,
@@ -1100,11 +2047,15 @@ pub(crate) async fn handle_cow_readlink(
 ) -> NotifAction {
     // readlinkat(dirfd, pathname, buf, bufsiz)
     let dirfd = notif.data.args[0] as i64;
-    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
-    let path = match read_path(notif, notif.data.args[1], notif_fd) {
-        Some(p) => resolve_at_path_with_virtual(notif, dirfd, &p, virtual_cwd.as_deref()),
+    let raw_path = match read_path(notif, notif.data.args[1], notif_fd) {
+        Some(path) => path,
         None => return NotifAction::Continue,
     };
+    if let Err(errno) = check_relative_resolution_base(notif, dirfd, &raw_path, cow_state).await {
+        return NotifAction::Errno(errno);
+    }
+    let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
+    let path = resolve_at_path_with_virtual(notif, dirfd, &raw_path, virtual_cwd.as_deref());
     let buf_addr = notif.data.args[2];
     let bufsiz = (notif.data.args[3] & 0xFFFFFFFF) as usize;
 
@@ -1115,8 +2066,11 @@ pub(crate) async fn handle_cow_readlink(
     };
 
     let path = map_cow_upper_path(cow, &path);
-    if !cow.has_changes() || !cow.matches(&path) {
+    if !cow.matches(&path) {
         return NotifAction::Continue;
+    }
+    if let Err(errno) = cow.check_logical_path_access(&path, 0) {
+        return NotifAction::Errno(errno);
     }
 
     let target = match cow.handle_readlink(&path) {
@@ -1148,11 +2102,16 @@ pub(crate) async fn handle_cow_getdents(
     let buf_addr = notif.data.args[1];
     let buf_size = (notif.data.args[2] & 0xFFFFFFFF) as usize;
 
-    // Check if fd points to a COW-managed directory.
-    let link_path = format!("/proc/{}/fd/{}", pid, child_fd);
-    let target = match std::fs::read_link(&link_path) {
+    // Pin the directory inode. The child may close/reuse its numeric fd while
+    // this notification is stopped, but this merged read must stay bound to
+    // the object that triggered it.
+    let pinned = match crate::seccomp::notif::dup_fd_from_pid(pid, child_fd as i32) {
+        Ok(fd) => fd,
+        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let target = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
         Ok(t) => t.to_string_lossy().into_owned(),
-        Err(_) => return NotifAction::Continue,
+        Err(_) => return NotifAction::Errno(libc::EBADF),
     };
 
     // Compute rel_path under the global COW lock, but do not hold it
@@ -1163,6 +2122,10 @@ pub(crate) async fn handle_cow_getdents(
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let handle_mode = cow.logical_directory_mode_for_handle(Path::new(&target));
+        if handle_mode.is_some_and(|mode| mode & 0o100 == 0) {
+            return NotifAction::Errno(libc::EACCES);
+        }
         if !cow.has_changes() {
             return NotifAction::Continue;
         }
@@ -1287,6 +2250,16 @@ pub(crate) async fn handle_cow_chdir(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+    if let Err(errno) = check_relative_resolution_base(
+        notif,
+        libc::AT_FDCWD as i64,
+        &path,
+        cow_state,
+    )
+    .await
+    {
+        return NotifAction::Errno(errno);
+    }
     let orig_path_buf_len = path.len() + 1; // NUL-terminated size in child memory
 
     let virtual_cwd = current_virtual_cwd(processes, notif.pid).await;
@@ -1308,6 +2281,9 @@ pub(crate) async fn handle_cow_chdir(
         let abs_path = map_cow_upper_path(cow, &resolved);
         if !cow.matches(&abs_path) {
             return NotifAction::Continue;
+        }
+        if let Err(errno) = cow.check_logical_path_access(&abs_path, 0o100) {
+            return NotifAction::Errno(errno);
         }
         let rel = match cow.safe_rel(&abs_path) {
             Some(r) => r,
@@ -1333,6 +2309,7 @@ pub(crate) async fn handle_cow_chdir(
         &workdir_root,
         &upper_path,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
         0,
     ) {
         Ok(fd) => fd,
@@ -1387,6 +2364,61 @@ pub(crate) async fn handle_cow_chdir(
         pp.lock().await.virtual_cwd = Some(abs_path);
     }
 
+    NotifAction::Continue
+}
+
+pub(crate) async fn handle_cow_fchdir(
+    notif: &SeccompNotif,
+    cow_state: &Arc<Mutex<CowState>>,
+    processes: &Arc<ProcessIndex>,
+    _notif_fd: RawFd,
+) -> NotifAction {
+    let fd = notif.data.args[0] as i32;
+    let pinned = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, fd) {
+        Ok(fd) => fd,
+        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(pinned.as_raw_fd(), &mut metadata) } < 0 {
+        return NotifAction::Errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EBADF),
+        );
+    }
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return NotifAction::Errno(libc::ENOTDIR);
+    }
+    let real_path = match std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+        Ok(path) => path,
+        Err(_) => return NotifAction::Errno(libc::EBADF),
+    };
+    let st = cow_state.lock().await;
+    let cow = match st.branch.as_ref() {
+        Some(cow) => cow,
+        None => return NotifAction::Continue,
+    };
+    let path = map_cow_upper_path(cow, real_path.to_string_lossy().as_ref());
+    if !cow.matches(&path) {
+        return NotifAction::Continue;
+    }
+    let handle_mode = cow
+        .logical_directory_mode_for_handle(&real_path)
+        .unwrap_or(metadata.st_mode & 0o7777);
+    if handle_mode & 0o100 == 0 {
+        return NotifAction::Errno(libc::EACCES);
+    }
+    // Do not predict which inode the kernel will install from the child's fd
+    // slot: another thread can close/dup2 that number while this notification
+    // is stopped. Forget any prior synthetic cwd so later relative operations
+    // derive the actual successful result (or unchanged cwd on failure) from
+    // /proc instead of poisoning routing with the preflight handle.
+    if let Some(process) = pp_handle(processes, notif.pid) {
+        process.lock().await.virtual_cwd = None;
+    }
+    if let Ok(pid) = i32::try_from(notif.pid) {
+        processes.clear_virtual_cwd(pid);
+    }
     NotifAction::Continue
 }
 
@@ -1450,7 +2482,7 @@ mod confine_tests {
         let lower = TempDir::new().unwrap();
         std::fs::write(lower.path().join("ok.txt"), "data").unwrap();
         let real = lower.path().join("ok.txt");
-        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0) {
+        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0, 0) {
             Ok(fd) => {
                 assert_eq!(std::fs::read_to_string(format!("/proc/self/fd/{}", fd)).unwrap(), "data");
                 unsafe { libc::close(fd) };
@@ -1467,7 +2499,7 @@ mod confine_tests {
         // workdir/link -> /etc/passwd
         symlink("/etc/passwd", lower.path().join("link")).unwrap();
         let real = lower.path().join("link");
-        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0) {
+        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0, 0) {
             // Confined: /etc/passwd resolves under <lower>/etc/passwd, absent.
             Err(libc::ENOENT) | Err(libc::ENOSYS) => {}
             Ok(fd) => {
@@ -1486,7 +2518,7 @@ mod confine_tests {
         // workdir/evil -> /etc, child opens evil/passwd
         symlink("/etc", lower.path().join("evil")).unwrap();
         let real = lower.path().join("evil/passwd");
-        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0) {
+        match open_confined(upper.path(), lower.path(), &real, libc::O_RDONLY, 0, 0) {
             Err(libc::ENOENT) | Err(libc::ENOSYS) => {}
             Ok(fd) => {
                 let resolved = read_fd_path(fd);
@@ -1503,7 +2535,7 @@ mod confine_tests {
         let lower = TempDir::new().unwrap();
         let real = Path::new("/etc/passwd");
         assert_eq!(
-            open_confined(upper.path(), lower.path(), real, libc::O_RDONLY, 0),
+            open_confined(upper.path(), lower.path(), real, libc::O_RDONLY, 0, 0),
             Err(libc::EACCES)
         );
     }

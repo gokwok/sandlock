@@ -2,6 +2,37 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+#[tokio::test]
+async fn shared_cow_checkpoint_waits_for_a_complete_notification_operation() {
+    let workdir = tempfile::tempdir().unwrap();
+    let branch_storage = tempfile::tempdir().unwrap();
+    let snapshot_storage = tempfile::tempdir().unwrap();
+    std::fs::write(workdir.path().join("file"), b"lower").unwrap();
+    let branch = crate::cow::seccomp::SeccompCowBranch::create(
+        workdir.path(),
+        Some(branch_storage.path()),
+        0,
+    )
+    .unwrap();
+    let shared = SharedCow::new(branch);
+    let operation = crate::seccomp::state::enter_cow_operation(&shared.state).await;
+    let checkpoint_shared = shared.clone();
+    let checkpoint_storage = snapshot_storage.path().to_path_buf();
+    let mut checkpoint = tokio::spawn(async move {
+        checkpoint_shared.checkpoint(&checkpoint_storage).await
+    });
+
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        &mut checkpoint,
+    )
+    .await
+    .is_err(), "checkpoint crossed an in-flight COW operation");
+    drop(operation);
+    let snapshot = checkpoint.await.unwrap().unwrap();
+    assert_eq!(snapshot.read_range("file", 0, 16).unwrap(), b"lower");
+}
+
 #[test]
 fn run_as_parses_uid_and_gid() {
     let r = RunAs::from_str("1000:2000").unwrap();

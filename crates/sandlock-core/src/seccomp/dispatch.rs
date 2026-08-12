@@ -792,6 +792,8 @@ fn register_chroot_handlers(
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
+                    let _cow_operation =
+                        crate::seccomp::state::enter_cow_operation(&cow_state).await;
                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
@@ -815,6 +817,8 @@ fn register_chroot_handlers(
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
+                    let _cow_operation =
+                        crate::seccomp::state::enter_cow_operation(&cow_state).await;
                     let chroot_ctx = ChrootCtx::new(&policy, &processes);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
@@ -896,6 +900,8 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_chown);
             async move {
+                let _cow_operation =
+                    crate::seccomp::state::enter_cow_operation(&sup.cow).await;
                 let chroot_ctx = ChrootCtx::new(&policy, &sup.processes);
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
             }
@@ -912,6 +918,8 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_lchown);
             async move {
+                let _cow_operation =
+                    crate::seccomp::state::enter_cow_operation(&sup.cow).await;
                 let chroot_ctx = ChrootCtx::new(&policy, &sup.processes);
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
             }
@@ -1005,6 +1013,8 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
                 let processes_state = Arc::clone(&processes_state);
                 let notif_fd = cx.notif_fd;
                 async move {
+                    let _cow_operation =
+                        crate::seccomp::state::enter_cow_operation(&cow_state).await;
                     $handler(&notif, &cow_state, &processes_state, notif_fd).await
                 }
             }
@@ -1014,16 +1024,21 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     // Write syscalls (*at variants + legacy)
     let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_renameat2,
+        crate::arch::SYS_FCHMODAT2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
     ];
     write_nrs.extend([
         arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
-        arch::sys_rename(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
+        arch::sys_rename(), arch::sys_renameat(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
         arch::sys_chown(), arch::sys_lchown(),
     ].into_iter().flatten());
     for nr in write_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_write));
+    }
+
+    for nr in [libc::SYS_fchmod, libc::SYS_fchown] {
+        table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_fd_metadata));
     }
 
     table.register(libc::SYS_utimensat, cow_call!(crate::cow::dispatch::handle_cow_utimensat));
@@ -1034,7 +1049,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_access));
     }
 
-    let mut open_nrs = vec![libc::SYS_openat];
+    let mut open_nrs = vec![libc::SYS_openat, crate::arch::SYS_OPENAT2];
     open_nrs.extend(arch::sys_open());
     for nr in open_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_open));
@@ -1045,6 +1060,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     for nr in stat_nrs {
         table.register(nr, cow_call!(crate::cow::dispatch::handle_cow_stat));
     }
+    table.register(libc::SYS_fstat, cow_call!(crate::cow::dispatch::handle_cow_fstat));
 
     table.register(libc::SYS_statx, cow_call!(crate::cow::dispatch::handle_cow_statx));
 
@@ -1061,6 +1077,7 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     }
 
     table.register(libc::SYS_chdir, cow_call!(crate::cow::dispatch::handle_cow_chdir));
+    table.register(libc::SYS_fchdir, cow_call!(crate::cow::dispatch::handle_cow_fchdir));
     table.register(libc::SYS_getcwd, cow_call!(crate::cow::dispatch::handle_cow_getcwd));
 
     for &nr in &[libc::SYS_execve, libc::SYS_execveat] {
