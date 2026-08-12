@@ -14,6 +14,55 @@ pub enum SandlockError {
 
     #[error("handler error: {0}")]
     Handler(#[from] crate::seccomp::dispatch::HandlerError),
+
+    #[error("snapshot error: {0}")]
+    Snapshot(#[from] SnapshotError),
+}
+
+/// Errors from immutable filesystem snapshot operations.
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    #[error("snapshot operation failed: {0}")]
+    Operation(String),
+
+    #[error("snapshot descriptor is invalid: {0}")]
+    InvalidDescriptor(String),
+
+    #[error("snapshot source changed while it was being captured")]
+    SourceChanged,
+
+    #[error("snapshot inspection budget was exceeded: {0}")]
+    LimitExceeded(String),
+
+    #[error("snapshot was published but durability could not be confirmed: {message}")]
+    Published {
+        descriptor: Box<crate::snapshot::FsSnapshotDescriptor>,
+        message: String,
+    },
+
+    #[error("snapshot materialization was published at {destination:?} but durability could not be confirmed: {message}")]
+    Materialized {
+        destination: std::path::PathBuf,
+        message: String,
+    },
+
+    #[error("snapshot was destroyed but durability could not be confirmed: {message}")]
+    Destroyed {
+        descriptor: Box<crate::snapshot::FsSnapshotDescriptor>,
+        message: String,
+    },
+
+    #[error("snapshot path is invalid: {0}")]
+    InvalidPath(String),
+
+    #[error("snapshot entry has an unsupported file type: {0}")]
+    UnsupportedFileType(std::path::PathBuf),
+
+    #[error("snapshot is still referenced by {count} active handle(s) or filesystem branch(es)")]
+    InUse { count: usize },
+
+    #[error("snapshot has already been destroyed")]
+    AlreadyDestroyed,
 }
 
 /// Errors from sandbox configuration validation and building.
@@ -111,6 +160,9 @@ pub enum NotifError {
 pub enum BranchError {
     #[error("branch operation failed: {0}")]
     Operation(String),
+
+    #[error("branch snapshot operation failed: {0}")]
+    Snapshot(#[from] SnapshotError),
 
     #[error("branch was published but durability could not be confirmed: {message}")]
     Published {

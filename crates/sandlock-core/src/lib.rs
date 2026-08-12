@@ -9,6 +9,7 @@ pub(crate) mod sys;
 pub mod landlock;
 pub mod protection;
 pub mod seccomp;
+pub mod snapshot;
 pub(crate) mod resource;
 pub(crate) mod network;
 pub mod context;
@@ -36,13 +37,17 @@ pub mod dry_run;
 pub mod control;
 mod transparent_proxy;
 
-pub use error::{BranchError, SandlockError};
+pub use error::{BranchError, SandlockError, SnapshotError};
 pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, PauseGuard, Process, Sandbox, SandboxBuilder,
     StdioMode,
+};
+pub use snapshot::{
+    FsSnapshot, FsSnapshotDescriptor, SnapshotChange, SnapshotChangeKind, SnapshotDiff,
+    SnapshotEntry, SnapshotEntryKind, SnapshotList,
 };
 pub use result::{RunResult, ExitStatus};
 pub use branch::{BranchInspection, BranchState, FsBranch, PendingBranch, PendingRunResult};
