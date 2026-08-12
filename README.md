@@ -594,6 +594,12 @@ and recovery machinery with `Transaction`; unlike `Transaction`,
 publication is controlled externally instead of happening automatically
 after a fixed stage list.
 
+Controllers that need stable branch baselines can capture an immutable
+`FsSnapshot`, create one or more snapshot-backed `FsBranch` values, and make
+non-terminal checkpoints without changing the lower or consuming the branch.
+See [`docs/filesystem-snapshots.md`](docs/filesystem-snapshots.md) for the Rust
+API, consistency boundary, persistence model, and supported filesystem types.
+
 Run the complete two-candidate example on Linux:
 
 ```sh
