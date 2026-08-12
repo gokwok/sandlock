@@ -2755,8 +2755,10 @@ pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t
 /// pseudo-filesystem paths) are recorded on the handle; enumerate them with
 /// `sandlock_handle_restore_skipped_len` / `_fd` / `_path`.
 ///
-/// x86_64 restore engine only. Transparent restore currently holds for
-/// vDSO-free programs; see `Sandbox::restore_interactive` in sandlock-core.
+/// x86_64 restore engine only. The image is rebuilt by an `execve`'d restore
+/// stub in a fresh, already-confined process, and the kernel vDSO is relocated
+/// onto the checkpoint-recorded base, so ordinary libc programs resume; see
+/// `Sandbox::restore_interactive` in sandlock-core.
 ///
 /// # Safety
 /// `policy` must be a valid policy pointer and `cp` a valid checkpoint

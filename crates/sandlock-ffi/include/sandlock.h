@@ -104,7 +104,7 @@ enum sandlock_exception
 #endif // __cplusplus
  {
   /**
-   * Treat the failure as `NotifAction::Kill { sig: SIGKILL, pgid: child_pgid }`.
+   * Treat the failure as `NotifAction::KillGroup { sig: SIGKILL, pgid: child_pgid }`.
    * Default; "fail-closed" — the safe option.
    */
   SANDLOCK_EXCEPTION_KILL = 0,
@@ -1356,8 +1356,10 @@ void sandlock_checkpoint_free(sandlock_checkpoint_t *cp);
  * pseudo-filesystem paths) are recorded on the handle; enumerate them with
  * `sandlock_handle_restore_skipped_len` / `_fd` / `_path`.
  *
- * x86_64 restore engine only. Transparent restore currently holds for
- * vDSO-free programs; see `Sandbox::restore_interactive` in sandlock-core.
+ * x86_64 restore engine only. The image is rebuilt by an `execve`'d restore
+ * stub in a fresh, already-confined process, and the kernel vDSO is relocated
+ * onto the checkpoint-recorded base, so ordinary libc programs resume; see
+ * `Sandbox::restore_interactive` in sandlock-core.
  *
  * # Safety
  * `policy` must be a valid policy pointer and `cp` a valid checkpoint

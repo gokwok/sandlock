@@ -21,6 +21,12 @@ fn main() {
     // it to reconstruct a checkpoint), freestanding, no libc, no PIE. It lives
     // next to the checkpoint code that owns it; its binary is built into OUT_DIR
     // and its path is handed to the crate via the RESTORE_STUB_PATH env var.
+    //
+    // The fixed load address must match `checkpoint::restore_blob::STUB_BASE`:
+    // the stub reconstructs the checkpoint's layout around itself, so its own
+    // text and stack have to sit outside the address range programs occupy. The
+    // default -no-pie base (0x400000) is exactly where a static ET_EXEC workload
+    // loads, so the checkpoint's own text would be mapped over the running stub.
     let stub_src = manifest_dir.join("src/checkpoint/restore-stub.c");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let stub_bin = out_dir.join("restore-stub");
@@ -28,7 +34,19 @@ fn main() {
         &stub_src,
         &stub_bin,
         &["cc"],
-        &["-static", "-nostdlib", "-no-pie", "-O2"],
+        &[
+            "-static",
+            "-nostdlib",
+            "-no-pie",
+            "-O2",
+            // Without these, loop-idiom recognition rewrites the stub's own
+            // hand-written memset/memcpy bodies into calls to memset/memcpy,
+            // i.e. into infinite self-recursion. There is no libc to fall back
+            // on, so the stub must keep its byte loops as byte loops.
+            "-ffreestanding",
+            "-fno-tree-loop-distribute-patterns",
+            "-Wl,-Ttext-segment=0x30000000000",
+        ],
         "cannot compile restore-stub: its restore tests will be skipped.",
     );
     // Emit the path every run (rustc-env is not cached across build-script runs),

@@ -1315,9 +1315,13 @@ class Sandbox:
         could not be transparently restored are reported by
         :attr:`restore_skipped`.
 
-        x86_64 only. Transparent restore currently works for vDSO-free
-        programs: a glibc program resumes but crashes on its first vDSO call
-        (known limitation of the injection-based restore engine).
+        x86_64 only. The checkpoint is rebuilt by ``execve``-ing a
+        freestanding restore stub into a fresh, already-confined process, so
+        the restored program gets an address space holding only its own image
+        and a fresh kernel vDSO. The vDSO is relocated onto the
+        checkpoint-recorded base, so ordinary libc programs resume and keep
+        making vDSO calls. Assumes the restore runs on the same kernel that
+        took the checkpoint.
 
         Args:
             cp: Checkpoint to restore, from :meth:`checkpoint` or

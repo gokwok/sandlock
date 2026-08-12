@@ -285,8 +285,12 @@ struct LearnObserver {
     /// /proc/<pid>/exe. Pins [program].exec to an absolute path; argv[0] may
     /// be relative (resolved through $PATH by execvp) and useless to `run`.
     first_exe: Arc<Mutex<Option<PathBuf>>>,
-    /// UDP connect() calls pending confirmation by a subsequent send().
-    /// Key: (pid, fd). Value: formatted "udp://host:port" entry.
+    /// UDP connect() calls pending confirmation by a subsequent send.
+    /// Keyed by (TGID, fd) so a connect observed on one thread can be
+    /// confirmed by traffic from a sibling thread using the same fd table.
+    /// Connected UDP write(2) is deliberately not observed: trapping write
+    /// would catch the child bootstrap pipe writes before the parent receives
+    /// the seccomp listener fd.
     pending_udp_connects: Arc<Mutex<HashMap<(u32, i64), String>>>,
 }
 
@@ -417,6 +421,23 @@ impl LearnObserver {
                 }
             }
             "connect" | "sendto" | "sendmsg" | "sendmmsg" => {
+                // An address-less send on a connected UDP socket is how the
+                // glibc resolver talks to its nameserver (connect, then
+                // send with no sockaddr): real traffic, so it promotes the
+                // parked connect() the same way an addressed send does.
+                if event.host.is_none()
+                    && event.syscall != "connect"
+                    && event.protocol.as_deref() == Some("udp")
+                {
+                    if let Some(fd) = event.fd {
+                        let key = (tgid_of(event.pid), fd);
+                        if let Some(pending) = self.pending_udp_connects
+                            .lock().unwrap().remove(&key)
+                        {
+                            self.connects.lock().unwrap().insert(pending);
+                        }
+                    }
+                }
                 if let (Some(ip), Some(port), Some(proto)) = (event.host, event.port, event.protocol) {
                     if proto != "icmp" {
                         let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
@@ -427,16 +448,18 @@ impl LearnObserver {
                             // address-sorting probe (e.g. glibc getaddrinfo) and is
                             // discarded when the workload exits.
                             if let Some(fd) = event.fd {
+                                let key = (tgid_of(event.pid), fd);
                                 self.pending_udp_connects.lock().unwrap()
-                                    .insert((event.pid, fd), entry);
+                                    .insert(key, entry);
                             }
                         } else {
                             // For UDP send*, promote any pending connect() on the
-                            // same (pid, fd) to confirmed traffic.
+                            // same process fd to confirmed traffic.
                             if proto == "udp" {
                                 if let Some(fd) = event.fd {
+                                    let key = (tgid_of(event.pid), fd);
                                     if let Some(pending) = self.pending_udp_connects
-                                        .lock().unwrap().remove(&(event.pid, fd))
+                                        .lock().unwrap().remove(&key)
                                     {
                                         self.connects.lock().unwrap().insert(pending);
                                     }
@@ -500,14 +523,20 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let observer = LearnObserver::new();
     let observer_cb = observer.clone();
     let policy = Sandbox::builder()
+        // Name + mode mark this as a learning sandbox in `sandlock ps`: the
+        // observation policy below (read "/", allow-all network) would
+        // otherwise look like a dangerously permissive run. One learn
+        // sandbox per CLI process, so the pid keeps names unique.
+        .name(format!("learn-{}", std::process::id()))
+        .mode("learn")
         .fs_read("/")
         .workdir("/")
         // Discard all COW changes after observation; learn is read-only from
         // the real filesystem's perspective.
         .on_exit(BranchAction::Abort)
         .on_error(BranchAction::Abort)
+        // A scheme-less "*" covers TCP and UDP; ICMP always needs its own rule.
         .net_allow("*")
-        .net_allow("udp://*")
         .net_allow("icmp://*")
         .max_memory(sandlock_core::sandbox::ByteSize(1 << 43)) // 8 TiB
         .policy_fn(move |event, _ctx| observer_cb.on_event(event))
@@ -518,8 +547,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     // Use the three-step lifecycle (create/start/wait) so we can get the child
     // PID from sandbox.pid() and sample /proc/<pid> for resource peaks.
-    // No explicit name: the auto-generated sandbox-<pid>-<counter> is unique,
-    // so concurrent learn invocations never collide on the runtime dir.
     let mut sandbox = policy;
     sandbox.create_interactive(&cmd_refs).await
         .map_err(|e| anyhow!("sandbox error: {e}"))?;

@@ -221,6 +221,12 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub name: Option<String>,
 
+    // Operating-mode marker (e.g. "learn") shown as STATUS by `sandlock ps`:
+    // gives operators context for otherwise alarming sandboxes like learn's
+    // read-everything observation run.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub mode: Option<String>,
+
     // COW fork init function: runs once in the child before COW cloning.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub(crate) init_fn: Option<Box<dyn FnOnce() + Send + 'static>>,
@@ -294,6 +300,7 @@ impl Default for SandboxBuilder {
             protection_policy: ProtectionPolicy::default(),
             policy_fn: None,
             name: None,
+            mode: None,
             init_fn: None,
             work_fn: None,
         }
@@ -356,6 +363,7 @@ impl Clone for SandboxBuilder {
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
+            mode: self.mode.clone(),
             // init_fn (FnOnce) cannot be cloned; drop to None.
             init_fn: None,
             // work_fn is Arc-wrapped; clone bumps the reference count.
@@ -581,10 +589,12 @@ impl SandboxBuilder {
     /// is running: an `open` the kernel services returns `EMFILE`, but one the
     /// supervisor services (`chroot`, COW, procfs virtualisation) is refused
     /// with `EACCES`, indistinguishable from a policy denial. Measured floors
-    /// for a trivial command: 4 for a plain dynamically linked exec, about 12
-    /// under `chroot`. Treat those as the shape of the constraint, not a
-    /// guarantee: the chroot figure varies slightly by host, and a program
-    /// linking more libraries needs more.
+    /// for a trivial command: 4 for a plain dynamically linked exec, and the
+    /// same 4 under `chroot` for a static binary (the injected exec fd needs
+    /// one free slot below the cap; a dynamically linked binary needs a second
+    /// slot for the injected interpreter fd). Treat those as the shape of the
+    /// constraint, not a guarantee: a program linking more libraries needs
+    /// more.
     pub fn max_open_files(mut self, n: u32) -> Self {
         self.max_open_files = Some(n);
         self
@@ -754,6 +764,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Set the operating-mode marker shown as STATUS in `sandlock ps`
+    /// output (e.g. `"learn"`).
+    pub fn mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
     /// Set the COW-fork init function.
     ///
     /// The init function runs once in the child process before any COW clones
@@ -820,8 +837,7 @@ impl SandboxBuilder {
             return Err(SandboxError::Invalid(
                 "max_open_files must be greater than 0; omit it to inherit the \
                  system limit. Note that a workable floor is well above 1: a \
-                 plain dynamically linked exec needs about 4 descriptors, and \
-                 about 12 under chroot."
+                 trivial command needs about 4 descriptors, plain or chroot."
                     .into(),
             ));
         }
@@ -1031,6 +1047,8 @@ impl SandboxBuilder {
             user: self.user,
             policy_fn: self.policy_fn,
             name: self.name,
+            mode: self.mode,
+            cow_upper: None,
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             keep_branch_if_abandoned: std::sync::Arc::new(

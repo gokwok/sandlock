@@ -760,7 +760,7 @@ async fn ffi_handler_translates_kill_with_explicit_pgid() {
     let action = h.handle(&fake_ctx()).await;
     assert!(matches!(
         action,
-        NotifAction::Kill { sig, pgid } if sig == libc::SIGTERM && pgid == 1234
+        NotifAction::KillGroup { sig, pgid } if sig == libc::SIGTERM && pgid == 1234
     ));
 }
 
@@ -848,7 +848,7 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
     assert!(
         matches!(
             action,
-            NotifAction::Kill { sig, pgid }
+            NotifAction::KillGroup { sig, pgid }
                 if sig == libc::SIGKILL && pgid == expected_pgid
         ),
         "expected Kill {{ sig: SIGKILL, pgid: {expected_pgid} }}, got {action:?}",
@@ -1084,7 +1084,7 @@ async fn ffi_handler_kill_policy_on_callback_rc_nonzero() {
     let action = h.handle(&cx).await;
     let _ = child.kill();
     let _ = child.wait();
-    assert!(matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL));
+    assert!(matches!(action, NotifAction::KillGroup { sig, .. } if sig == libc::SIGKILL));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1141,7 +1141,7 @@ async fn ffi_handler_recovers_from_callback_panic() {
     let _ = child.wait();
     // The `catch_unwind` inside `spawn_blocking` swallows the panic and
     // the dispatcher falls back to the configured exception policy.
-    assert!(matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL));
+    assert!(matches!(action, NotifAction::KillGroup { sig, .. } if sig == libc::SIGKILL));
 }
 
 // ---- Group E: Unset action with zero rc ---------------------------------

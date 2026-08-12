@@ -51,12 +51,23 @@ impl ByteSize {
                 .trim()
                 .parse()
                 .map_err(|_| SandboxError::Invalid(format!("invalid byte size: {}", s)))?;
-            match suffix.to_ascii_uppercase().as_str() {
-                "K" => Ok(ByteSize::kib(n)),
-                "M" => Ok(ByteSize::mib(n)),
-                "G" => Ok(ByteSize::gib(n)),
-                other => Err(SandboxError::Invalid(format!("unknown byte size suffix: {}", other))),
-            }
+            let scale: u64 = match suffix.to_ascii_uppercase().as_str() {
+                "K" => 1024,
+                "M" => 1024 * 1024,
+                "G" => 1024 * 1024 * 1024,
+                other => {
+                    return Err(SandboxError::Invalid(format!(
+                        "unknown byte size suffix: {}",
+                        other
+                    )))
+                }
+            };
+            // Checked: the multiply wraps in a release build, so a value that
+            // parses cleanly but does not fit, such as "17179869184G", used to
+            // come back as a ceiling of zero bytes rather than as an error.
+            n.checked_mul(scale)
+                .map(ByteSize)
+                .ok_or_else(|| SandboxError::Invalid(format!("byte size out of range: {}", s)))
         } else {
             let n: u64 = s
                 .parse()
@@ -411,12 +422,15 @@ pub struct Sandbox {
     /// concrete host or "any IP." TCP and UDP rules carry ports; ICMP
     /// rules have none.
     ///
-    /// **Protocol gating falls out of rule presence.** Sandlock denies
-    /// UDP and ICMP socket creation by default; opting in is "list at
-    /// least one rule for that protocol". Scheme-less specs expand to a
-    /// TCP + UDP rule pair at parse time, so any of them opts UDP in;
-    /// ICMP always needs an explicit rule (`icmp://*` for any ICMP
-    /// echo). TCP is always permitted.
+    /// **Protocol gating falls out of rule presence.** With no network
+    /// rules at all, Sandlock denies UDP and ICMP socket creation. Once
+    /// any network destination policy is active, datagram sockets may be
+    /// created so libc DNS/address-selection probes can run, but actual
+    /// UDP/ICMP destinations are still denied unless a matching rule for
+    /// that protocol exists. Scheme-less specs expand to a TCP + UDP rule
+    /// pair at parse time, so any of them opts UDP traffic in; ICMP always
+    /// needs an explicit rule (`icmp://*` for any ICMP echo). TCP is
+    /// always permitted.
     ///
     /// Empty `net_allow` and empty `http_allow`/`http_deny` together
     /// mean "deny all outbound" (Landlock direct path denies, no
@@ -484,6 +498,13 @@ pub struct Sandbox {
     pub no_coredump: bool,
     pub deterministic_dirs: bool,
 
+    /// The COW upper dir granted read+exec at spawn time so Landlock can
+    /// execute binaries the workload creates in the workdir. An internal
+    /// grant, not user policy: recorded here so `sandbox_to_profile` can
+    /// keep it out of inspect output. Spawn-time state, not serialized.
+    #[serde(skip)]
+    pub(crate) cow_upper: Option<PathBuf>,
+
     // Filesystem branch
     pub workdir: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
@@ -546,6 +567,14 @@ pub struct Sandbox {
     // Not serialized — instance names are set at runtime, not in the policy file.
     #[serde(skip)]
     pub name: Option<String>,
+
+    /// Operating-mode marker (e.g. "learn") written to the runtime dir at
+    /// spawn time and shown as STATUS by `sandlock ps`, so an operator sees
+    /// why a sandbox exists (learn's read-everything observation run would
+    /// otherwise be indistinguishable from a dangerously permissive one).
+    /// Instance metadata like `name`, not policy — never serialized.
+    #[serde(skip)]
+    pub mode: Option<String>,
 
     // COW fork init function — runs once in the child before COW cloning.
     // Not serialized; not cloned (FnOnce can't be cloned — drops to None on clone).
@@ -627,6 +656,9 @@ impl Clone for Sandbox {
             no_huge_pages: self.no_huge_pages,
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
+            // Cloned for the control-loop snapshot, which is taken after the
+            // spawn-time upper grant lands in fs_readable.
+            cow_upper: self.cow_upper.clone(),
             workdir: self.workdir.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
@@ -648,6 +680,7 @@ impl Clone for Sandbox {
             user: self.user,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
+            mode: self.mode.clone(),
             // init_fn (FnOnce) cannot be cloned — the clone gets None.
             // If the clone also needs an init function, set it explicitly.
             init_fn: None,
@@ -1146,87 +1179,95 @@ impl Sandbox {
 
     /// Restore a checkpoint into a fresh, fully-sandboxed process.
     ///
-    /// Reuses the normal create path to fork a child with the saved policy and the
-    /// full notify stack in place (the child parks before execve), then takes the
-    /// parked child over with ptrace and injects the checkpoint image over it via
-    /// `restore_into`, resuming it at the saved program counter. The process comes
-    /// up already sandboxed and running; like [`Sandbox::popen`], the returned
-    /// [`Process`] is the handle to it (no `start()` step). Fds that could not be
-    /// transparently recreated are recorded on this `Sandbox`; query them with
-    /// [`Sandbox::restore_skipped`]. x86_64 restore engine only.
+    /// Reuses the normal create path to fork a child with the saved policy and
+    /// the full notify stack in place, then `execve`s the freestanding
+    /// restore-stub into it. The stub rebuilds the checkpoint's address space in
+    /// an otherwise empty one and `rt_sigreturn`s into the saved register
+    /// context; the supervisor writes the anonymous page contents in at the
+    /// stub's READY barrier and releases it. Confinement is installed before the
+    /// `execve`, so the restored program runs under the policy from its first
+    /// instruction.
+    ///
+    /// The restored process ends up with an address space holding only the
+    /// checkpoint image, a fresh kernel vDSO, and the stub's own few pages in a
+    /// reserved window the checkpoint provably does not use: anything else the
+    /// kernel set up for the stub's startup is unmapped before control passes to
+    /// the restored program.
+    ///
+    /// The process comes up already sandboxed and running; like
+    /// [`Sandbox::popen`], the returned [`Process`] is the handle to it (no
+    /// `start()` step). Fds that could not be transparently recreated are
+    /// recorded on this `Sandbox`; query them with [`Sandbox::restore_skipped`].
+    /// x86_64 restore engine only.
     ///
     /// The kernel vDSO is relocated onto the checkpoint-recorded base during
     /// restore, so ordinary libc/glibc programs that call vDSO functions (e.g.
     /// `clock_gettime`) resume correctly. Assumes a same-kernel restore.
     ///
-    /// On error the child may be left half-built; the caller should drop/kill the
-    /// Sandbox (Drop reaps it).
+    /// On error the child may be left mid-restore; the caller should drop/kill
+    /// the Sandbox (Drop reaps it).
     pub async fn restore_interactive(
         &mut self,
         cp: &crate::checkpoint::Checkpoint,
     ) -> Result<Process<'_>, crate::error::SandlockError> {
+        use crate::checkpoint::{restore_blob, resume};
         use crate::error::SandboxRuntimeError;
 
-        // The exe to launch is the checkpoint's original binary (within the
-        // policy's fs_read/exec grant). It is never actually execve'd: the child
-        // parks blocked in read() on the ready-pipe, and we inject the checkpoint
-        // over it before it could ever be released. Fall back to a benign command
-        // only when the checkpoint recorded no exe path.
-        let exe = if cp.process_state.exe.is_empty() {
-            "/bin/true".to_string()
-        } else {
-            cp.process_state.exe.clone()
-        };
-        self.create_interactive(&[exe.as_str()]).await?;
-        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
+        if cfg!(not(target_arch = "x86_64")) {
+            return Err(SandboxRuntimeError::Child(
+                "checkpoint restore is only implemented on x86_64".into(),
+            )
+            .into());
+        }
 
-        // ptrace is per-thread: the seize, inject, and detach must all run on the
-        // SAME OS thread (the seizing thread becomes the tracer). Do the entire
-        // synchronous sequence inside one spawn_blocking closure with no awaits.
-        // `restore_into` borrows the checkpoint, and spawn_blocking requires a
-        // 'static closure, so move a clone of `cp` in. The clone resets the
-        // policy's runtime to None (Sandbox::clone), which is harmless here:
-        // restore_into reads only process_state + fd_table, never policy.
-        // Resolve the confinement's chroot root and mounts so restore_into can
-        // translate the checkpoint's HOST-recorded mapping/fd paths back into
-        // the child's in-chroot view before reopening them (see restore_into).
-        // Empty/None when there is no chroot, leaving paths untranslated.
+        let stub = resume::stub_path();
+        if !stub.exists() {
+            return Err(SandboxRuntimeError::Child(format!(
+                "restore-stub was not built ({}); a C compiler is required to build sandlock \
+                 with checkpoint restore",
+                stub.display()
+            ))
+            .into());
+        }
+
+        // Resolve the confinement's chroot root and mounts so the plan can
+        // translate the checkpoint's HOST-recorded mapping/fd paths into the
+        // child's in-chroot view before the stub reopens them. Empty/None
+        // without a chroot, leaving paths untranslated.
         let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
+        let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
+            .map_err(SandboxRuntimeError::Child)?;
 
-        let cp = cp.clone();
-        let skipped = tokio::task::spawn_blocking(
-            move || -> Result<Vec<crate::checkpoint::SkippedFd>, crate::error::SandlockError> {
-                // PTRACE_SEIZE + PTRACE_INTERRUPT + waitpid to reach the ptrace-stop.
-                crate::checkpoint::capture::ptrace_seize(pid).map_err(|e| {
-                    SandboxRuntimeError::Child(format!("restore ptrace seize {pid}: {e}"))
-                })?;
-                // Inject the checkpoint image; leaves the child stopped with the
-                // saved registers (including rip at the checkpoint pc) loaded.
-                // On error, best-effort detach so the child is not left seized
-                // with a dangling tracer thread.
-                let skipped = match crate::checkpoint::resume::restore_into(
-                    pid, &cp, chroot_root.as_deref(), &mounts,
-                ) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = crate::checkpoint::capture::ptrace_detach(pid);
-                        return Err(e);
-                    }
-                };
-                // PTRACE_DETACH resumes the child; because rip points at the
-                // checkpoint pc, it resumes the checkpointed program, abandoning
-                // the ready-pipe read, under the already-installed policy.
-                crate::checkpoint::capture::ptrace_detach(pid).map_err(|e| {
-                    SandboxRuntimeError::Child(format!("restore ptrace detach {pid}: {e}"))
-                })?;
-                Ok(skipped)
-            },
-        )
+        let channel = resume::StubChannel::new(&plan.blob)
+            .map_err(|e| SandboxRuntimeError::Child(format!("restore control channel: {e}")))?;
+
+        // Landlock checks EXECUTE on the real path at execve time, so the stub
+        // binary has to be inside the policy's read+execute grant. It is a
+        // build artifact of sandlock itself, not workload-reachable state.
+        self.fs_readable.push(stub.clone());
+
+        self.ensure_runtime()?;
+        self.rt_mut().extra_fds = channel.extra_fds();
+        let stub_s = stub.to_string_lossy().into_owned();
+        self.create_interactive(&[stub_s.as_str()]).await?;
+        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
+        // Release the parked child to execve the stub. From here the stub runs
+        // confined, and its openat calls flow through the notify supervisor,
+        // which only makes progress while this runtime is pumped, hence the
+        // spawn_blocking below rather than a blocking wait on the executor.
+        self.start()?;
+
+        let (plan, channel, result) = tokio::task::spawn_blocking(move || {
+            let r = resume::finish_restore(pid, &channel, &plan);
+            (plan, channel, r)
+        })
         .await
-        .map_err(|e| SandboxRuntimeError::Child(format!("restore join error: {e}")))??;
+        .map_err(|e| SandboxRuntimeError::Child(format!("restore join error: {e}")))?;
+        drop(channel);
+        result?;
 
-        self.restore_skipped = skipped;
+        self.restore_skipped = plan.skipped;
         Ok(Process { sandbox: self })
     }
 
@@ -2112,6 +2153,7 @@ impl Sandbox {
         let shared_cow = self.rt().shared_cow.clone();
         let seccomp_cow_branch = if let Some(ref shared) = shared_cow {
             self.fs_readable.push(shared.upper_dir.clone());
+            self.cow_upper = Some(shared.upper_dir.clone());
             None
         } else if !no_supervisor && self.workdir.is_some() {
             let workdir = self.workdir.as_ref().unwrap().clone();
@@ -2126,13 +2168,16 @@ impl Sandbox {
             // `Keep` must survive a sandbox that is never `wait()`ed:
             // the branch only reaches `Sandbox`'s own disposition after
             // a completed `wait()`, and the branch's `Drop` would otherwise
-            // reclaim the upper the caller asked to keep.
+            // reclaim the upper the caller asked to keep. Commit and Abort are
+            // not carried over: an abandoned run has no exit status and must
+            // never merge its writes implicitly.
             self.keep_branch_if_abandoned.store(
                 self.on_exit == BranchAction::Keep || self.on_error == BranchAction::Keep,
                 std::sync::atomic::Ordering::Release,
             );
             branch.set_keep_if_abandoned(Arc::clone(&self.keep_branch_if_abandoned));
             self.fs_readable.push(branch.upper_dir().to_path_buf());
+            self.cow_upper = Some(branch.upper_dir().to_path_buf());
             Some(branch)
         } else {
             None
@@ -2318,6 +2363,7 @@ impl Sandbox {
                 &sandbox_name,
                 pid,
                 supervisor_pid,
+                self.mode.as_deref(),
             ) {
                 Ok(dir) => {
                     self.rt_mut().control_dir = Some(dir);
@@ -2377,6 +2423,7 @@ impl Sandbox {
                     &sandbox_name,
                     pid,
                     supervisor_pid,
+                    self.mode.as_deref(),
                 ) {
                     Ok((listener, control_dir)) => {
                         self.rt_mut().control_dir = Some(control_dir);

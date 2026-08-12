@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, spawn_pid_watcher, NotifAction, NotifPolicy};
-use crate::seccomp::state::ResourceState;
+use crate::seccomp::state::{read_tgid_of_tid, PerProcessState, ResourceState};
 use crate::sys::structs::{
     SeccompNotif, CLONE_NS_FLAGS, EAGAIN, EPERM,
 };
@@ -185,16 +185,6 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
     // Hand the pidfd to the watcher; it owns the fd's lifetime now.
     spawn_pid_watcher(Arc::clone(ctx), key, pidfd);
     true
-}
-
-fn read_tgid_of_tid(tid: i32) -> Option<i32> {
-    let status = std::fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Tgid:") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
 }
 
 pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
@@ -573,6 +563,106 @@ pub(crate) async fn rollback_fork_count(resource: &Arc<Mutex<ResourceState>>) {
     rs.proc_count = rs.proc_count.saturating_sub(1);
 }
 
+/// Handle execve/execveat notifications for memory accounting.
+///
+/// exec tears down the whole address space: every anonymous mapping and
+/// the entire heap go away at once, without the munmap/brk events the
+/// accounting normally learns from. So the old image's charge is credited
+/// back and the brk base dropped, leaving the new image to be accounted
+/// from zero.
+///
+/// Keeping the brk base across exec was the sharper of the two bugs: the
+/// kernel assigns the new image a fresh randomized base, so its first brk
+/// was charged the ASLR distance between the two heaps — hundreds of MB of
+/// phantom memory when the new base landed above the old one (SIGKILLing
+/// innocent workloads during startup), or a bogus shrink when it landed
+/// below.
+///
+/// The notification arrives before the kernel runs the syscall, so a
+/// failed exec releases the charge early; the address space then
+/// re-accumulates from its next mmap/brk, which under-counts the surviving
+/// image until it does. Erring that way keeps a failed exec from leaving a
+/// permanent phantom charge behind.
+pub(crate) async fn handle_exec_memory_reset(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+) -> NotifAction {
+    // exec from a non-leader thread continues under the leader's pid and
+    // the leader's entry is where the charge lives, so route through
+    // addr_space_state rather than the calling tid's own entry.
+    let Some(space) = ctx.processes.addr_space_state(notif.pid as i32) else {
+        return NotifAction::Continue;
+    };
+    let mut per = space.lock().await;
+    let mut st = ctx.resource.lock().await;
+    release_charge(&mut st, &mut per);
+    per.brk_base = None;
+    NotifAction::Continue
+}
+
+/// Credit an address space's entire outstanding charge back to the global
+/// total and zero it. Callers hold the per-process lock, then the
+/// resource lock (the ordering used throughout this module).
+pub(crate) fn release_charge(st: &mut ResourceState, per: &mut PerProcessState) {
+    st.mem_used = st.mem_used.saturating_sub(per.mem_charged);
+    per.mem_charged = 0;
+}
+
+/// Add `bytes` to the global total and to the address space's charge.
+fn charge(st: &mut ResourceState, per: Option<&mut PerProcessState>, bytes: u64) {
+    st.mem_used = st.mem_used.saturating_add(bytes);
+    st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+    if let Some(per) = per {
+        per.mem_charged = per.mem_charged.saturating_add(bytes);
+    }
+}
+
+/// Return `bytes` to the global total, capped at what this address space
+/// actually owes so one process's frees can never consume another's
+/// charge (the global total stays the sum of the per-space charges).
+fn credit(st: &mut ResourceState, per: Option<&mut PerProcessState>, bytes: u64) {
+    match per {
+        Some(per) => {
+            let refund = bytes.min(per.mem_charged);
+            per.mem_charged -= refund;
+            st.mem_used = st.mem_used.saturating_sub(refund);
+        }
+        None => st.mem_used = st.mem_used.saturating_sub(bytes),
+    }
+}
+
+/// Private anonymous bytes in `pid`'s address space: field 6 of
+/// `/proc/<pid>/statm` (`data_vm + stack_vm`). An O(1) read of the
+/// `mm_struct` counters; `/proc/<pid>/maps` would answer the same
+/// question by formatting every VMA (~274us against ~10us here).
+fn read_private_anon_bytes(pid: i32) -> Option<u64> {
+    let statm = std::fs::read_to_string(format!("/proc/{}/statm", pid)).ok()?;
+    let pages: u64 = statm.split_whitespace().nth(5)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    Some(pages.saturating_mul(page_size as u64))
+}
+
+/// Raise a laundered ledger back to the measured footprint: only
+/// anonymous mappings are charged but every unmap is credited, so
+/// mapping and unmapping a file refunds memory that was never charged.
+///
+/// A floor, not an assignment: `mmap` charges `PROT_NONE` reservations
+/// that `data_vm` excludes until an `mprotect` this handler never sees
+/// makes them writable, so the ledger must be allowed to sit higher.
+fn reconcile_floor(st: &mut ResourceState, per: Option<&mut PerProcessState>, pid: i32) {
+    let Some(per) = per else { return };
+    let Some(measured) = read_private_anon_bytes(pid) else { return };
+    if measured > per.mem_charged {
+        let correction = measured - per.mem_charged;
+        per.mem_charged = measured;
+        st.mem_used = st.mem_used.saturating_add(correction);
+        st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+    }
+}
+
 /// Handle memory-related notifications (mmap, munmap, brk, mremap, shmget).
 ///
 /// Tracks anonymous memory usage and enforces the configured memory limit.
@@ -596,59 +686,72 @@ pub(crate) async fn handle_memory(
             .unwrap_or(policy.max_memory_bytes)
     };
 
+    // brk is a query when new_brk is 0; nothing to account, and it must not
+    // seed a base.
+    if nr == libc::SYS_brk && args[0] == 0 {
+        return NotifAction::Continue;
+    }
+
+    // Charges are attributed to the calling task's address space (the
+    // ProcessIndex entry of its thread-group leader) so exec and exit can
+    // credit the whole address space back. An untracked task still counts
+    // against the global total; it just has nothing to credit later.
+    // Lock order: per-process first, then the global resource state.
+    let space = ctx.processes.addr_space_state(notif.pid as i32);
+    let mut per = match space {
+        Some(ref s) => Some(s.lock().await),
+        None => None,
+    };
     let mut st = ctx.resource.lock().await;
 
-    let kill = NotifAction::Kill { sig: libc::SIGKILL, pgid: notif.pid as i32 };
+    // Kill the task that asked for the memory, not the whole sandbox: the
+    // budget is sandbox-wide, so ending the one process that would exceed
+    // it frees its charge and lets the rest run on, as an OOM killer does.
+    let kill = NotifAction::KillTask { sig: libc::SIGKILL, pid: notif.pid as i32 };
+    let would_exceed = |st: &ResourceState, bytes: u64| st.mem_used.saturating_add(bytes) > limit;
+
+    // Allocations are judged against the ledger, so correct it first; a
+    // credit may have pushed it below what is really mapped.
+    if nr != libc::SYS_munmap {
+        reconcile_floor(&mut st, per.as_deref_mut(), notif.pid as i32);
+    }
 
     if nr == libc::SYS_mmap {
         // args[1] = len, args[3] = flags
         let len = args[1];
         let flags = args[3];
         if (flags & MAP_ANONYMOUS) != 0 {
-            if st.mem_used.saturating_add(len) > limit {
+            if would_exceed(&st, len) {
                 return kill;
             }
-            st.mem_used += len;
-            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+            charge(&mut st, per.as_deref_mut(), len);
         }
     } else if nr == libc::SYS_munmap {
-        // args[1] = len
-        let len = args[1];
-        st.mem_used = st.mem_used.saturating_sub(len);
+        // args[1] = len. Whether the range was anonymous isn't knowable
+        // from the arguments; `reconcile_floor` undoes an over-refund
+        // before the next allocation is judged.
+        credit(&mut st, per.as_deref_mut(), args[1]);
     } else if nr == libc::SYS_brk {
         // args[0] = new_brk
         let new_brk = args[0];
-
-        if new_brk == 0 {
-            // Query: return Continue, kernel handles it.
+        let Some(per) = per.as_deref_mut() else {
+            // No address-space entry to hold a base, so the delta from the
+            // previous break is unknowable. Accounting skips this task's
+            // heap rather than guessing.
             return NotifAction::Continue;
-        }
-
-        // Per-process brk base is in PerProcessState. Drop the global
-        // ResourceState lock first to avoid lock ordering issues with
-        // the per-process lock acquired below (per-process first,
-        // then global, when both are needed).
-        drop(st);
-        let entry = match ctx.processes.entry_for(notif.pid as i32) {
-            Some(e) => e,
-            None => return NotifAction::Continue,
         };
-        let mut perproc = entry.1.lock().await;
-        let mut st = ctx.resource.lock().await;
 
-        let base = *perproc.brk_base.get_or_insert(new_brk);
+        let base = *per.brk_base.get_or_insert(new_brk);
         if new_brk > base {
             let delta = new_brk - base;
-            if st.mem_used.saturating_add(delta) > limit {
+            if would_exceed(&st, delta) {
                 return kill;
             }
-            st.mem_used += delta;
-            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
-            perproc.brk_base = Some(new_brk);
+            charge(&mut st, Some(per), delta);
+            per.brk_base = Some(new_brk);
         } else if new_brk < base {
-            let delta = base - new_brk;
-            st.mem_used = st.mem_used.saturating_sub(delta);
-            perproc.brk_base = Some(new_brk);
+            credit(&mut st, Some(per), base - new_brk);
+            per.brk_base = Some(new_brk);
         }
     } else if nr == libc::SYS_mremap {
         // args[1] = old_len, args[2] = new_len
@@ -657,26 +760,128 @@ pub(crate) async fn handle_memory(
 
         if new_len > old_len {
             let growth = new_len - old_len;
-            if st.mem_used.saturating_add(growth) > limit {
+            if would_exceed(&st, growth) {
                 return kill;
             }
-            st.mem_used += growth;
-            st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+            charge(&mut st, per.as_deref_mut(), growth);
         } else if new_len < old_len {
-            let shrink = old_len - new_len;
-            st.mem_used = st.mem_used.saturating_sub(shrink);
+            credit(&mut st, per.as_deref_mut(), old_len - new_len);
         }
     } else if nr == libc::SYS_shmget {
         // shmget(key, size, shmflg) — args[1] = size
         let size = args[1];
-        if size > 0 && st.mem_used.saturating_add(size) > limit {
+        if size > 0 && would_exceed(&st, size) {
             return kill;
         }
-        st.mem_used += size;
-        st.peak_mem_used = st.peak_mem_used.max(st.mem_used);
+        charge(&mut st, per.as_deref_mut(), size);
     }
 
     NotifAction::Continue
+}
+
+#[cfg(test)]
+mod memory_range_tests {
+    use super::*;
+
+    /// The measured footprint follows anonymous memory and ignores file
+    /// mappings, which is what makes it a trustworthy floor: a workload
+    /// can't lower it by mapping and unmapping a file.
+    #[test]
+    fn measured_footprint_tracks_anonymous_not_file_mappings() {
+        let pid = std::process::id() as i32;
+        // Sibling tests allocate and free in this process while this one
+        // runs, so the mappings are sized far above that noise and the
+        // readings are compared with wide margins.
+        let len = 1 << 30;
+        let before = read_private_anon_bytes(pid).expect("read own statm");
+
+        let file = tempfile::tempfile().expect("temp file");
+        file.set_len(len as u64).expect("size temp file");
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED, "file mmap failed");
+        let with_file = read_private_anon_bytes(pid).unwrap();
+
+        let anon = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anon, libc::MAP_FAILED, "anon mmap failed");
+        let with_anon = read_private_anon_bytes(pid).unwrap();
+
+        unsafe {
+            libc::munmap(mapped, len);
+            libc::munmap(anon, len);
+        }
+
+        let len = len as u64;
+        assert!(
+            with_file < before + len / 4,
+            "file mapping moved the measure: {before} -> {with_file}"
+        );
+        assert!(
+            with_anon >= with_file + len / 2,
+            "anonymous mapping did not move the measure: {with_file} -> {with_anon}"
+        );
+    }
+
+    /// A ledger pushed below reality (by crediting an unmap of memory it
+    /// never charged) is restored before the next allocation is judged.
+    #[test]
+    fn reconcile_raises_a_laundered_ledger_to_the_measured_footprint() {
+        let pid = std::process::id() as i32;
+        let mut st = ResourceState::new(0, 0);
+        let mut per = PerProcessState::default(); // laundered to zero
+
+        reconcile_floor(&mut st, Some(&mut per), pid);
+
+        // Sibling tests move this process's footprint while the test
+        // runs, so the restored figure is checked for being real and
+        // consistent rather than against a separately-taken reading.
+        assert!(per.mem_charged > 0, "ledger not restored from the measure");
+        assert_eq!(st.mem_used, per.mem_charged);
+
+        // A ledger above the measure is left alone: mmap charges PROT_NONE
+        // reservations that the kernel's measure excludes. A gigabyte of
+        // headroom keeps this clear of any sibling's allocations.
+        let inflated = per.mem_charged + (1 << 30);
+        per.mem_charged = inflated;
+        st.mem_used = inflated;
+        reconcile_floor(&mut st, Some(&mut per), pid);
+        assert_eq!(per.mem_charged, inflated);
+        assert_eq!(st.mem_used, inflated);
+    }
+
+    /// An address space can never hand back more than it owes, so one
+    /// process's frees cannot consume another's charge.
+    #[test]
+    fn credit_is_capped_by_what_the_address_space_owes() {
+        let mut st = ResourceState::new(0, 0);
+        st.mem_used = 100;
+        let mut per = PerProcessState {
+            mem_charged: 30,
+            ..Default::default()
+        };
+
+        credit(&mut st, Some(&mut per), 80);
+
+        assert_eq!(per.mem_charged, 0);
+        assert_eq!(st.mem_used, 70, "only this space's 30 may be returned");
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::arch;
+use crate::cow::result::link_result;
 use crate::cow::seccomp::SeccompCowBranch;
 use crate::procfs::{build_dirent64, DT_DIR, DT_LNK, DT_REG};
 use crate::seccomp::notif::{read_child_mem, write_child_mem, write_child_mem_force, NotifAction};
@@ -638,8 +639,17 @@ pub(crate) async fn handle_cow_write(
             cow_result(cow.handle_symlink(target, linkpath))
         }
         CowWriteOp::Link { ref old_path, ref new_path } => {
+            // A hard link cannot be half staged. With one name inside the
+            // branch and the other below it there is nothing to stage: linking
+            // in would create the name in the workdir the branch promised to
+            // leave untouched, and linking out would hand the child an alias
+            // for the lower inode that survives an abort. EXDEV is what the
+            // kernel says about a link that cannot span the two sides.
+            if cow.matches(old_path) != cow.matches(new_path) {
+                return NotifAction::Errno(libc::EXDEV);
+            }
             if !cow.matches(new_path) { return NotifAction::Continue; }
-            cow_result(cow.handle_link(old_path, new_path))
+            link_result(cow.handle_link(old_path, new_path))
         }
         CowWriteOp::Chmod { ref path, mode } => {
             if !cow.matches(path) { return NotifAction::Continue; }

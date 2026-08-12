@@ -206,6 +206,41 @@ static int cmd_ln_s(int argc, char **argv) {
     return 0;
 }
 
+/* ── ln (hard link) ─────────────────────────────────────────── */
+/* link(2). On architectures that still carry the legacy syscall this
+ * reaches the dispatcher through SYS_link; elsewhere the libc maps it
+ * onto linkat(2). Use the "linkat" command to pin the *at form. */
+static int cmd_ln(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "ln: missing operand\n"); return 1; }
+    if (link(argv[0], argv[1]) < 0) {
+        fprintf(stderr, "ln: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+/* ── linkat (hard link via the *at syscall) ─────────────────── */
+/* linkat target link [follow]. The optional third word sets
+ * AT_SYMLINK_FOLLOW, which is the only way to ask for the inode a
+ * symlink points at: link(2) and plain linkat(2) always take the
+ * source name itself. */
+static int cmd_linkat(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "linkat: missing operand\n"); return 1; }
+    int flags = 0;
+    if (argc >= 3) {
+        if (strcmp(argv[2], "follow") != 0) {
+            fprintf(stderr, "linkat: unknown flag: %s\n", argv[2]);
+            return 1;
+        }
+        flags = AT_SYMLINK_FOLLOW;
+    }
+    if (linkat(AT_FDCWD, argv[0], AT_FDCWD, argv[1], flags) < 0) {
+        fprintf(stderr, "linkat: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
 /* ── access ─────────────────────────────────────────────────── */
 static int cmd_access(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "access: missing operand\n"); return 1; }
@@ -592,9 +627,13 @@ static int cmd_spawn_loop(int argc, char **argv) {
  * single thread with one open fd: exactly the shape the checkpoint/restore
  * engine supports. Used by the restore test to prove a restored process keeps
  * making vDSO calls (which requires the engine to relocate the vDSO onto the
- * checkpoint-recorded base); as a static-musl binary its clock_gettime routes
- * through the kernel vDSO just as a glibc program's would.
+ * checkpoint-recorded base) and keeps reaching its thread-local storage (which
+ * requires the engine to restore the thread pointer); as a static binary its
+ * clock_gettime routes through the kernel vDSO just as a dynamic program's would.
  */
+/* Thread-local, so the loop below exercises %fs-relative addressing. */
+static __thread unsigned long tls_ticks;
+
 static int cmd_clock_loop(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "clock-loop: missing file operand\n"); return 1; }
     int fd = open(argv[0], O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -605,6 +644,17 @@ static int cmd_clock_loop(int argc, char **argv) {
     struct timespec now;
     for (;;) {
         i++;
+        /* Read and write thread-local storage every iteration, so the loop
+         * faults if a restore did not put the thread pointer back. The x86_64
+         * signal frame cannot carry fs_base, so a restore engine that resumes
+         * through rt_sigreturn has to set it separately; without that, %fs is
+         * whatever the restoring code had. Which libc this is built against
+         * decides whether the rest of the loop would notice on its own (glibc
+         * reads the stack-protector canary at %fs:0x28 on nearly every call,
+         * musl here would not), so touch TLS explicitly rather than depend on
+         * the toolchain to expose the bug. */
+        tls_ticks++;
+        if (tls_ticks != i) _exit(3);
         clock_gettime(CLOCK_MONOTONIC, &now); /* vDSO fast path */
         unsigned long v = i;
         for (int d = 19; d >= 0; d--) { buf[d] = '0' + (v % 10); v /= 10; }
@@ -643,6 +693,67 @@ static int cmd_chdir(int argc, char **argv) {
     }
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) { perror("chdir: getcwd"); return 1; }
+    printf("OK %s\n", buf);
+    return 0;
+}
+
+/* ── openat2 (the newest open spelling, via raw syscall) ──────── */
+/*
+ * openat2(2) carries flags, mode and resolve in a struct open_how in user
+ * memory instead of in registers, so a supervisor that reads open arguments
+ * positionally misreads its third argument as flags when it is really a
+ * pointer. Opens <path> read-only and dumps it, so a test can tell which
+ * file the path actually resolved to. musl has no wrapper for it.
+ */
+#ifndef __NR_openat2
+#define __NR_openat2 437
+#endif
+struct helper_open_how {
+    unsigned long long flags;
+    unsigned long long mode;
+    unsigned long long resolve;
+};
+
+static int cmd_openat2(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "openat2: missing operand\n"); return 1; }
+    /* Second operand, when present, is a RESOLVE_* mask (decimal). */
+    struct helper_open_how how = { .flags = O_RDONLY, .mode = 0, .resolve = 0 };
+    if (argc >= 2) how.resolve = strtoull(argv[1], NULL, 0);
+    long fd = syscall(__NR_openat2, AT_FDCWD, argv[0], &how, sizeof(how));
+    if (fd < 0) {
+        fprintf(stderr, "openat2: %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read((int)fd, buf, sizeof(buf))) > 0)
+        write(STDOUT_FILENO, buf, n);
+    close((int)fd);
+    return 0;
+}
+
+/* ── fchdir (change directory through an already-open dirfd) ──── */
+/*
+ * fchdir() carries no path for the supervisor to inspect, so a supervisor
+ * that tracks the cwd itself has to notice this spelling too or its notion
+ * goes stale and later relative paths resolve somewhere else. Prints the
+ * resulting cwd like `chdir` does.
+ */
+static int cmd_fchdir(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "fchdir: missing operand\n"); return 1; }
+    int fd = open(argv[0], O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        fprintf(stderr, "fchdir: open %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    if (fchdir(fd) != 0) {
+        fprintf(stderr, "fchdir: %s: %s\n", argv[0], strerror(errno));
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    char buf[4096];
+    if (!getcwd(buf, sizeof(buf))) { perror("fchdir: getcwd"); return 1; }
     printf("OK %s\n", buf);
     return 0;
 }
@@ -727,6 +838,8 @@ static int cmd_write_fd_link(int argc, char **argv) {
 
 static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
+    if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
+    if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
@@ -743,12 +856,12 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "rm") == 0)             return cmd_rm(argc, argv);
     if (strcmp(cmd, "mv") == 0)             return cmd_mv(argc, argv);
     if (strcmp(cmd, "ln") == 0) {
-        /* ln -s target link */
+        /* ln -s target link (symlink), ln target link (hard link) */
         if (argc >= 1 && strcmp(argv[0], "-s") == 0)
             return cmd_ln_s(argc - 1, argv + 1);
-        fprintf(stderr, "ln: only -s supported\n");
-        return 1;
+        return cmd_ln(argc, argv);
     }
+    if (strcmp(cmd, "linkat") == 0)         return cmd_linkat(argc, argv);
     if (strcmp(cmd, "access") == 0)         return cmd_access(argc, argv);
     if (strcmp(cmd, "getxattr") == 0)       return cmd_getxattr(argc, argv);
     if (strcmp(cmd, "setxattr") == 0)       return cmd_setxattr(argc, argv);

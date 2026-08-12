@@ -56,7 +56,7 @@ pub(crate) fn is_sensitive_proc(path: &str) -> bool {
 ///
 /// Returns `None` for non-numeric components like `/proc/self/...`,
 /// `/proc/cpuinfo`, etc.  Those are handled elsewhere or are safe.
-fn extract_proc_pid(path: &str) -> Option<i32> {
+pub(crate) fn extract_proc_pid(path: &str) -> Option<i32> {
     let rest = path.strip_prefix("/proc/")?;
     // Take the next path component (up to '/' or end of string).
     let component = rest.split('/').next()?;
@@ -417,6 +417,7 @@ pub(crate) async fn handle_proc_open(
         notif_fd,
         policy.chroot_root.as_deref(),
         &policy.chroot_mounts,
+        processes,
     ) {
         Some(p) => p,
         None => return NotifAction::Continue,
@@ -607,8 +608,9 @@ pub(crate) fn handle_hostname_open(
     notif_fd: RawFd,
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    processes: &ProcessIndex,
 ) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts)?;
+    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
     if resolved != std::path::Path::new("/etc/hostname") {
         return None;
     }
@@ -629,8 +631,9 @@ pub(crate) fn handle_etc_hosts_open(
     notif_fd: RawFd,
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    processes: &ProcessIndex,
 ) -> Option<NotifAction> {
-    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts)?;
+    let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
     if resolved != std::path::Path::new("/etc/hosts") {
         return None;
     }
@@ -657,6 +660,7 @@ pub(crate) fn resolve_open_target(
     notif_fd: RawFd,
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    processes: &ProcessIndex,
 ) -> Option<std::path::PathBuf> {
     let nr = notif.data.nr as i64;
     let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::sys_open() {
@@ -670,7 +674,7 @@ pub(crate) fn resolve_open_target(
         return None;
     };
     let path = read_path(notif, path_ptr, notif_fd)?;
-    resolve_to_normalized_absolute(notif.pid, dirfd, &path, chroot_root, chroot_mounts)
+    resolve_to_normalized_absolute(notif.pid, dirfd, &path, chroot_root, chroot_mounts, processes)
 }
 
 /// Lexical normalization of `(pid, dirfd, path)`:
@@ -690,30 +694,40 @@ fn resolve_to_normalized_absolute(
     path: &str,
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    processes: &ProcessIndex,
 ) -> Option<std::path::PathBuf> {
     use std::path::{Component, Path, PathBuf};
 
+    // The dirfd/cwd symlink target is the *real* host directory. Under
+    // chroot, sandlock services /proc, /etc and /dev via on-behalf opens,
+    // so that target is e.g. `<chroot>/proc` while the child's absolute
+    // spelling of the same file is `/proc/...`. Map the base back into the
+    // sandbox's virtual namespace so relative and absolute spellings
+    // resolve identically and the open-family shims (proc synthesis,
+    // /etc/hosts, /etc/hostname, random seed, CA inject) match either way.
+    let to_virtual = |host: PathBuf| match chroot_root {
+        Some(root) => {
+            crate::chroot::resolve::host_to_virtual(root, chroot_mounts, &host).unwrap_or(host)
+        }
+        None => host,
+    };
+
     let joined: PathBuf = if Path::new(path).is_absolute() {
         PathBuf::from(path)
-    } else {
-        let base = if dirfd as i32 == libc::AT_FDCWD {
-            std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()?
-        } else {
-            std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd as i32)).ok()?
-        };
-        // The dirfd/cwd symlink target is the *real* host directory. Under
-        // chroot, sandlock services /proc, /etc and /dev via on-behalf opens,
-        // so that target is e.g. `<chroot>/proc` while the child's absolute
-        // spelling of the same file is `/proc/...`. Map the base back into the
-        // sandbox's virtual namespace so relative and absolute spellings
-        // resolve identically and the open-family shims (proc synthesis,
-        // /etc/hosts, /etc/hostname, random seed, CA inject) match either way.
-        let base = match chroot_root {
-            Some(root) => crate::chroot::resolve::host_to_virtual(root, chroot_mounts, &base)
-                .unwrap_or(base),
-            None => base,
+    } else if dirfd as i32 == libc::AT_FDCWD {
+        // Under chroot the supervisor services chdir itself and the child's
+        // real cwd never moves, so its own notion is the only current one,
+        // and it is already virtual. Falling back to the kernel's is right
+        // only for a task that has never moved, which is when nothing is
+        // tracked.
+        let base = match i32::try_from(pid).ok().and_then(|p| processes.virtual_cwd(p)) {
+            Some(tracked) => tracked,
+            None => to_virtual(std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()?),
         };
         base.join(path)
+    } else {
+        let base = std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd as i32)).ok()?;
+        to_virtual(base).join(path)
     };
 
     let mut out = PathBuf::new();

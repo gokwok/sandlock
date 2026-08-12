@@ -4,6 +4,7 @@
 // `ProcessIndex`; cleanup on exit is just dropping the entry's `Arc`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -85,6 +86,30 @@ pub struct PidKey {
     pub start_time: u64,
 }
 
+/// Read the thread-group leader pid (TGID) containing `tid` from
+/// `/proc/<tid>/status`. `None` when the task is gone or /proc is
+/// unreadable; callers decide what that means for them.
+pub(crate) fn read_tgid_of_tid(tid: i32) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", tid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Read the parent pid (field 4 of `/proc/<pid>/stat`) for `pid`.
+/// `None` when the task is gone or /proc is unreadable.
+pub(crate) fn read_ppid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Skip past "pid (comm)": comm may contain spaces and parens, but the
+    // last ") " in the line ends it. The first token after it is the state,
+    // and the parent pid follows.
+    let rest = stat.rsplit_once(") ")?.1;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Read the process start time (field 22 of /proc/<pid>/stat) for `pid`.
 /// Returns None if the process is gone or /proc is not readable.
 pub(crate) fn read_pid_start_time(pid: i32) -> Option<u64> {
@@ -112,6 +137,13 @@ pub struct PerProcessState {
     pub virtual_cwd: Option<String>,
     /// Recorded brk base for memory accounting. None until first brk.
     pub brk_base: Option<u64>,
+    /// Anonymous memory (bytes) charged to this address space and not
+    /// yet credited back. Only the thread-group leader's entry carries a
+    /// charge: threads share one address space, so all accounting for a
+    /// task is routed to its leader via [`ProcessIndex::addr_space_state`].
+    /// Credited back to the global total when the address space goes away
+    /// (exec replaces it, or the process exits).
+    pub mem_charged: u64,
     /// COW directory dirent cache. Keyed by child's fd; value is
     /// (host target path, sorted dirent bytes left to return).
     /// Entries are invalidated when the fd is reused for a different
@@ -154,10 +186,27 @@ pub struct ProcessIndex {
     inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
 }
 
+/// A task's current directory as the sandbox believes it to be: the
+/// path `getcwd` should report, in whatever namespace the child sees
+/// (the virtual path under chroot, the real path otherwise).
+///
+/// `None` means the task has never moved, so the kernel's own cwd is
+/// still authoritative. Shared behind an `Arc` the way the kernel
+/// shares `fs_struct`, so a chdir in one thread is seen by its
+/// siblings. Kept outside `PerProcessState` (and behind a std mutex)
+/// because path resolution reads it from synchronous helpers.
+pub type SharedCwd = Arc<std::sync::Mutex<Option<PathBuf>>>;
+
 #[derive(Clone)]
 struct ProcessEntry {
     key: PidKey,
+    /// Thread-group leader of this task; equals `key.pid` for a
+    /// single-threaded process. Read once at registration and kept
+    /// outside the async mutex so address-space lookups need only the
+    /// index's read lock.
+    tgid: i32,
     state: Arc<AsyncMutex<PerProcessState>>,
+    cwd: SharedCwd,
 }
 
 impl ProcessIndex {
@@ -175,12 +224,83 @@ impl ProcessIndex {
     pub fn register(&self, pid: i32) -> Option<PidKey> {
         let start_time = read_pid_start_time(pid)?;
         let key = PidKey { pid, start_time };
+        // Unreadable /proc means the task is its own address space as far
+        // as accounting is concerned: better local than misrouted.
+        let tgid = read_tgid_of_tid(pid).unwrap_or(pid);
         let entry = ProcessEntry {
             key,
+            tgid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+            cwd: self.inherited_cwd(pid, tgid),
         };
         self.inner.write().ok()?.insert(pid, entry);
         Some(key)
+    }
+
+    /// The cwd cell a task starts life with.
+    ///
+    /// A thread joins its leader's cell, because the kernel hands
+    /// pthreads a shared `fs_struct` and one thread's chdir moves its
+    /// siblings. Anything else copies the parent's current value, which
+    /// is what `fork(2)` does. Thread-group membership stands in for
+    /// `CLONE_FS` here, the same approximation `addr_space_state` makes
+    /// for `CLONE_VM`: a bare `clone(CLONE_FS)` without `CLONE_THREAD`
+    /// gets a private copy instead of sharing. An untracked parent
+    /// leaves the child at None, which falls back to the kernel's cwd.
+    fn inherited_cwd(&self, pid: i32, tgid: i32) -> SharedCwd {
+        let ppid = if tgid == pid { read_ppid(pid) } else { None };
+        let Ok(guard) = self.inner.read() else {
+            return SharedCwd::default();
+        };
+        if tgid != pid {
+            if let Some(leader) = guard.get(&tgid) {
+                return Arc::clone(&leader.cwd);
+            }
+        }
+        let parent_cwd = ppid
+            .and_then(|p| guard.get(&p))
+            .and_then(|e| e.cwd.lock().ok().and_then(|c| c.clone()));
+        Arc::new(std::sync::Mutex::new(parent_cwd))
+    }
+
+    /// The cwd cell to read or write for `pid`.
+    ///
+    /// A task without an entry of its own falls back to its
+    /// thread-group leader: `pidfd_open` on a non-leader tid needs
+    /// `PIDFD_THREAD` (Linux 6.9), so `register_pid_if_new` can leave a
+    /// thread unregistered. Since threads share one `fs_struct`, the
+    /// leader's cell is the correct answer for them, not an
+    /// approximation. Only that miss pays for the extra /proc read.
+    fn cwd_cell(&self, pid: i32) -> Option<SharedCwd> {
+        if let Ok(guard) = self.inner.read() {
+            if let Some(entry) = guard.get(&pid) {
+                return Some(Arc::clone(&entry.cwd));
+            }
+        }
+        let tgid = read_tgid_of_tid(pid)?;
+        if tgid == pid {
+            return None;
+        }
+        let guard = self.inner.read().ok()?;
+        guard.get(&tgid).map(|e| Arc::clone(&e.cwd))
+    }
+
+    /// The cwd this task believes it is in, or None when the task is
+    /// untracked or has never moved.
+    pub fn virtual_cwd(&self, pid: i32) -> Option<PathBuf> {
+        let cell = self.cwd_cell(pid)?;
+        let cwd = cell.lock().ok()?.clone();
+        cwd
+    }
+
+    /// Record where this task now believes it is. Silently does nothing
+    /// for an untracked pid: the fallback is the kernel's own cwd.
+    pub fn set_virtual_cwd(&self, pid: i32, cwd: PathBuf) {
+        if let Some(cell) = self.cwd_cell(pid) {
+            if let Ok(mut slot) = cell.lock() {
+                *slot = Some(cwd);
+            }
+        }
     }
 
     /// Look up the canonical PidKey for a notification's raw pid.
@@ -199,6 +319,24 @@ impl ProcessIndex {
             .ok()?
             .get(&pid)
             .map(|e| (e.key, Arc::clone(&e.state)))
+    }
+
+    /// Per-address-space state for `pid`: the thread-group leader's
+    /// entry when `pid` is a thread, otherwise its own. Memory
+    /// accounting keys off this because threads share one address
+    /// space — charging each thread separately would let every thread's
+    /// first brk go free and would credit a live heap back when one
+    /// thread exits. Falls back to the task's own entry when the leader
+    /// is untracked.
+    pub fn addr_space_state(&self, pid: i32) -> Option<Arc<AsyncMutex<PerProcessState>>> {
+        let guard = self.inner.read().ok()?;
+        let entry = guard.get(&pid)?;
+        if entry.tgid != pid {
+            if let Some(leader) = guard.get(&entry.tgid) {
+                return Some(Arc::clone(&leader.state));
+            }
+        }
+        Some(Arc::clone(&entry.state))
     }
 
     /// Cheap tracked-process test — used by /proc virtualization to
@@ -615,6 +753,91 @@ mod tests {
     }
 
     #[test]
+    fn threads_of_one_process_share_one_cwd() {
+        // The kernel gives pthreads a shared fs_struct, so a chdir in one
+        // thread moves its siblings. Registering a tid must join the leader's
+        // cwd rather than start a private one.
+        let leader = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        idx.register(leader).expect("leader registers");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            // Stay alive: register() reads /proc/<tid>/stat.
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        idx.register(tid).expect("thread registers");
+
+        idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
+        assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn an_unregistered_thread_uses_its_leader_cwd() {
+        // pidfd_open on a non-leader tid needs PIDFD_THREAD (Linux 6.9), so
+        // register_pid_if_new can leave a thread without an entry of its own.
+        // It still shares the leader's fs_struct, so its chdir must land in
+        // the leader's cell rather than vanish.
+        let leader = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        idx.register(leader).expect("leader registers");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        // Deliberately not registered.
+        assert!(!idx.contains(tid));
+
+        idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
+        assert_eq!(idx.virtual_cwd(tid), Some(PathBuf::from("/workspace")));
+        assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_child_copies_the_parent_cwd_instead_of_sharing_it() {
+        // fork(2) copies fs_struct: the child starts where the parent stood,
+        // and its later chdir must not move the parent.
+        let parent = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        idx.register(parent).expect("parent registers");
+        idx.set_virtual_cwd(parent, PathBuf::from("/workspace"));
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Async-signal-safe only: sleep, then leave without unwinding.
+            let ts = libc::timespec { tv_sec: 30, tv_nsec: 0 };
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+            unsafe { libc::_exit(0) };
+        }
+
+        idx.register(child).expect("child registers");
+        assert_eq!(idx.virtual_cwd(child), Some(PathBuf::from("/workspace")));
+
+        idx.set_virtual_cwd(child, PathBuf::from("/tmp"));
+        assert_eq!(idx.virtual_cwd(parent), Some(PathBuf::from("/workspace")));
+
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+    }
+
+    #[test]
     fn process_index_register_overwrites_stale_entry_for_recycled_pid() {
         let self_pid = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
@@ -623,7 +846,9 @@ mod tests {
             let stale_key = PidKey { pid: self_pid, start_time: 0 };
             let stale = ProcessEntry {
                 key: stale_key,
+                tgid: self_pid,
                 state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+                cwd: SharedCwd::default(),
             };
             idx.inner.write().unwrap().insert(self_pid, stale);
         }
@@ -681,7 +906,9 @@ mod tests {
         let stale_key = PidKey { pid: self_pid, start_time: 0 };
         let stale = ProcessEntry {
             key: stale_key,
+            tgid: self_pid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
+            cwd: SharedCwd::default(),
         };
         idx.inner.write().unwrap().insert(self_pid, stale);
 

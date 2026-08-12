@@ -40,6 +40,23 @@ pub(crate) fn openat2_in_root(
     flags: i32,
     mode: u32,
 ) -> Result<RawFd, i32> {
+    openat2_in_root_with_resolve(root, path, flags, mode, 0)
+}
+
+/// As [`openat2_in_root`], plus the caller's own `RESOLVE_*` flags.
+///
+/// Used when servicing an `openat2` on behalf of a child: the child chose
+/// those flags to make the kernel refuse something (a symlink, a mount
+/// crossing), and performing the open for it must not quietly grant what it
+/// declined. The union with `RESOLVE_IN_ROOT` can only be stricter, never
+/// looser, so the sandbox's own confinement still holds whatever is added.
+pub(crate) fn openat2_in_root_with_resolve(
+    root: &Path,
+    path: &str,
+    flags: i32,
+    mode: u32,
+    extra_resolve: u64,
+) -> Result<RawFd, i32> {
     let c_root = CString::new(root.to_str().unwrap_or("")).map_err(|_| libc::EINVAL)?;
     let root_fd = unsafe {
         libc::open(
@@ -61,7 +78,7 @@ pub(crate) fn openat2_in_root(
     let how = OpenHow {
         flags: flags as u64,
         mode: mode as u64,
-        resolve: RESOLVE_IN_ROOT,
+        resolve: RESOLVE_IN_ROOT | extra_resolve,
     };
 
     let fd = unsafe {

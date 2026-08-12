@@ -404,7 +404,7 @@ pub unsafe extern "C" fn sandlock_action_set_kill(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum sandlock_exception_policy_t {
-    /// Treat the failure as `NotifAction::Kill { sig: SIGKILL, pgid: child_pgid }`.
+    /// Treat the failure as `NotifAction::KillGroup { sig: SIGKILL, pgid: child_pgid }`.
     /// Default; "fail-closed" — the safe option.
     Kill = 0,
     /// Treat the failure as `NotifAction::Errno(EPERM)`. Useful for

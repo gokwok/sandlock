@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import statistics
 import sys
@@ -88,6 +89,139 @@ class TestSandboxRun:
         result = policy.run(["cat", str(secret)])
 
         assert not result.success
+
+
+class TestMaxMemoryExecReseed:
+    def test_limit_not_charged_for_exec_heap_distance(self):
+        """Regression: random KILLED-at-startup under an ample memory limit.
+
+        When the parent's glibc main arena has no free slack at fork time
+        (forced here by the hoard), the sandboxed child extends the
+        inherited heap via brk before execve. The supervisor used to keep
+        that pre-exec brk position as its accounting base across exec, so
+        the new image's first brk was charged the ASLR distance between the
+        two heaps: hundreds of MB of phantom memory, SIGKILLing the child
+        during interpreter startup (reason KILLED, empty stdout). With the
+        base reset on exec, a few-MB workload must always survive a 64 MiB
+        limit.
+        """
+        hoard = [bytes(4096) for _ in range(3000)]
+        try:
+            for i in range(8):
+                r = _policy(fs_writable=["/tmp"], max_memory="64M").run(
+                    [sys.executable, "-c", "print('HELLO')"], timeout=15
+                )
+                assert r.success and b"HELLO" in r.stdout, (
+                    f"iter {i}: reason={r.reason} signal={r.signal} "
+                    f"stdout={r.stdout!r}"
+                )
+        finally:
+            del hoard
+
+
+class TestMaxMemoryReleasedOnExit:
+    def test_hard_exiting_children_do_not_exhaust_the_budget(self):
+        """A child that dies holding memory must return it to the budget.
+
+        The limit is sandbox-wide, so a child that exits without
+        unmapping (os._exit here, but equally a crash or a SIGKILL) used
+        to leave its charge behind forever: three 64 MiB children were
+        enough to exhaust a 256 MiB budget and every later child was
+        killed, even though concurrent usage never exceeded ~64 MiB.
+        """
+        child = (
+            "import os; b = bytearray(64 * 1024 * 1024); "
+            "b[::4096] = b'\\x01' * (len(b) // 4096); "
+            "print('OK', flush=True); os._exit(0)"
+        )
+        driver = (
+            "import subprocess, sys\n"
+            "for i in range(10):\n"
+            f"    r = subprocess.run([sys.executable, '-c', {child!r}],"
+            "        capture_output=True)\n"
+            "    print(i, r.returncode, r.stdout.strip().decode(), flush=True)\n"
+        )
+        result = _policy(
+            fs_writable=["/tmp"], max_memory="256M", max_processes=32
+        ).run([sys.executable, "-c", driver], timeout=90)
+
+        lines = [ln.split() for ln in result.stdout.decode().splitlines() if ln]
+        assert len(lines) == 10, result.stdout
+        for i, rc, *rest in lines:
+            assert rc == "0" and rest == ["OK"], (
+                f"child {i} died (rc={rc}) — freed memory was not credited back: "
+                f"{result.stdout!r}"
+            )
+
+
+class TestMaxMemoryFileMappingLaundering:
+    def test_file_map_unmap_cannot_launder_the_budget(self, tmp_dir):
+        """Unmapping a file must not refund memory it never charged.
+
+        Only anonymous mappings are charged, but every unmap used to be
+        credited, so mapping and unmapping a large file zeroed the
+        counter. Repeating that let a workload hold arbitrarily more
+        anonymous memory than the limit: 200 MiB under a 128 MiB cap.
+        """
+        big = tmp_dir / "big.bin"
+        with open(big, "wb") as f:
+            f.truncate(100 * 1024 * 1024)
+
+        prog = (
+            "import mmap, sys\n"
+            "held = bytearray(100 * 1024 * 1024)\n"
+            "held[::4096] = b'\\x01' * (len(held) // 4096)\n"
+            "print('anon-ok', flush=True)\n"
+            f"f = open({str(big)!r}, 'r+b')\n"
+            "for _ in range(6):\n"
+            "    m = mmap.mmap(f.fileno(), 100 * 1024 * 1024, prot=mmap.PROT_READ)\n"
+            "    m.close()\n"
+            "more = bytearray(100 * 1024 * 1024)\n"
+            "more[::4096] = b'\\x01' * (len(more) // 4096)\n"
+            "print('LAUNDERED', flush=True)\n"
+        )
+        result = _policy(
+            fs_readable=[*_PYTHON_READABLE, str(tmp_dir)],
+            fs_writable=["/tmp", str(tmp_dir)],
+            max_memory="128M",
+        ).run([sys.executable, "-c", prog], timeout=60)
+
+        assert b"anon-ok" in result.stdout, result.stdout
+        assert b"LAUNDERED" not in result.stdout, (
+            "held 200 MiB under a 128 MiB limit by laundering the counter "
+            "with file mappings"
+        )
+
+
+class TestMaxMemoryKillsTheViolator:
+    def test_grandchild_over_the_limit_is_killed(self):
+        """The process that exceeds the limit must be the one that dies.
+
+        The kill signalled the process *group* named by the violator's
+        pid. That is only a real group for the top-level child, so a
+        grandchild's allocation was never stopped: it got ENOMEM back
+        and the run reported success. Worse, a same-user process group
+        elsewhere on the host whose id collided with that pid would have
+        been signalled instead.
+        """
+        prog = (
+            "import subprocess, sys\n"
+            "r = subprocess.run([sys.executable, '-c',\n"
+            "    \"b = bytearray(400*1024*1024); \"\n"
+            "    \"b[::4096] = b'\\\\x01' * (len(b) // 4096)\"],\n"
+            "    capture_output=True)\n"
+            "print('grandchild', r.returncode, flush=True)\n"
+            "print('PARENT-ALIVE', flush=True)\n"
+        )
+        result = _policy(
+            fs_writable=["/tmp"], max_memory="128M", max_processes=32
+        ).run([sys.executable, "-c", prog], timeout=60)
+
+        out = result.stdout.decode()
+        assert "PARENT-ALIVE" in out, out
+        assert f"grandchild {-signal.SIGKILL}" in out, (
+            f"violator was not killed: {out!r}"
+        )
 
 
 class TestNetAllowDenyAll:

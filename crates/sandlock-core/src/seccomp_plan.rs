@@ -70,6 +70,12 @@ const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_munmap,
     libc::SYS_brk,
     libc::SYS_mremap,
+    // exec destroys the address space and the kernel picks a fresh
+    // randomized brk base, so brk accounting must observe it to drop the
+    // old image's base; otherwise the new image's first brk is charged the
+    // ASLR distance between the two heaps.
+    libc::SYS_execve,
+    libc::SYS_execveat,
 ];
 
 const NETWORK_POLICY_SYSCALLS: &[i64] = &[
@@ -176,6 +182,10 @@ fn cow_path_syscalls() -> Vec<i64> {
 fn chroot_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
+        // openat2 resolves paths like openat and must be mediated the same
+        // way: left to the kernel, an absolute path resolves against the
+        // host root rather than the rootfs.
+        arch::SYS_OPENAT2,
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_unlinkat,
@@ -193,6 +203,10 @@ fn chroot_path_syscalls() -> Vec<i64> {
         libc::SYS_readlinkat,
         libc::SYS_getdents64,
         libc::SYS_chdir,
+        // fchdir carries no path, but it still moves the cwd that every
+        // later relative path resolves against, so the supervisor has to
+        // see it to keep its own notion in step.
+        libc::SYS_fchdir,
         libc::SYS_getcwd,
         libc::SYS_statfs,
         libc::SYS_utimensat,
@@ -221,6 +235,11 @@ fn chroot_path_syscalls() -> Vec<i64> {
             arch::sys_rmdir(),
             arch::sys_mkdir(),
             arch::sys_rename(),
+            // Where the ABI has no plain rename(2), libc's rename() compiles
+            // to renameat, so leaving it out left rename unmediated on
+            // aarch64: an absolute path went to the kernel and resolved
+            // against the host root instead of the rootfs.
+            arch::sys_renameat(),
             arch::sys_symlink(),
             arch::sys_link(),
             arch::sys_chmod(),
@@ -559,17 +578,21 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     // header). Workloads that need ping should use the kernel ping
     // socket (SOCK_DGRAM + IPPROTO_ICMP) via an `icmp://...` rule.
     //
-    // SOCK_DGRAM is denied unless a UDP or ICMP rule exists in
-    // net_allow. The kernel ping socket uses SOCK_DGRAM with
-    // IPPROTO_ICMP, so the same type bit gates both; destination
-    // filtering at sendto (Phase 2) is what separates them per-rule.
-    // `--net-deny` is default-allow, so UDP and the kernel ping socket
-    // (both SOCK_DGRAM) must be creatable; without this the sandbox
-    // could not even do DNS over UDP. Per-destination UDP/ICMP denial
-    // is still enforced on the sendto on-behalf path via the DenyList.
+    // SOCK_DGRAM is denied only when no net rule exists at all. Once any
+    // `--net-allow`/`--net-deny` rule is present, connect/sendto/sendmsg/
+    // sendmmsg are trapped and destination-checked per protocol, and a
+    // protocol with no rule resolves to an empty allowlist that denies
+    // every destination — so creation itself is harmless and must be
+    // permitted: glibc's getaddrinfo creates UDP sockets for its RFC 3484
+    // address-sorting probes (connect, never send), and blocking those
+    // breaks name resolution for TCP-only rule sets. Gating stays at
+    // socket() only for the no-rules sandbox, where nothing traps sends.
+    // This must NOT widen to HTTP-ACL-only or policy_fn-only configs:
+    // their empty net_allow resolves the UDP policy to Unrestricted, so
+    // creation would mean unrestricted UDP egress.
     let mut blocked_types: Vec<u32> = Vec::new();
     blocked_types.push(SOCK_RAW);
-    if !features.udp_or_icmp_allowed && !features.net_deny {
+    if !features.net_allow_present && !features.net_deny {
         blocked_types.push(SOCK_DGRAM);
     }
 

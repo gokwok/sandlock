@@ -208,23 +208,16 @@ fn list_threads_of_tgid(tgid: i32) -> io::Result<Vec<i32>> {
     Ok(tids)
 }
 
-/// Read the TGID containing `tid` from `/proc/<tid>/status`.
+/// Read the TGID containing `tid`, as an `io::Result` so a missing or
+/// unparseable value aborts the freeze instead of silently narrowing it
+/// to one task.
 fn read_tgid_of_tid(tid: i32) -> io::Result<i32> {
-    let status = fs::read_to_string(format!("/proc/{}/status", tid))?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Tgid:") {
-            return rest.trim().parse().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("parse Tgid: {}", e),
-                )
-            });
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "no Tgid: line in /proc/<tid>/status",
-    ))
+    crate::seccomp::state::read_tgid_of_tid(tid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no usable Tgid: line in /proc/<tid>/status",
+        )
+    })
 }
 
 /// Outcome of a sandbox-wide freeze.

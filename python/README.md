@@ -356,8 +356,10 @@ saved program counter under the full confinement; the sandbox is
 running when this returns (no `start()` needed). Manage it with `pid`,
 `pause()`, `resume()`, `kill()`, and `wait()` as usual.
 
-x86_64 only; transparent restore currently works for vDSO-free
-programs (a glibc program resumes but crashes on its first vDSO call).
+x86_64 only. The image is rebuilt by an `execve`'d restore stub in a fresh,
+already-confined process, and the kernel vDSO is relocated onto the
+checkpoint-recorded base, so ordinary libc programs resume. Assumes the
+restore runs on the same kernel that took the checkpoint.
 
 Raises `RuntimeError` if a process is already running in this sandbox
 or the restore fails. See [Checkpoint](#checkpoint).

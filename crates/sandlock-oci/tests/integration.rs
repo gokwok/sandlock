@@ -202,11 +202,10 @@ fn oci_create_rejects_duplicate_id() {
 /// an output file once, then loops forever rewriting an incrementing counter
 /// through the kept-open fd, sleeping via `nanosleep` between writes.
 ///
-/// It is deliberately libc/vDSO-free: glibc caches vDSO pointers in process
-/// memory and the injection-based restore engine does not relocate the kernel
-/// vDSO, so a libc program (python, sh) resumes but crashes on its first vDSO
-/// call. A raw-syscall program lets the test prove the restore engine itself
-/// (memory, registers, reopened fd). Mirrors the core restore test.
+/// It is deliberately libc-free so the test needs no libc toolchain and so a
+/// failure points at the OCI plumbing rather than at libc state: it proves the
+/// restore engine itself (memory, registers, reopened fd). The libc/vDSO case
+/// is covered by sandlock-core's restore integration test.
 fn counter_source(out_path: &str) -> String {
     format!(
         r##"
@@ -254,7 +253,7 @@ void _start(void){{
 #[tokio::test(flavor = "multi_thread")]
 async fn oci_restore_resumes_vdso_free_program() {
     if cfg!(not(target_arch = "x86_64")) {
-        eprintln!("skipping: injection-based restore is x86_64-only");
+        eprintln!("skipping: checkpoint restore is x86_64-only");
         return;
     }
     if sandlock_core::landlock_abi_version().is_err() {
@@ -416,7 +415,7 @@ fn build_counter(bin: &Path, src: &Path, out_path: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn oci_checkpoint_of_running_container() {
     if cfg!(not(target_arch = "x86_64")) {
-        eprintln!("skipping: injection-based checkpoint/restore is x86_64-only");
+        eprintln!("skipping: checkpoint/restore is x86_64-only");
         return;
     }
     if sandlock_core::landlock_abi_version().is_err() {

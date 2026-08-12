@@ -1284,3 +1284,94 @@ async fn test_cow_child_rmdir_nonempty_fails() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+/// A hard link cannot be half staged. With one name inside the workdir and the
+/// other below it there is nothing for the branch to copy up, and letting the
+/// child's own linkat run instead puts the name in the pristine workdir (or
+/// hands out an alias for the lower inode that outlives the abort). Both
+/// directions have to be refused, and the proof is the link count: neither
+/// original may gain a second name.
+#[tokio::test]
+async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
+    use std::os::unix::fs::MetadataExt;
+
+    let workdir = temp_dir("seccomp-link-inside");
+    let outside = temp_dir("seccomp-link-outside");
+    for d in [&workdir, &outside] {
+        let _ = fs::remove_dir_all(d);
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::write(workdir.join("inside.txt"), "INSIDE").unwrap();
+    fs::write(outside.join("outside.txt"), "OUTSIDE").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .fs_write(&outside)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let pull_in = format!(
+        "ln {}/outside.txt {}/pulled-in.txt",
+        outside.display(),
+        workdir.display()
+    );
+    let result = policy.clone().run(&["sh", "-c", &pull_in]).await;
+    let pulled = match result {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Seccomp COW test skipped: {}", e);
+            let _ = fs::remove_dir_all(&workdir);
+            let _ = fs::remove_dir_all(&outside);
+            return;
+        }
+    };
+    assert!(
+        !pulled.success(),
+        "a hard link into the workdir should be refused, exit={:?} stderr={}",
+        pulled.code(),
+        pulled.stderr_str().unwrap_or("")
+    );
+
+    let push_out = format!(
+        "ln {}/inside.txt {}/pushed-out.txt",
+        workdir.display(),
+        outside.display()
+    );
+    let pushed = policy
+        .clone()
+        .run(&["sh", "-c", &push_out])
+        .await
+        .expect("second run should launch once the first did");
+    assert!(
+        !pushed.success(),
+        "a hard link out of the workdir should be refused, exit={:?} stderr={}",
+        pushed.code(),
+        pushed.stderr_str().unwrap_or("")
+    );
+
+    assert_eq!(
+        fs::metadata(outside.join("outside.txt")).unwrap().nlink(),
+        1,
+        "the file outside the workdir gained a second name inside it"
+    );
+    assert_eq!(
+        fs::metadata(workdir.join("inside.txt")).unwrap().nlink(),
+        1,
+        "the file the branch was staging over gained a second name outside it"
+    );
+    assert!(
+        !workdir.join("pulled-in.txt").exists(),
+        "the aborted branch left a name in the workdir"
+    );
+    assert!(
+        !outside.join("pushed-out.txt").exists(),
+        "the aborted branch left a name outside the workdir"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&outside);
+}

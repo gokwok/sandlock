@@ -76,9 +76,6 @@ mod test_http_inject_ca;
 #[path = "integration/test_restore.rs"]
 mod test_restore;
 
-#[path = "integration/test_restore_stub.rs"]
-mod test_restore_stub;
-
 #[path = "integration/test_popen.rs"]
 mod test_popen;
 

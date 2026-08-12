@@ -174,9 +174,10 @@ class TestCheckpointLoadRestoreFn:
 
 # Freestanding x86_64 program (no libc, no vDSO; raw syscalls only) that opens
 # an output file once, then loops forever rewriting an incrementing counter
-# through that kept-open fd. Mirrors the core restore integration test: the
-# injection-based restore engine does not relocate the vDSO, so the guest must
-# be vDSO-free for transparent restore to hold.
+# through that kept-open fd. Deliberately minimal: this exercises the C ABI's
+# restore path (memory, registers, a reopened fd) without depending on a libc
+# toolchain being installed. The libc/vDSO case is covered in Rust by
+# tests/integration/test_restore.rs.
 _COUNTER_TEMPLATE = r"""
 #define SYS_write 1
 #define SYS_open 2
@@ -213,7 +214,7 @@ void _start(void){
 def _build_counter(tmp_dir):
     """Compile the vDSO-free counter program, or skip if this host can't."""
     if platform.machine() != "x86_64":
-        pytest.skip("injection-based restore is x86_64-only")
+        pytest.skip("checkpoint restore is x86_64-only")
     cc = shutil.which("cc") or shutil.which("gcc")
     if cc is None:
         pytest.skip("no C compiler (cc/gcc) available")

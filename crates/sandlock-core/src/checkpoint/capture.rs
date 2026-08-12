@@ -142,9 +142,17 @@ fn ptrace_getregset_bytes(pid: i32, set: libc::c_int, max: usize) -> io::Result<
 }
 
 fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
-    // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202. 8 KiB upper-bounds AVX-512 xstate.
+    // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202.
+    //
+    // The buffer must be able to hold the CPU's *whole* user xstate. The kernel
+    // fills what fits and reports how much it wrote, so a buffer that is merely
+    // "big enough for the CPUs we had in mind" yields a silently truncated
+    // capture: 8 KiB covers AVX-512 (~2.7 KiB) but not AMX, whose tile data
+    // alone is 8 KiB. That truncation is invisible here and lethal at restore,
+    // where the image is framed for the signal frame's `xrstor` as if complete.
+    // 64 KiB is far above any current CPU's `CPUID.(EAX=0DH,ECX=0):EBX`.
     #[cfg(target_arch = "x86_64")]
-    { ptrace_getregset_bytes(pid, 0x202, 8192).or_else(|_| ptrace_getregset_bytes(pid, 2, 512)) }
+    { ptrace_getregset_bytes(pid, 0x202, 65536).or_else(|_| ptrace_getregset_bytes(pid, 2, 512)) }
     #[cfg(not(target_arch = "x86_64"))]
     { ptrace_getregset_bytes(pid, 2, 4096) }
 }
@@ -195,30 +203,95 @@ pub(crate) fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
 // Memory capture -- process_vm_readv (scatter-gather, no file I/O)
 // ---------------------------------------------------------------------------
 
-fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>> {
+/// Largest single region capture will dump.
+///
+/// A resource guard, not a supported-size statement: the buffer for a region is
+/// allocated whole, so one pathological mapping could otherwise exhaust the
+/// supervisor. It does not bound the image, which is the sum of every dumped
+/// region. Raise it if real workloads need larger regions; exceeding it is a
+/// refusal to checkpoint, never a partial image.
+const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
+
+/// Whether a region's bytes have to travel inside the image, because restore
+/// cannot obtain them from anywhere else.
+///
+/// The bytes are needed unless some file still holds them at restore time:
+///
+/// * Kernel special mappings are provided by the kernel, never rebuilt.
+/// * A read-only region backed by a real file is remapped from that file, which
+///   is cheaper and shares pages.
+/// * A *shared* writable region backed by a real file wrote through to it, so
+///   remapping from that file recovers the current contents.
+///
+/// Everything else is dumped, including shared **anonymous** regions. Those have
+/// no backing file, so their contents exist only in the process; skipping them
+/// loses the data outright. They come back private, since the restore plan has
+/// no shared arm, which trades sharing for contents. A region backed by a memfd
+/// or a "(deleted)" path counts as anonymous here: the path is real in `/proc`
+/// but nothing can reopen it, and that includes the program text of a workload
+/// exec'd from a memfd.
+fn must_dump(map: &MemoryMap) -> bool {
+    if map.is_special() {
+        return false;
+    }
+    let unreopenable = map
+        .path
+        .as_deref()
+        .map_or(false, |p| p.starts_with("/memfd:") || p.ends_with(" (deleted)"));
+    if !map.writable() && !unreopenable {
+        return false;
+    }
+    let reopenable_file =
+        map.path.as_deref().map_or(false, |p| p.starts_with('/')) && !unreopenable;
+    if !map.private() && reopenable_file {
+        return false;
+    }
+    true
+}
+
+/// Render a region the way a refusal needs it: the permissions say whether it is
+/// shared or private, and the path says what backs it, which together decide
+/// whether the region should have been dumped at all. An address range alone
+/// leaves that unanswerable from a bug report.
+fn describe(map: &MemoryMap) -> String {
+    format!(
+        "{:#x}-{:#x} {} {}",
+        map.start,
+        map.end,
+        map.perms,
+        map.path.as_deref().unwrap_or("(anonymous)"),
+    )
+}
+
+fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, SandlockError> {
+    let refuse = |msg: String| {
+        SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+            "cannot checkpoint: {msg}"
+        )))
+    };
     let mut segments = Vec::new();
 
     for map in maps {
-        if map.is_special() || !map.private() {
+        if !must_dump(map) {
             continue;
         }
-        // Dump writable regions (their contents are live process state) and any
-        // region backed by an unreopenable file. A memfd (e.g. the memfd the
-        // launcher execs the image binary from) or a "(deleted)" path has no
-        // file restore can reopen, so its bytes must travel inside the image or
-        // the mapping — including the program text of an imaged workload — is
-        // lost. Read-only regions backed by a real file are left to be remapped
-        // from that file at restore, which is cheaper and shares pages.
-        let unreopenable = map
-            .path
-            .as_deref()
-            .map_or(false, |p| p.starts_with("/memfd:") || p.ends_with(" (deleted)"));
-        if !map.writable() && !unreopenable {
-            continue;
-        }
+        // Past this point the region's bytes ARE the image. Nothing else can
+        // supply them at restore: with no captured segment and no reopenable
+        // absolute path, `restore_blob::build_memory_plan` omits the region
+        // altogether, so the restored process comes up with that mapping simply
+        // absent and dies at whatever unrelated point first touches it. Skipping
+        // quietly here buys a checkpoint that reports success and cannot work,
+        // which is strictly worse than refusing to take one.
         let size = (map.end - map.start) as usize;
-        if size > 256 * 1024 * 1024 {
-            continue; // skip segments > 256MB
+        if size > MAX_REGION_BYTES {
+            return Err(refuse(format!(
+                "region {} is {} MiB, over the {} MiB per-region capture limit \
+                 (MAX_REGION_BYTES); its contents exist nowhere else, so the image would \
+                 be missing that memory",
+                describe(map),
+                size / (1024 * 1024),
+                MAX_REGION_BYTES / (1024 * 1024),
+            )));
         }
 
         let mut data = vec![0u8; size];
@@ -243,13 +316,21 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> io::Result<Vec<MemorySegment>
             )
         };
 
-        if ret == size as isize {
-            segments.push(MemorySegment {
-                start: map.start,
-                data,
-            });
+        if ret != size as isize {
+            let why = if ret < 0 {
+                io::Error::last_os_error().to_string()
+            } else {
+                format!("read {ret} of {size} bytes")
+            };
+            return Err(refuse(format!(
+                "reading region {}: {why}",
+                describe(map),
+            )));
         }
-        // Skip unreadable segments silently (same as old behavior)
+        segments.push(MemorySegment {
+            start: map.start,
+            data,
+        });
     }
     Ok(segments)
 }
@@ -328,28 +409,30 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace seize: {}", e)))
     })?;
 
-    // Capture registers
-    let regs = ptrace_getregs(pid).map_err(|e| {
-        SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
-    })?;
+    // Everything up to the detach reads the frozen process, and any of it can
+    // fail (a region too large to dump, an unreadable mapping, a /proc read
+    // racing the workload). Gather it all first and detach unconditionally:
+    // returning early here would leave the workload stopped under a tracer that
+    // is walking away, which turns a failed checkpoint into a hung sandbox.
+    let captured = (|| {
+        let regs = ptrace_getregs(pid).map_err(|e| {
+            SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
+        })?;
+        // FP state is best-effort: an image without it still restores.
+        let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
+        let maps =
+            parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        let memory_data = capture_memory(pid, &maps)?;
+        let fd_table = capture_fd_table(pid)
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        Ok::<_, SandlockError>((regs, fpregs, maps, memory_data, fd_table))
+    })();
 
-    // Capture FPU/extended register state
-    let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
-
-    // Capture memory maps
-    let maps =
-        parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-
-    // Capture memory data
-    let memory_data =
-        capture_memory(pid, &maps).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-
-    // Capture fd table
-    let fd_table =
-        capture_fd_table(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-
-    // Detach
-    ptrace_detach(pid).map_err(|e| {
+    let detached = ptrace_detach(pid);
+    // Surface a capture failure first: it is the reason the caller is here, and
+    // a detach error on top of it is noise.
+    let (regs, fpregs, maps, memory_data, fd_table) = captured?;
+    detached.map_err(|e| {
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace detach: {}", e)))
     })?;
 
@@ -454,6 +537,177 @@ mod tests {
     /// register arm plus the on-disk save/load format end to end WITHOUT a sandbox
     /// launch (no Landlock) -- the coverage the sandbox-launch integration test
     /// cannot provide on kernels below the required Landlock ABI.
+    fn region(perms: &str, path: Option<&str>) -> MemoryMap {
+        MemoryMap {
+            start: 0x1000,
+            end: 0x2000,
+            perms: perms.into(),
+            offset: 0,
+            path: path.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn shared_anonymous_regions_are_dumped_like_private_ones() {
+        // Nothing backs these, so their contents live only in the process. They
+        // return private, trading sharing for the data itself.
+        assert!(must_dump(&region("rw-s", None)), "shared anonymous");
+        assert!(must_dump(&region("rw-s", Some("/memfd:scratch (deleted)"))), "shared memfd");
+        assert!(must_dump(&region("rw-s", Some("/SYSV00000000 (deleted)"))), "SysV shm");
+        assert!(must_dump(&region("rw-p", None)), "private anonymous");
+    }
+
+    #[test]
+    fn regions_a_file_still_holds_are_left_to_be_remapped() {
+        // Dumping these would bloat every image with bytes restore can read off
+        // disk, and could push a checkpoint over the per-region ceiling.
+        assert!(!must_dump(&region("rw-s", Some("/data/db"))),
+            "a shared writable file mapping wrote through to the file");
+        assert!(!must_dump(&region("r--p", Some("/lib/libc.so"))),
+            "a read-only file mapping is remapped from the file");
+        assert!(!must_dump(&region("r-xp", Some("/bin/app"))), "program text");
+        assert!(!must_dump(&region("r--s", Some("/lib/libc.so"))), "shared read-only file");
+    }
+
+    #[test]
+    fn kernel_special_mappings_are_never_dumped() {
+        for name in ["[vdso]", "[vvar]", "[vvar_vclock]", "[vsyscall]"] {
+            assert!(!must_dump(&region("rw-p", Some(name))), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_dirtied_private_file_mapping_is_dumped() {
+        // Its contents no longer match the file on disk, so the file cannot
+        // supply them at restore.
+        assert!(must_dump(&region("rw-p", Some("/lib/libc.so"))));
+    }
+
+    /// A region capture cannot dump must refuse the checkpoint, and must still
+    /// let the workload go.
+    ///
+    /// Skipping the region instead would produce an image that reports success
+    /// and cannot work: with no captured bytes and no reopenable path, restore
+    /// omits the mapping entirely and the resumed process dies wherever it first
+    /// touches that memory, a long way from the cause.
+    #[test]
+    fn capture_refuses_a_region_it_cannot_dump_and_still_detaches() {
+        // The child maps past the limit and parks. The pages are never touched,
+        // so this costs address space rather than memory.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    MAX_REGION_BYTES + 4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    libc::_exit(1);
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        assert!(child > 0, "fork");
+        unsafe { libc::usleep(100_000) }; // let the child finish its mmap
+
+        let policy = Sandbox::builder().build().expect("build policy");
+        let result = capture(child, &policy);
+
+        // Read the child's state while it is still alive: a capture that bailed
+        // out without detaching would leave it in 't' (tracing stop) forever.
+        let state = std::fs::read_to_string(format!("/proc/{child}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit(") ").next().and_then(|t| t.split(' ').next()).map(String::from));
+
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut s = 0;
+            libc::waitpid(child, &mut s, 0);
+        }
+
+        let err = result.expect_err("a region it cannot dump must refuse").to_string();
+        // Assert that it refused, not which region tipped it over. The child is
+        // a fork of the test harness, so it inherits mappings this test never
+        // asked for, and on some hosts one of those is itself undumpable and is
+        // reached first. Either way the property under test holds: capture would
+        // rather fail than ship an image with a hole in it.
+        assert!(
+            err.contains("cannot checkpoint"),
+            "the refusal should say a checkpoint was refused: {err}"
+        );
+        // Anything but a stop ('t' tracing stop, 'T' stopped) means the tracer
+        // let go; whether the child is scheduled or sleeping is up to the kernel.
+        let state = state.expect("read child state");
+        assert!(
+            state != "t" && state != "T",
+            "a refused capture must still detach, leaving the workload runnable; state {state}"
+        );
+    }
+
+    /// The kernel has to describe a `MAP_SHARED|MAP_ANONYMOUS` region the way
+    /// `must_dump` expects, or the classification above is reasoning about a
+    /// shape that never occurs. Check it against a real mapping rather than a
+    /// hand-written `MemoryMap`.
+    ///
+    /// Deliberately maps into this process instead of capturing a child. An
+    /// earlier version forked and checkpointed the fork, which made the subject
+    /// a copy of the whole test harness: on riscv64 that inherits a private
+    /// anonymous region the kernel will not expose, and capture rightly refused
+    /// the image. Nothing a sandbox checkpoints is a fork of the supervisor, so
+    /// that was the test choosing an unrepresentative process, not a bug in
+    /// capture (an `execve`'d workload captures fine there, per
+    /// `capture_save_load_roundtrips`).
+    #[test]
+    fn the_kernel_describes_shared_anonymous_memory_as_must_dump_expects() {
+        let len = 4096;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED, "map a shared anonymous page");
+        let addr = p as u64;
+
+        let maps = parse_proc_maps(unsafe { libc::getpid() }).expect("read our own maps");
+        // By containment, not equality: the kernel is free to merge the new VMA
+        // with an adjacent one that agrees with it.
+        let region = maps.iter().find(|m| m.start <= addr && addr < m.end).cloned();
+        unsafe { libc::munmap(p, len) };
+
+        let region = region.expect("the mapping must appear in /proc/self/maps");
+        assert!(
+            region.perms.contains('s'),
+            "the kernel must report it shared, got {:?}",
+            region.perms,
+        );
+        // The kernel need not report it as pathless: shared anonymous memory is
+        // backed by an internal shmem inode, and Linux names it "/dev/zero
+        // (deleted)". That is why must_dump treats a "(deleted)" path as having
+        // no file behind it rather than keying off the absence of a path, and it
+        // is the assumption this test exists to hold down.
+        assert!(
+            region.path.as_deref().map_or(true, |p| p.ends_with(" (deleted)")),
+            "expected no path or a deleted one, got {:?}",
+            region.path,
+        );
+        assert!(
+            must_dump(&region),
+            "so its bytes have to travel in the image: {}",
+            describe(&region),
+        );
+    }
+
     #[test]
     fn capture_save_load_roundtrips() {
         let mut child = Command::new("sleep")

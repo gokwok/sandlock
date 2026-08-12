@@ -54,7 +54,14 @@ pub fn host_to_virtual(
         .max_by_key(|(_, source)| source.as_os_str().len())
         .map(|(virtual_base, source)| {
             // strip_prefix cannot fail: the filter above already matched it.
-            virtual_base.join(host_path.strip_prefix(source).expect("prefix matched"))
+            let rest = host_path.strip_prefix(source).expect("prefix matched");
+            // join("") appends a separator, so the mount point itself would
+            // render as "/proc/" and reach the child that way through getcwd.
+            if rest.as_os_str().is_empty() {
+                virtual_base.to_path_buf()
+            } else {
+                virtual_base.join(rest)
+            }
         })
 }
 
@@ -73,11 +80,32 @@ pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf,
         return Some(result);
     }
 
-    // Full path doesn't exist — resolve parent directory and append the
-    // missing filename.  This is needed for O_CREAT targets where the
-    // final component will be created.
+    // Full path doesn't exist — resolve the parent and append the missing
+    // filename.  This is needed for O_CREAT targets where the final
+    // component will be created.
+    resolve_in_root_nofollow(chroot_root, child_path)
+}
+
+/// Resolve a virtual path *without* following a final symlink.
+///
+/// The parent is resolved by the kernel (following intermediate symlinks,
+/// confined to `chroot_root`) and the final component is appended verbatim,
+/// so the caller acts on the last component itself.
+///
+/// This is what the no-follow family needs. `lstat` must describe the link,
+/// `unlink` and `rename` must remove and move the link, and `lchown` must own
+/// it: resolving through the final component would silently redirect every
+/// one of them onto the target. It is also how an `O_CREAT` target resolves,
+/// since a name that does not exist yet cannot be walked to.
+pub fn resolve_in_root_nofollow(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Option<(PathBuf, PathBuf)> {
     let confined = confine(child_path);
-    let file_name = confined.file_name()?;
+    // "/" has no final component to leave unresolved.
+    let Some(file_name) = confined.file_name() else {
+        return resolve_existing_in_root(chroot_root, child_path);
+    };
     let parent = confined.parent().unwrap_or(Path::new("/"));
 
     match openat2_in_root(
@@ -261,6 +289,17 @@ mod tests {
             to_virtual_path(Path::new("/rootfs"), Path::new("/other/path")),
             None
         );
+    }
+
+    #[test]
+    fn host_to_virtual_at_a_mount_point_renders_without_a_trailing_slash() {
+        // The rendered bytes matter, not just Path equality (which ignores a
+        // trailing separator): getcwd copies this string into the child, and a
+        // child sitting exactly on a mount point saw "/proc/".
+        let mounts = vec![(PathBuf::from("/proc"), PathBuf::from("/proc"))];
+        let virtual_path = host_to_virtual(Path::new("/rootfs"), &mounts, Path::new("/proc"))
+            .expect("a mount point maps to its own virtual path");
+        assert_eq!(virtual_path.to_string_lossy(), "/proc");
     }
 
     #[test]

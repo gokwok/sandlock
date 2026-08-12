@@ -75,7 +75,7 @@ impl FfiHandler {
                     // failed syscall.
                     NotifAction::Errno(libc::EPERM)
                 } else {
-                    NotifAction::Kill {
+                    NotifAction::KillGroup {
                         sig: libc::SIGKILL,
                         pgid: child_pgid,
                     }
@@ -327,7 +327,7 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
                     if child_pgid == UNSAFE_PGID {
                         return None;
                     }
-                    NotifAction::Kill {
+                    NotifAction::KillGroup {
                         sig: out.payload.kill.sig,
                         pgid: child_pgid,
                     }
@@ -343,7 +343,7 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
                     if user_pgid == supervisor_pgid {
                         return None;
                     }
-                    NotifAction::Kill {
+                    NotifAction::KillGroup {
                         sig: out.payload.kill.sig,
                         pgid: user_pgid,
                     }

@@ -118,9 +118,13 @@ pub enum NotifAction {
     ReturnValue(i64),
     /// Don't respond — used for checkpoint/freeze.
     Hold,
-    /// Kill the child process group (OOM-kill semantics).
-    /// Fields: signal, process group leader pid.
-    Kill { sig: i32, pgid: i32 },
+    /// Signal an entire process group. `pgid` must be a real process
+    /// group id — passing a bare pid signals whatever unrelated group
+    /// happens to carry that number, or nothing at all.
+    KillGroup { sig: i32, pgid: i32 },
+    /// Signal one process, named by any pid in it. `SIGKILL` here ends
+    /// the whole thread group, as it does for any task.
+    KillTask { sig: i32, pid: i32 },
     /// Defer the response: run the carried future on a worker task and
     /// send its terminal action later, keyed by `notif.id`.  Non-`Continue`,
     /// so it short-circuits the handler chain — a deferring handler makes a
@@ -271,6 +275,18 @@ pub enum NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    /// True iff no destination can ever match: the allowlist for a protocol
+    /// nothing was granted to. Distinguishes "deny all" from `Unrestricted`
+    /// and from a `DenyList` (both default-allow).
+    pub fn denies_everything(&self) -> bool {
+        match self {
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
+                per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     /// True iff a connection to (ip, port) should be permitted.
     pub fn allows(&self, ip: IpAddr, port: u16) -> bool {
         // `::ffff:a.b.c.d` is the same destination as `a.b.c.d` (a
@@ -488,20 +504,21 @@ fn deny_open_verdict(
 }
 
 /// open/openat/openat2 argument layout, normalized across the spellings.
-struct OpenArgs {
-    dirfd: i64,
-    path_ptr: u64,
-    flags: u64,
-    mode: u64,
+pub(crate) struct OpenArgs {
+    pub(crate) dirfd: i64,
+    pub(crate) path_ptr: u64,
+    pub(crate) flags: u64,
+    #[allow(dead_code)]
+    pub(crate) mode: u64,
     /// `openat2` `resolve` flags (`RESOLVE_*`); 0 for `open`/`openat`.
-    resolve: u64,
+    pub(crate) resolve: u64,
 }
 
 /// Decode the open arguments. `openat2` carries flags/mode/resolve inside a
 /// `struct open_how` in child memory, so its decode reads child memory and
 /// can fail; `None` means "could not decode" and the caller soft-falls-through
 /// (the kernel's own re-read fails the same way).
-fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
+pub(crate) fn decode_open_args(notif: &SeccompNotif, notif_fd: RawFd) -> Option<OpenArgs> {
     let a = &notif.data.args;
     let nr = notif.data.nr as i64;
     if nr == libc::SYS_openat {
@@ -1469,10 +1486,14 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             debug_assert!(false, "Defer reached send_response; should be intercepted earlier");
             respond_errno(fd, id, libc::EIO)
         }
-        NotifAction::Kill { sig, pgid } => {
+        NotifAction::KillGroup { sig, pgid } => {
             // Kill the entire process group, then return ENOMEM so the
             // seccomp notification is resolved (avoids a kernel warning).
             unsafe { libc::killpg(pgid, sig) };
+            respond_errno(fd, id, ENOMEM)
+        }
+        NotifAction::KillTask { sig, pid } => {
+            unsafe { libc::kill(pid, sig) };
             respond_errno(fd, id, ENOMEM)
         }
     }
@@ -1570,18 +1591,6 @@ fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
             => SyscallCategory::Memory,
         _ => SyscallCategory::File, // default
     }
-}
-
-/// Read the parent PID from /proc/{pid}/stat.
-fn read_ppid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    // Format: "pid (comm) state ppid ..."
-    // Find the closing ')' then split the rest
-    let close_paren = stat.rfind(')')?;
-    let rest = &stat[close_paren + 2..]; // skip ") "
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // fields[0] = state, fields[1] = ppid
-    fields.get(1)?.parse().ok()
 }
 
 /// Read a NUL-terminated path from child memory (up to PATH_MAX bytes).
@@ -1887,7 +1896,10 @@ async fn emit_policy_event(
     let denied = matches!(action, NotifAction::Errno(_));
     let name = syscall_name(nr);
     let category = syscall_category(nr);
-    let parent_pid = read_ppid(notif.pid);
+    let parent_pid = i32::try_from(notif.pid)
+        .ok()
+        .and_then(crate::seccomp::state::read_ppid)
+        .and_then(|p| u32::try_from(p).ok());
 
     // Extract metadata based on syscall type.
     //
@@ -2515,7 +2527,22 @@ pub(crate) fn spawn_pid_watcher(
 /// `ProcessIndex`), this is a single unregister — the entry's `Arc`
 /// drops here, and remaining clones held by in-flight handlers will
 /// drop with their tasks, freeing `PerProcessState` automatically.
+///
+/// The exiting task's memory charge is credited back first: exit tears
+/// down the address space without the munmap/brk events the accounting
+/// learns from, so a process that dies holding memory (SIGKILL, a crash,
+/// `_exit`) would otherwise leave its charge in the sandbox-wide total
+/// forever, and enough such deaths would exhaust the budget and start
+/// killing innocent workloads. Only a thread-group leader's entry carries
+/// a charge, so crediting whatever this entry holds is self-limiting.
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
+    if let Some((entry_key, state)) = ctx.processes.entry_for(key.pid) {
+        if entry_key == key {
+            let mut per = state.lock().await;
+            let mut st = ctx.resource.lock().await;
+            crate::resource::release_charge(&mut st, &mut per);
+        }
+    }
     ctx.processes.unregister(key);
 }
 
@@ -2788,7 +2815,7 @@ mod tests {
         let _ = format!("{:?}", NotifAction::InjectFdSend { srcfd: test_fd, newfd_flags: 0 });
         let _ = format!("{:?}", NotifAction::ReturnValue(42));
         let _ = format!("{:?}", NotifAction::Hold);
-        let _ = format!("{:?}", NotifAction::Kill { sig: 9, pgid: 1 });
+        let _ = format!("{:?}", NotifAction::KillGroup { sig: 9, pgid: 1 });
         let _ = format!("{:?}", NotifAction::defer(async { NotifAction::Continue }));
     }
 

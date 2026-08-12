@@ -41,8 +41,9 @@ pub(crate) fn handle_ca_inject_open(
     notif_fd: RawFd,
     chroot_root: Option<&std::path::Path>,
     chroot_mounts: &[(PathBuf, PathBuf)],
+    processes: &crate::seccomp::state::ProcessIndex,
 ) -> Option<NotifAction> {
-    let resolved = crate::procfs::resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts)?;
+    let resolved = crate::procfs::resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
     if !path_matches(&resolved, inject_paths) {
         return None;
     }

@@ -4,28 +4,13 @@ use crate::sandbox::Sandbox;
 
 pub(crate) mod capture;
 mod image;
-mod inject;
-mod regs;
-pub(crate) mod resume;
-// The execve-stub restore path (blob serializer, supervisor pager, fd
-// convention) is validated by its own unit tests and the end-to-end
-// `test_restore_stub` integration test, but is not yet wired into the live
-// restore code (which still uses the injection engine). The `allow(dead_code)`
-// stands until the supervisor cutover replaces that path; drop it then.
-#[allow(dead_code)]
 pub(crate) mod restore_blob;
-#[allow(dead_code)]
-pub(crate) mod pager;
+pub(crate) mod resume;
 
 /// Fixed inherited-fd convention for the execve restore-stub.
-#[allow(dead_code)]
 pub(crate) const CTRL_FD: i32 = 3;   // control-blob memfd
-#[allow(dead_code)]
-pub(crate) const READY_FD: i32 = 4;  // eventfd: stub -> supervisor ("uffd ready")
-#[allow(dead_code)]
-pub(crate) const GO_FD: i32 = 5;     // eventfd: supervisor -> stub ("pager attached")
-#[allow(dead_code)]
-pub(crate) const UFFD_SLOT: i32 = 6; // stub dup2's its userfaultfd here
+pub(crate) const READY_FD: i32 = 4;  // eventfd: stub -> supervisor ("layout done")
+pub(crate) const GO_FD: i32 = 5;     // eventfd: supervisor -> stub ("pages written")
 
 pub(crate) use capture::capture;
 
