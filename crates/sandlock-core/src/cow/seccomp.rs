@@ -2145,6 +2145,10 @@ impl SeccompCowBranch {
             if self.is_deleted(&rel) {
                 return Err(BranchError::Deleted);
             }
+            let upper_dir = self.upper.join(&rel);
+            if self.directory_modes.contains_key(&rel) {
+                return Ok(Some(upper_dir));
+            }
             return Ok(None);
         }
 
@@ -5723,9 +5727,9 @@ mod tests {
             Ok(CowOpenPlan::Deleted)
         ));
         // Re-created in the upper: the shadow makes it visible again and the
-        // open goes back to the normal resolution.
+        // open selects the real upper directory for fd injection.
         assert!(branch.handle_mkdir(&path, 0o755).unwrap());
-        assert!(matches!(branch.handle_open(&path, dirflag), Ok(None)));
+        assert!(matches!(branch.handle_open(&path, dirflag), Ok(Some(_))));
         assert!(!matches!(
             branch.prepare_open(&path, dirflag),
             Ok(CowOpenPlan::Deleted)

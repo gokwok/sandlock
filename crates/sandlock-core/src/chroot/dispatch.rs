@@ -169,35 +169,6 @@ impl ChrootCtx<'_> {
         Some((mount_hp, sub_str))
     }
 
-    /// Resolve a virtual path against mounts, using `resolver` for the part
-    /// below the mount point. Returns (host_path, virtual_path); the virtual
-    /// path is the confined form of what the child asked for, since that is
-    /// what the policy check reads.
-    fn resolve_mount_with(
-        &self,
-        virtual_path: &str,
-        resolver: fn(&Path, &str) -> Option<(PathBuf, PathBuf)>,
-    ) -> Option<(PathBuf, PathBuf)> {
-        let confined = confine(virtual_path);
-        let (mount_target, sub_path) = self.mount_target(&confined)?;
-        resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
-    }
-
-    /// Resolve against mounts for paths that may not exist yet (O_CREAT).
-    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
-        self.resolve_mount_with(virtual_path, resolve_in_root)
-    }
-
-    /// Resolve against mounts for paths that must exist.
-    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
-        self.resolve_mount_with(virtual_path, resolve_existing_in_root)
-    }
-
-    /// Resolve against mounts without following a final symlink.
-    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
-        self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
-    }
-
     /// Inverse: given a host path, return the virtual path.
     /// Checks mount targets first, then falls back to chroot root.
     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
@@ -407,60 +378,98 @@ fn build_virtual_path(
     Some(canon_proc_cwd(&canon_proc_self(&vpath, notif.pid), ctx))
 }
 
-/// Resolve a child path to (host_path, virtual_path) within the chroot.
-///
-/// Falls back to parent resolution for paths whose final component does not
-/// yet exist (needed for O_CREAT targets).
-/// Checks mounts first — if the virtual path falls under a mount point,
-/// resolution is confined to the mount target directory.
-fn resolve_chroot_path(
+/// Build a virtual path while treating a COW upper fd as the corresponding
+/// logical lower fd. Chroot mount inversion only knows configured mount
+/// sources, so paths rooted at an upper-only directory need this mapping.
+async fn build_merged_virtual_path(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
     ctx: &ChrootCtx<'_>,
-) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
-    if let Some(result) = ctx.resolve_mount(&full_path) {
-        return Some(result);
+    cow_state: &Arc<Mutex<CowState>>,
+) -> Option<String> {
+    if Path::new(path).is_absolute() || dirfd as i32 == libc::AT_FDCWD {
+        return build_virtual_path(notif, dirfd, path, ctx);
     }
-    resolve_in_root(ctx.root, &full_path)
+    let base_host = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?;
+    let logical_host = {
+        let state = cow_state.lock().await;
+        state.branch.as_ref().map_or(base_host.clone(), |cow| {
+            PathBuf::from(crate::cow::dispatch::map_cow_upper_path(
+                cow,
+                base_host.to_string_lossy().as_ref(),
+            ))
+        })
+    };
+    let base_virtual = ctx.host_to_virtual(&logical_host)?;
+    let combined = base_virtual.join(path);
+    Some(canon_proc_cwd(
+        &canon_proc_self(&combined.to_string_lossy(), notif.pid),
+        ctx,
+    ))
 }
 
-/// Resolve a child path without following a final symlink.
-///
-/// For the no-follow family: lstat describes the link, unlink removes it,
-/// rename moves it, lchown owns it. Following the last component would point
-/// every one of them at the target instead.
-fn resolve_chroot_path_nofollow(
+/// Resolve a chroot path against the logical COW merged view when a virtual
+/// mount points at the branch lower. The host path deliberately stays in the
+/// lower namespace: COW handlers use it as the stable logical key and select
+/// upper, lower, or whiteout themselves.
+async fn resolve_merged_chroot_path(
     notif: &SeccompNotif,
     dirfd: i64,
     path: &str,
     ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
+    follow_final: bool,
+    require_existing: bool,
 ) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
-    if let Some(result) = ctx.resolve_mount_nofollow(&full_path) {
-        return Some(result);
+    let full_path = build_merged_virtual_path(notif, dirfd, path, ctx, cow_state).await?;
+    let confined = confine(&full_path);
+    if let Some((mount_target, sub_path)) = ctx.mount_target(&confined) {
+        let relative = sub_path.strip_prefix('/').unwrap_or(&sub_path);
+        let logical_host = mount_target.join(relative);
+        let state = cow_state.lock().await;
+        if let Some(cow) = state
+            .branch
+            .as_ref()
+            .filter(|cow| cow.matches(logical_host.to_string_lossy().as_ref()))
+        {
+            let valid = if require_existing {
+                cow.handle_stat_with_follow(
+                    logical_host.to_string_lossy().as_ref(),
+                    follow_final,
+                )
+                .is_some()
+            } else {
+                cow.check_merged_parent_path(logical_host.to_string_lossy().as_ref())
+                    .is_ok()
+            };
+            return valid.then_some((logical_host, confined));
+        }
+        drop(state);
+        let resolver = if require_existing {
+            if follow_final {
+                resolve_existing_in_root
+            } else {
+                resolve_in_root_nofollow
+            }
+        } else if follow_final {
+            resolve_in_root
+        } else {
+            resolve_in_root_nofollow
+        };
+        return resolver(mount_target, &sub_path).map(|(host, _)| (host, confined));
     }
-    resolve_in_root_nofollow(ctx.root, &full_path)
-}
-
-/// Resolve a child path that must already exist within the chroot.
-///
-/// Unlike [`resolve_chroot_path`], this does NOT fall back to parent
-/// resolution, so the returned host path is always fully resolved by the
-/// kernel — no unresolved symlinks that could escape the chroot.
-/// Checks mounts first.
-fn resolve_chroot_path_existing(
-    notif: &SeccompNotif,
-    dirfd: i64,
-    path: &str,
-    ctx: &ChrootCtx<'_>,
-) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
-    if let Some(result) = ctx.resolve_mount_existing(&full_path) {
-        return Some(result);
+    if require_existing {
+        if follow_final {
+            resolve_existing_in_root(ctx.root, &full_path)
+        } else {
+            resolve_in_root_nofollow(ctx.root, &full_path)
+        }
+    } else if follow_final {
+        resolve_in_root(ctx.root, &full_path)
+    } else {
+        resolve_in_root_nofollow(ctx.root, &full_path)
     }
-    resolve_existing_in_root(ctx.root, &full_path)
 }
 
 /// Convert a Path to CString, returning Errno on failure.
@@ -496,10 +505,11 @@ async fn cow_resolve(
 /// Read path arg at `arg_idx`, resolve chroot path using dirfd at `dirfd_idx`.
 /// Falls back to parent resolution for O_CREAT targets.
 /// Returns (path_string, host_path, virtual_path).
-fn read_and_resolve(
+async fn read_and_resolve(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
     dirfd_idx: usize,
     path_idx: usize,
 ) -> Result<(String, PathBuf, PathBuf), NotifAction> {
@@ -507,33 +517,19 @@ fn read_and_resolve(
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) =
-        resolve_chroot_path(notif, dirfd, &path, ctx).ok_or(NotifAction::Errno(libc::EACCES))?;
+        resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, true, false)
+            .await
+            .ok_or(NotifAction::Errno(libc::EACCES))?;
     Ok((path, host_path, virtual_path))
 }
 
 /// Like [`read_and_resolve`] but stops at a final symlink, for the callers
 /// that must act on the link rather than on what it points at.
-fn read_and_resolve_nofollow(
+async fn read_and_resolve_nofollow(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
-    dirfd_idx: usize,
-    path_idx: usize,
-) -> Result<(String, PathBuf, PathBuf), NotifAction> {
-    let path = read_path(notif, notif.data.args[path_idx], notif_fd)
-        .ok_or(NotifAction::Continue)?;
-    let dirfd = notif.data.args[dirfd_idx] as i64;
-    let (host_path, virtual_path) = resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
-        .ok_or(NotifAction::Errno(libc::EACCES))?;
-    Ok((path, host_path, virtual_path))
-}
-
-/// Like [`read_and_resolve`] but requires the path to already exist.
-/// Returns a fully kernel-resolved host path with no unresolved symlinks.
-fn read_and_resolve_existing(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
     dirfd_idx: usize,
     path_idx: usize,
 ) -> Result<(String, PathBuf, PathBuf), NotifAction> {
@@ -541,7 +537,28 @@ fn read_and_resolve_existing(
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) =
-        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
+        resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, false, false)
+            .await
+            .ok_or(NotifAction::Errno(libc::EACCES))?;
+    Ok((path, host_path, virtual_path))
+}
+
+/// Like [`read_and_resolve`] but requires the path to already exist.
+/// Returns a fully kernel-resolved host path with no unresolved symlinks.
+async fn read_and_resolve_existing(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
+    dirfd_idx: usize,
+    path_idx: usize,
+) -> Result<(String, PathBuf, PathBuf), NotifAction> {
+    let path = read_path(notif, notif.data.args[path_idx], notif_fd)
+        .ok_or(NotifAction::Continue)?;
+    let dirfd = notif.data.args[dirfd_idx] as i64;
+    let (host_path, virtual_path) =
+        resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, true, true)
+            .await
             .ok_or(NotifAction::Errno(libc::ENOENT))?;
     Ok((path, host_path, virtual_path))
 }
@@ -557,6 +574,26 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
     } else {
         NotifAction::ReturnValue(0)
     }
+}
+
+/// Locate an existing merged entry below the trusted upper or lower layer.
+async fn cow_layer_root_rel(
+    cow_state: &Arc<Mutex<CowState>>,
+    host_path: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let state = cow_state.lock().await;
+    let cow = state.branch.as_ref()?;
+    let logical = host_path.to_string_lossy();
+    if !cow.matches(&logical) {
+        return None;
+    }
+    let real = cow.handle_stat(&logical)?;
+    for root in [cow.upper_dir(), cow.workdir()] {
+        if let Ok(relative) = real.strip_prefix(root) {
+            return Some((root.to_path_buf(), relative.to_path_buf()));
+        }
+    }
+    None
 }
 
 // ============================================================
@@ -589,7 +626,17 @@ pub(crate) async fn handle_chroot_open(
     }
 
     // Resolve to get the virtual path for access control.
-    let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
+    let (host_path, virtual_path) = match resolve_merged_chroot_path(
+        notif,
+        dirfd,
+        &rel_path,
+        ctx,
+        cow_state,
+        flags & libc::O_NOFOLLOW as u64 == 0,
+        false,
+    )
+    .await
+    {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };
@@ -610,6 +657,14 @@ pub(crate) async fn handle_chroot_open(
         if let Some(cow) = cs.branch.as_mut() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
+                if honored & RESOLVE_NO_SYMLINKS != 0
+                    && cow.merged_path_uses_symlink(
+                        &host_str,
+                        flags & libc::O_NOFOLLOW as u64 == 0,
+                    )
+                {
+                    return NotifAction::Errno(libc::ELOOP);
+                }
                 match cow.handle_open(&host_str, flags) {
                     Ok(Some(real_path)) => {
                         drop(cs);
@@ -937,7 +992,7 @@ fn memfd_with_patched_interp(
 pub(crate) async fn handle_chroot_exec(
     notif: &SeccompNotif,
     chroot_state: &Arc<Mutex<ChrootState>>,
-    _cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -953,37 +1008,41 @@ pub(crate) async fn handle_chroot_exec(
         None => return NotifAction::Continue,
     };
 
-    // Build the full virtual path from dirfd + relative path.
-    let full_path = if Path::new(&rel_path).is_absolute() {
-        rel_path
-    } else {
-        let base = match dirfd as i32 {
-            libc::AT_FDCWD => virtual_cwd_of(notif, ctx),
-            _ => std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd))
-                .ok()
-                .and_then(|host| ctx.host_to_virtual(&host)),
-        };
-        match base {
-            Some(base) => base.join(&rel_path).to_string_lossy().to_string(),
-            None => return NotifAction::Errno(libc::EACCES),
-        }
+    let (host_path, virtual_path) = match resolve_merged_chroot_path(
+        notif,
+        dirfd,
+        &rel_path,
+        ctx,
+        cow_state,
+        true,
+        true,
+    )
+    .await
+    {
+        Some(resolved) => resolved,
+        None => return NotifAction::Errno(libc::ENOENT),
     };
-
-    let virtual_path = crate::chroot::resolve::confine(&full_path);
     if !ctx.can_read(&virtual_path) {
         return NotifAction::Errno(libc::EACCES);
     }
 
-    // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
-    // open confined to the chroot root (or mount target) — no resolve-then-reopen TOCTOU gap.
-    let (exec_root, exec_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
-        (mt.to_path_buf(), sub)
-    } else {
-        (ctx.root.to_path_buf(), virtual_path.to_string_lossy().to_string())
-    };
+    // Select an upper-only executable from the merged view, then re-open it
+    // relative to its trusted layer root. Non-COW paths retain ordinary
+    // chroot/mount resolution.
+    let cow_exec = cow_layer_root_rel(cow_state, &host_path).await;
+    let (exec_root, exec_path) = cow_exec.map_or_else(
+        || {
+            if let Some((mount, sub)) = ctx.mount_target(&virtual_path) {
+                (mount.to_path_buf(), PathBuf::from(sub))
+            } else {
+                (ctx.root.to_path_buf(), virtual_path.clone())
+            }
+        },
+        |resolved| resolved,
+    );
     let src_fd = match openat2_in_root(
         &exec_root,
-        &exec_path,
+        exec_path.to_string_lossy().as_ref(),
         libc::O_RDONLY | libc::O_CLOEXEC,
         0,
     ) {
@@ -1115,7 +1174,7 @@ pub(crate) async fn handle_chroot_write(
 
     if nr == libc::SYS_unlinkat {
         // unlink(2) removes the link, never what it points at.
-        let (_, host_path, vp) = match read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve_nofollow(notif, notif_fd, ctx, cow_state, 0, 1).await {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -1142,7 +1201,7 @@ pub(crate) async fn handle_chroot_write(
     }
 
     if nr == libc::SYS_mkdirat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, cow_state, 0, 1).await {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -1184,11 +1243,11 @@ pub(crate) async fn handle_chroot_write(
         };
         // rename(2) moves the names themselves: a symlink on either side is
         // renamed, not chased.
-        let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
+        let (old_host, old_vp) = match resolve_merged_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx, cow_state, false, false).await {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
-        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
+        let (new_host, new_vp) = match resolve_merged_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx, cow_state, false, false).await {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1229,7 +1288,7 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx) {
+        let (host_link, link_vp) = match resolve_merged_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx, cow_state, false, false).await {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1288,10 +1347,26 @@ pub(crate) async fn handle_chroot_write(
             // the name of the inode being linked: a symlink inside a mount
             // would otherwise be judged by the link's own name, and a denied
             // or read-only target would pass under any allowed spelling.
-            resolve_chroot_path_existing(notif, notif.data.args[0] as i64, &old_path, ctx)
-                .and_then(|(host, _)| ctx.host_to_virtual(&host).map(|vp| (host, vp)))
+            match resolve_merged_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx, cow_state, true, true).await {
+                Some((host, _)) => {
+                    let logical_target = {
+                        let state = cow_state.lock().await;
+                        state.branch.as_ref().and_then(|cow| {
+                            let path = host.to_string_lossy();
+                            if cow.matches(&path) {
+                                cow.resolve_merged_path(&path, true).ok().map(PathBuf::from)
+                            } else {
+                                Some(host.clone())
+                            }
+                        }).unwrap_or_else(|| host.clone())
+                    };
+                    ctx.host_to_virtual(&logical_target)
+                        .map(|virtual_target| (logical_target, virtual_target))
+                }
+                None => None,
+            }
         } else {
-            resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx)
+            resolve_merged_chroot_path(notif, notif.data.args[0] as i64, &old_path, ctx, cow_state, false, true).await
         };
         let (old_host, old_vp) = match old_resolved {
             Some(r) => r,
@@ -1302,7 +1377,7 @@ pub(crate) async fn handle_chroot_write(
             None if follow_old => return NotifAction::Errno(libc::ENOENT),
             None => return NotifAction::Errno(libc::EACCES),
         };
-        let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
+        let (new_host, new_vp) = match resolve_merged_chroot_path(notif, notif.data.args[2] as i64, &new_path, ctx, cow_state, false, false).await {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1359,7 +1434,7 @@ pub(crate) async fn handle_chroot_write(
     }
 
     if nr == libc::SYS_fchmodat {
-        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
+        let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, cow_state, 0, 1).await {
             Ok(r) => r,
             Err(a) => return a,
         };
@@ -1385,9 +1460,9 @@ pub(crate) async fn handle_chroot_write(
     if nr == libc::SYS_fchownat {
         let nofollow = (notif.data.args[4] & libc::AT_SYMLINK_NOFOLLOW as u64) != 0;
         let resolved = if nofollow {
-            read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
+            read_and_resolve_nofollow(notif, notif_fd, ctx, cow_state, 0, 1).await
         } else {
-            read_and_resolve(notif, notif_fd, ctx, 0, 1)
+            read_and_resolve(notif, notif_fd, ctx, cow_state, 0, 1).await
         };
         let (_, host_path, vp) = match resolved {
             Ok(r) => r,
@@ -1423,7 +1498,7 @@ pub(crate) async fn handle_chroot_write(
             Some(p) => p,
             None => return NotifAction::Continue,
         };
-        let (host_path, vp) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
+        let (host_path, vp) = match resolve_merged_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx, cow_state, true, false).await {
             Some(r) => r,
             None => return NotifAction::Errno(libc::EACCES),
         };
@@ -1511,9 +1586,9 @@ pub(crate) async fn handle_chroot_stat(
     }
 
     let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
-        read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
+        read_and_resolve_nofollow(notif, notif_fd, ctx, cow_state, 0, 1).await
     } else {
-        read_and_resolve_existing(notif, notif_fd, ctx, 0, 1)
+        read_and_resolve_existing(notif, notif_fd, ctx, cow_state, 0, 1).await
     };
     let (_, host_path, vp) = match resolved {
         Ok(r) => r,
@@ -1564,11 +1639,17 @@ pub(crate) async fn handle_chroot_statx(
         _ => return NotifAction::Continue,
     };
 
-    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
-        resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
-    } else {
-        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
-    };
+    let follow_final = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
+    let resolved = resolve_merged_chroot_path(
+        notif,
+        dirfd,
+        &path,
+        ctx,
+        cow_state,
+        follow_final,
+        true,
+    )
+    .await;
     let (host_path, vp) = match resolved {
         Some(r) => r,
         None => return NotifAction::Errno(libc::ENOENT),
@@ -1708,7 +1789,7 @@ pub(crate) async fn handle_chroot_readlink(
 
     // readlink must read the link itself, never what it points at, which is
     // exactly what the no-follow resolver gives.
-    let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
+    let (host_path, _) = match resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, false, true).await {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };
@@ -1855,15 +1936,20 @@ pub(crate) async fn handle_chroot_xattr(
         Some(p) if !p.is_empty() => p,
         _ => return NotifAction::Continue,
     };
-    let (host_path, vp) =
-        match if follow {
-            resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx)
-        } else {
-            resolve_chroot_path_nofollow(notif, libc::AT_FDCWD as i64, &path, ctx)
-        } {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::ENOENT),
-        };
+    let (host_path, vp) = match resolve_merged_chroot_path(
+        notif,
+        libc::AT_FDCWD as i64,
+        &path,
+        ctx,
+        cow_state,
+        follow,
+        true,
+    )
+    .await
+    {
+        Some(r) => r,
+        None => return NotifAction::Errno(libc::ENOENT),
+    };
 
     let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
     let allowed = if writing { ctx.can_write(&vp) } else { ctx.can_read(&vp) };
@@ -1966,7 +2052,7 @@ pub(crate) async fn handle_chroot_getdents(
 pub(crate) async fn handle_chroot_chdir(
     notif: &SeccompNotif,
     _chroot_state: &Arc<Mutex<ChrootState>>,
-    _cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1975,37 +2061,62 @@ pub(crate) async fn handle_chroot_chdir(
         None => return NotifAction::Errno(libc::EFAULT),
     };
 
-    let full_path = match build_virtual_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
-        Some(p) => p,
-        None => return NotifAction::Errno(libc::EACCES),
+    let (host_path, confined) = match resolve_merged_chroot_path(
+        notif,
+        libc::AT_FDCWD as i64,
+        &path,
+        ctx,
+        cow_state,
+        true,
+        true,
+    )
+    .await
+    {
+        Some(resolved) => resolved,
+        None => return NotifAction::Errno(libc::ENOENT),
     };
-
-    // Resolve on-behalf: this is what decides whether the directory exists,
-    // is reachable inside the root, and is a directory at all, and it gives
-    // the errno the child gets when it is not.
-    let confined = confine(&full_path);
-    let (chdir_root, chdir_path) = if let Some((mt, sub)) = ctx.mount_target(&confined) {
-        (mt.to_path_buf(), sub)
+    let cow_dir = cow_layer_root_rel(cow_state, &host_path).await;
+    let src_fd = if let Some((root, relative)) = cow_dir {
+        match openat2_in_root(
+            &root,
+            relative.to_string_lossy().as_ref(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+            Err(errno) => return NotifAction::Errno(errno),
+        }
     } else {
-        (ctx.root.to_path_buf(), full_path.clone())
-    };
-    let src_fd = match openat2_in_root(
-        &chdir_root,
-        &chdir_path,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    ) {
-        Ok(fd) => fd,
-        Err(errno) => return NotifAction::Errno(errno),
+        match open_in_namespace(
+            ctx,
+            notif.pid,
+            &confined,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+            0,
+        ) {
+            Ok(fd) => fd,
+            Err(errno) => return NotifAction::Errno(errno),
+        }
     };
     // Record where the kernel actually landed, not what the child asked for:
     // symlinks and .. are already collapsed in the resolved fd.
-    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", src_fd)).ok();
-    unsafe { libc::close(src_fd) };
-    let virtual_cwd = resolved
-        .as_deref()
-        .and_then(|host| ctx.host_to_virtual(host))
-        .unwrap_or(confined);
+    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", src_fd.as_raw_fd())).ok();
+    let logical_resolved = if let Some(host) = resolved.as_deref() {
+        let state = cow_state.lock().await;
+        state.branch.as_ref().map_or_else(
+            || host.to_path_buf(),
+            |cow| {
+                PathBuf::from(crate::cow::dispatch::map_cow_upper_path(
+                    cow,
+                    host.to_string_lossy().as_ref(),
+                ))
+            },
+        )
+    } else {
+        host_path
+    };
+    let virtual_cwd = ctx.host_to_virtual(&logical_resolved).unwrap_or(confined);
 
     // The child's own cwd never moves. chdir cannot be run on-behalf (only
     // the kernel can update the calling task's fs_struct) and the argument
@@ -2101,7 +2212,7 @@ pub(crate) async fn handle_chroot_getcwd(
 pub(crate) async fn handle_chroot_statfs(
     notif: &SeccompNotif,
     _chroot_state: &Arc<Mutex<ChrootState>>,
-    _cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -2112,12 +2223,16 @@ pub(crate) async fn handle_chroot_statfs(
         None => return NotifAction::Continue,
     };
 
-    let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
+    let (host_path, _) = match resolve_merged_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx, cow_state, true, true).await {
         Some(r) => r,
         None => return NotifAction::Errno(libc::ENOENT),
     };
 
-    let c_path = match path_cstr(&host_path, libc::ENOENT) {
+    let real_path = match cow_resolve(cow_state, &host_path).await {
+        Ok(path) => path,
+        Err(action) => return action,
+    };
+    let c_path = match path_cstr(&real_path, libc::ENOENT) {
         Ok(c) => c,
         Err(a) => return a,
     };
@@ -2163,11 +2278,16 @@ pub(crate) async fn handle_chroot_utimensat(
         None => return NotifAction::Continue,
     };
 
-    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
-        resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
-    } else {
-        resolve_chroot_path(notif, dirfd, &path, ctx)
-    };
+    let resolved = resolve_merged_chroot_path(
+        notif,
+        dirfd,
+        &path,
+        ctx,
+        cow_state,
+        (flags & libc::AT_SYMLINK_NOFOLLOW) == 0,
+        true,
+    )
+    .await;
     let (host_path, vp) = match resolved {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
