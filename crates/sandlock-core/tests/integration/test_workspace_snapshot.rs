@@ -1,5 +1,5 @@
 use sandlock_core::error::SandboxRuntimeError;
-use sandlock_core::{BranchError, FsSnapshot, Sandbox, SnapshotError};
+use sandlock_core::{BranchError, FsBranch, FsSnapshot, RunResult, Sandbox, SnapshotError};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -41,6 +41,119 @@ fn throttled_snapshot_sandbox(workdir: &Path, branch_storage: &Path, writable: &
         .max_cpu(10)
         .build()
         .unwrap()
+}
+
+fn logical_snapshot_sandbox(
+    logical_workspace: &Path,
+    lower: &Path,
+    branch_storage: &Path,
+) -> Sandbox {
+    Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .chroot("/")
+        .fs_mount(logical_workspace, lower)
+        .fs_deny(lower)
+        .fs_deny(branch_storage)
+        .workdir(lower)
+        .cwd(logical_workspace)
+        .fs_storage(branch_storage)
+        .build()
+        .unwrap()
+}
+
+fn assert_backend_paths_hidden(result: &RunResult, paths: &[&Path]) {
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()),
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+    for path in paths {
+        assert!(!output.contains(path.to_string_lossy().as_ref()), "{output}");
+    }
+}
+
+#[tokio::test]
+async fn logical_mount_snapshot_branch_exposes_merged_view_after_reopen() {
+    let source = tempfile::tempdir().unwrap();
+    let snapshot_storage = tempfile::tempdir().unwrap();
+    let branch_storage = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("lower.txt"), b"lower").unwrap();
+    fs::write(source.path().join("deleted.txt"), b"hidden after delete").unwrap();
+    let mut snapshot = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+    let logical = source.path().to_string_lossy();
+
+    let mut sandbox = logical_snapshot_sandbox(
+        source.path(), snapshot.root_dir(), branch_storage.path(),
+    );
+    let mut branch = sandbox.create_fs_branch_from_snapshot(&snapshot).unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+    let write = format!(
+        "set -eu; \
+         test \"$PWD\" = '{0}'; \
+         printf 'content\\n' > '{0}/added.txt'; \
+         read VALUE < '{0}/added.txt'; test \"$VALUE\" = content; \
+         test -r '{0}/added.txt'; \
+         mkdir '{0}/upper-dir'; \
+         printf nested > '{0}/upper-dir/nested.txt'; \
+         test \"$(cat '{0}/upper-dir/nested.txt')\" = nested; \
+         cd '{0}/upper-dir'; \
+         test \"$PWD\" = '{0}/upper-dir'; \
+         test \"$(ls)\" = nested.txt; \
+         cd '{0}'; \
+         ln -s added.txt upper-link; \
+         test \"$(cat upper-link)\" = content; \
+         printf '#!/bin/sh\\nprintf executable' > upper-executable; \
+         chmod 755 upper-executable; \
+         test \"$(./upper-executable)\" = executable; \
+         rm deleted.txt; \
+         test ! -e deleted.txt; \
+         if DELETED=$(cat deleted.txt 2>&1); then exit 1; fi; \
+         case \"$DELETED\" in *'hidden after delete'*) exit 1;; esac; \
+         case \"$(ls -1)\" in *added.txt*) :;; *) exit 1;; esac",
+        logical,
+    );
+    let result = sandbox.run(&["sh", "-c", &write]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(
+        result.stderr.as_deref().unwrap_or_default()
+    ));
+    assert_backend_paths_hidden(&result, &[snapshot.root_dir(), branch_storage.path()]);
+
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    let preserved = branch.persist().unwrap();
+    drop(sandbox);
+
+    let mut reopened = FsBranch::reopen(preserved).unwrap();
+    let mut resumed = logical_snapshot_sandbox(
+        source.path(), snapshot.root_dir(), branch_storage.path(),
+    );
+    resumed.attach_fs_branch(&mut reopened).unwrap();
+    let read = format!(
+        "set -eu; \
+         test \"$PWD\" = '{0}'; \
+         test \"$(cat '{0}/added.txt')\" = content; \
+         test \"$(cat '{0}/upper-dir/nested.txt')\" = nested; \
+         test \"$(readlink '{0}/upper-link')\" = added.txt; \
+         test \"$('{0}/upper-executable')\" = executable; \
+         test ! -e '{0}/deleted.txt'; \
+         if DELETED=$(cat '{0}/deleted.txt' 2>&1); then exit 1; fi; \
+         case \"$DELETED\" in *'hidden after delete'*) exit 1;; esac; \
+         case \"$(ls -1 '{0}')\" in *upper-dir*) :;; *) exit 1;; esac",
+        logical,
+    );
+    let result = resumed.run(&["sh", "-c", &read]).await.unwrap();
+    assert!(result.success(), "{}", String::from_utf8_lossy(
+        result.stderr.as_deref().unwrap_or_default()
+    ));
+    assert_backend_paths_hidden(&result, &[snapshot.root_dir(), branch_storage.path()]);
+    let mut reopened = resumed.take_attached_fs_branch().await.unwrap();
+    reopened.abort().unwrap();
+    snapshot.destroy().unwrap();
 }
 
 #[tokio::test]
