@@ -127,6 +127,21 @@ pub(crate) async fn handle_fork(
     // Enforce concurrent process limit.
     let limit = live_max.unwrap_or(rs.max_processes);
     if rs.proc_count >= limit {
+        rs.process_limit_denials = rs.process_limit_denials.saturating_add(1);
+        let denials = rs.process_limit_denials;
+        let current = rs.proc_count;
+        let reservations = rs.process_slots.len();
+        // Log the first denial and then powers of two. A failing program may
+        // retry fork in a tight loop; this keeps the diagnostic visible
+        // without allowing it to fill the supervisor log.
+        if denials.is_power_of_two() {
+            let tracked_tasks = ctx.processes.len();
+            eprintln!(
+                "sandlock: process quota exhausted: caller_tid={} current={} limit={} \
+                 reservations={} tracked_tasks={} denials={}",
+                notif.pid, current, limit, reservations, tracked_tasks, denials
+            );
+        }
         return NotifAction::Errno(EAGAIN);
     }
 
@@ -1111,6 +1126,23 @@ mod tests {
         rollback_fork_count(&context.resource, process_slot).await;
         crate::seccomp::notif::cleanup_pid(&context, key).await;
         assert_eq!(context.resource.lock().await.proc_count, 1);
+    }
+
+    #[tokio::test]
+    async fn process_limit_denials_are_counted_for_diagnostics() {
+        let context = fake_supervisor_ctx(false);
+        {
+            let mut resource = context.resource.lock().await;
+            resource.max_processes = 1;
+            resource.proc_count = 1;
+        }
+        let notification = fake_notif(libc::SYS_clone, 0);
+
+        assert!(matches!(
+            handle_fork(&notification, -1, &context, &fake_policy(false)).await,
+            NotifAction::Errno(EAGAIN)
+        ));
+        assert_eq!(context.resource.lock().await.process_limit_denials, 1);
     }
 
     struct SharedFlags {

@@ -21,6 +21,10 @@ pub struct ResourceState {
     pub peak_proc_count: u32,
     /// Maximum allowed concurrent processes.
     pub max_processes: u32,
+    /// Number of fork-like syscalls rejected because the concurrent-process
+    /// budget was full. Used to rate-limit quota diagnostics while retaining
+    /// the total denial count in each emitted message.
+    pub process_limit_denials: u64,
     /// Estimated anonymous memory usage (bytes).
     pub mem_used: u64,
     /// Peak anonymous memory usage observed since sandbox start (bytes).
@@ -45,6 +49,7 @@ impl ResourceState {
             process_slots: HashSet::new(),
             peak_proc_count: 1, // root process always exists; handle_fork counts children only
             max_processes,
+            process_limit_denials: 0,
             mem_used: 0,
             peak_mem_used: 0,
             max_memory_bytes,
