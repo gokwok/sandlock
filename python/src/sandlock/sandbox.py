@@ -268,9 +268,10 @@ class Sandbox:
     """Memory limit. String like '512M' or int bytes."""
 
     max_processes: int = 64
-    """Maximum total forks allowed in the sandbox (lifetime count,
-    not concurrent).  Enforced by the seccomp notif supervisor.
-    Also enables fork interception needed for checkpoint freeze."""
+    """Maximum concurrent live processes in the sandbox. Threads do not
+    count, and exited children release their slot independently of how the
+    parent reaps them. Enforced by the seccomp notif supervisor. Also enables
+    fork interception needed for checkpoint freeze."""
 
     max_open_files: int | None = None
     """Maximum number of open file descriptors.  Enforced via

@@ -10,8 +10,13 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock as AsyncRwLo
 
 /// Resource-limit runtime state shared across notification handlers.
 pub struct ResourceState {
-    /// Live concurrent process count — incremented on fork, decremented on wait.
+    /// Live concurrent process count — the root process plus every reserved
+    /// fork slot that has not yet been released by rollback or process exit.
     pub proc_count: u32,
+    /// Fork-notification IDs owning a process-count slot.  Both failed-fork
+    /// rollback and pidfd exit cleanup remove from this set before decrementing,
+    /// making the credit exactly-once even when cleanup paths race.
+    pub process_slots: HashSet<u64>,
     /// Peak concurrent process count observed since sandbox start.
     pub peak_proc_count: u32,
     /// Maximum allowed concurrent processes.
@@ -37,6 +42,7 @@ impl ResourceState {
     pub fn new(max_memory_bytes: u64, max_processes: u32) -> Self {
         Self {
             proc_count: 0,
+            process_slots: HashSet::new(),
             peak_proc_count: 1, // root process always exists; handle_fork counts children only
             max_processes,
             mem_used: 0,
@@ -161,11 +167,11 @@ pub struct PerProcessState {
 /// Registry for tracked sandbox processes plus their per-process
 /// supervisor state.
 ///
-/// In the default supervisor this is populated lazily from seccomp
-/// notifications. When `policy_fn` is active, fork-like syscalls are
-/// additionally traced for one ptrace creation event so children are
-/// inserted here before they can run user code; this makes the index
-/// complete for argv-safety freezes.
+/// The top-level process and threads can be populated lazily from seccomp
+/// notifications. Process-creating fork-like syscalls are traced for one
+/// ptrace creation event so each child is inserted with its quota slot and
+/// pidfd before it can run user code; this also makes the index complete for
+/// argv-safety freezes.
 ///
 /// Maps the kernel's numeric `pid` (the value that arrives in seccomp
 /// notifications) to the canonical `PidKey` plus an
@@ -207,6 +213,9 @@ struct ProcessEntry {
     tgid: i32,
     state: Arc<AsyncMutex<PerProcessState>>,
     cwd: SharedCwd,
+    /// Fork-notification ID whose quota slot belongs to this process.  The
+    /// top-level sandbox process and lazily discovered threads have no slot.
+    process_slot: Option<u64>,
 }
 
 impl ProcessIndex {
@@ -222,6 +231,19 @@ impl ProcessIndex {
     /// responsible for keeping the pidfd alive — the per-child
     /// watcher task does this via `AsyncFd<OwnedFd>`.
     pub fn register(&self, pid: i32) -> Option<PidKey> {
+        self.register_with_process_slot(pid, None).map(|registered| registered.0)
+    }
+
+    /// Register a process and attach the quota reservation made for the fork
+    /// that created it. Returns the stable key plus any quota slot displaced
+    /// from a stale entry with the same numeric PID. The caller must release a
+    /// displaced slot. The current slot travels with the stable `PidKey`, so
+    /// PID reuse cannot release a newer process's quota charge.
+    pub fn register_with_process_slot(
+        &self,
+        pid: i32,
+        process_slot: Option<u64>,
+    ) -> Option<(PidKey, Option<u64>)> {
         let start_time = read_pid_start_time(pid)?;
         let key = PidKey { pid, start_time };
         // Unreadable /proc means the task is its own address space as far
@@ -232,9 +254,15 @@ impl ProcessIndex {
             tgid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             cwd: self.inherited_cwd(pid, tgid),
+            process_slot,
         };
-        self.inner.write().ok()?.insert(pid, entry);
-        Some(key)
+        let displaced_process_slot = self
+            .inner
+            .write()
+            .ok()?
+            .insert(pid, entry)
+            .and_then(|displaced| displaced.process_slot);
+        Some((key, displaced_process_slot))
     }
 
     /// The cwd cell a task starts life with.
@@ -378,30 +406,31 @@ impl ProcessIndex {
             .unwrap_or_default()
     }
 
-    /// Remove a process from the index. The per-process state's
-    /// `Arc` reference held by the index drops here; remaining clones
-    /// (e.g. a handler that's mid-execution for that pid) will drop
+    /// Remove a process from the index and return its quota slot, if any. The
+    /// per-process state's `Arc` reference held by the index drops here;
+    /// remaining clones (e.g. a handler that's mid-execution for that pid) will drop
     /// when they go out of scope, and the inner `PerProcessState`
     /// frees automatically.
-    pub fn unregister(&self, key: PidKey) {
+    pub fn unregister(&self, key: PidKey) -> Option<u64> {
         if let Ok(mut g) = self.inner.write() {
             // Only clear if the entry still points at this key. A PID
             // recycled with a fresh start_time may already have
             // overwritten the entry via register(); we must not stomp it.
             if g.get(&key.pid).map(|e| e.key) == Some(key) {
-                g.remove(&key.pid);
+                return g.remove(&key.pid).and_then(|entry| entry.process_slot);
             }
         }
+        None
     }
 
-    /// Defensive sweep: drop entries whose process is gone (or whose
-    /// start_time has changed). Called from a low-frequency backstop
-    /// task in case a pidfd watcher failed to spawn or the kernel
-    /// didn't deliver the readability event.
-    pub fn prune_dead(&self) {
+    /// Defensive sweep: identify entries whose process is gone (or whose
+    /// start_time has changed). A low-frequency backstop passes the returned
+    /// keys through unified cleanup so memory and process quota are both
+    /// credited exactly once.
+    pub fn dead_keys(&self) -> Vec<PidKey> {
         let candidates: Vec<(i32, PidKey)> = match self.inner.read() {
             Ok(g) => g.iter().map(|(p, e)| (*p, e.key)).collect(),
-            Err(_) => return,
+            Err(_) => return Vec::new(),
         };
         let mut dead = Vec::new();
         for (pid, key) in candidates {
@@ -410,16 +439,7 @@ impl ProcessIndex {
                 _ => dead.push(key),
             }
         }
-        if dead.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = self.inner.write() {
-            for key in dead {
-                if g.get(&key.pid).map(|e| e.key) == Some(key) {
-                    g.remove(&key.pid);
-                }
-            }
-        }
+        dead
     }
 }
 
@@ -877,6 +897,7 @@ mod tests {
                 tgid: self_pid,
                 state: Arc::new(AsyncMutex::new(PerProcessState::default())),
                 cwd: SharedCwd::default(),
+                process_slot: None,
             };
             idx.inner.write().unwrap().insert(self_pid, stale);
         }
@@ -937,10 +958,13 @@ mod tests {
             tgid: self_pid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             cwd: SharedCwd::default(),
+            process_slot: None,
         };
         idx.inner.write().unwrap().insert(self_pid, stale);
 
-        idx.prune_dead();
+        for key in idx.dead_keys() {
+            idx.unregister(key);
+        }
         assert!(!idx.contains(self_pid));
     }
 
@@ -949,7 +973,7 @@ mod tests {
         let self_pid = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
         let key = idx.register(self_pid).unwrap();
-        idx.prune_dead();
+        assert!(idx.dead_keys().is_empty());
         assert_eq!(idx.key_for(self_pid), Some(key));
     }
 }

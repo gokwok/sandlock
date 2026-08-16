@@ -63,9 +63,9 @@ pub enum SyscallCategory {
 /// (`fs_read` / `fs_write` / `fs_deny`); see issue #27.
 ///
 /// `argv` *is* exposed for `execve`/`execveat` and is TOCTOU-safe by
-/// construction: with `policy_fn` active, fork-like syscalls are traced
-/// for one ptrace creation event, so children are registered in
-/// `ProcessIndex` before they can run user code. Before the supervisor
+/// construction: process-creating fork-like syscalls are traced for one
+/// ptrace creation event, so children are registered in `ProcessIndex`
+/// before they can run user code. Before the supervisor
 /// exposes `argv` to `policy_fn` or returns `Continue` for an execve, it
 /// then `PTRACE_SEIZE`+`PTRACE_INTERRUPT`s every task that could write
 /// the memory — both sibling threads of the calling tid (same TGID, share

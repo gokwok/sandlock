@@ -208,6 +208,123 @@ async fn test_process_limit_allows_sequential_reuse() {
 }
 
 #[tokio::test]
+async fn test_process_limit_releases_after_waitpid_wnohang() {
+    let out = temp_path("proc-wnohang-reuse");
+
+    // Regression: non-blocking waits used to bypass the seccomp notification
+    // that credited proc_count. Although every child was already exited and
+    // reaped, its slot leaked forever and the 64th-ish fork returned EAGAIN.
+    let script = format!(
+        concat!(
+            "import os, time\n",
+            "for i in range(100):\n",
+            "  pid = os.fork()\n",
+            "  if pid == 0:\n",
+            "    os._exit(0)\n",
+            "  while True:\n",
+            "    waited, _ = os.waitpid(pid, os.WNOHANG)\n",
+            "    if waited == pid:\n",
+            "      break\n",
+            "    time.sleep(0.001)\n",
+            "open('{out}', 'w').write('100')\n",
+        ),
+        out = out.display()
+    );
+
+    let policy = base_policy().max_processes(3).build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(result.exit_status, ExitStatus::Code(0)),
+        "100 sequential WNOHANG-reaped forks should exit 0; got {:?}",
+        result.exit_status,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("completion file should exist"),
+        "100",
+        "all 100 sequential forks should complete under max_processes=3",
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test]
+async fn test_process_limit_releases_after_node_child_process_spawn() {
+    let Some(node) = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("node"))
+                .find(|candidate| candidate.is_file())
+        })
+        .and_then(|path| std::fs::canonicalize(path).ok())
+    else {
+        eprintln!("skipping Node process-quota regression: node is not installed");
+        return;
+    };
+
+    let out = temp_path("node-spawn-reuse");
+    let out_js = serde_json::to_string(&out.to_string_lossy()).unwrap();
+    let script = format!(
+        concat!(
+            "const fs = require('node:fs');\n",
+            "const {{ spawn }} = require('node:child_process');\n",
+            "let completed = 0;\n",
+            "function next() {{\n",
+            "  if (completed === 100) {{\n",
+            "    fs.writeFileSync({out_js}, String(completed));\n",
+            "    return;\n",
+            "  }}\n",
+            "  const child = spawn('/bin/true');\n",
+            "  child.once('error', (error) => {{\n",
+            "    console.error(error);\n",
+            "    process.exitCode = 1;\n",
+            "  }});\n",
+            "  child.once('exit', (code, signal) => {{\n",
+            "    if (code !== 0 || signal !== null) {{\n",
+            "      console.error(`unexpected child exit: ${{code}}/${{signal}}`);\n",
+            "      process.exitCode = 1;\n",
+            "      return;\n",
+            "    }}\n",
+            "    completed += 1;\n",
+            "    setImmediate(next);\n",
+            "  }});\n",
+            "}}\n",
+            "next();\n",
+        ),
+        out_js = out_js,
+    );
+
+    let node_arg = node.to_string_lossy().into_owned();
+    let mut builder = base_policy().max_processes(3);
+    if !node.starts_with("/usr") && !node.starts_with("/bin") {
+        builder = builder.fs_read(&node);
+    }
+    let policy = builder.build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&[&node_arg, "-e", &script])
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(result.exit_status, ExitStatus::Code(0)),
+        "100 sequential child_process.spawn calls should exit 0; got {:?}",
+        result.exit_status,
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("completion file should exist"),
+        "100",
+        "all 100 Node child_process.spawn calls should complete",
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[tokio::test]
 async fn test_threads_do_not_count_toward_process_limit_clone3() {
     // Regression: handle_fork only checked CLONE_THREAD on SYS_clone, not
     // SYS_clone3 (whose flags live in a clone_args struct in user memory).

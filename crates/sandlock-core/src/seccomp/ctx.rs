@@ -27,11 +27,11 @@ pub struct SupervisorCtx {
     /// NETLINK_ROUTE virtualization state.
     pub netlink: Arc<crate::netlink::NetlinkState>,
     /// Per-process registry: pid → PidKey. This anchors unified
-    /// per-process state cleanup. With policy_fn active, fork-like
-    /// syscalls populate it at child creation time before user code can
-    /// run; otherwise it is populated lazily from notifications. Wraps
-    /// an internal RwLock, so handlers can query it synchronously
-    /// without `.await`.
+    /// per-process state cleanup. Process-creating fork-like syscalls
+    /// populate it at the child's ptrace birth-stop so pidfd exit cleanup can
+    /// release quota exactly once; the top-level process and threads may be
+    /// populated lazily from notifications. Wraps an internal RwLock, so
+    /// handlers can query it synchronously without `.await`.
     pub processes: Arc<ProcessIndex>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,

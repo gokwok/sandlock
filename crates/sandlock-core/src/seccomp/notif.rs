@@ -2235,9 +2235,9 @@ async fn handle_notification(
     //   2. Peer processes in other TGIDs that alias argv pages via
     //      MAP_SHARED mappings or share mm via clone(CLONE_VM).
     //
-    // The freeze enumerates ProcessIndex. With policy_fn active, that
-    // index is complete: fork-like syscalls are traced at creation time
-    // below, before new children can run user code.
+    // The freeze enumerates ProcessIndex. Process-creating fork-like syscalls
+    // are traced at creation time below, before new children can run user code,
+    // so the index is complete when policy_fn needs it.
     //
     // Strict on failure: if we cannot establish the freeze, we cannot
     // safely expose argv or allow execve, so we deny with EPERM.
@@ -2286,29 +2286,35 @@ async fn handle_notification(
     }
 
     if fork_counted && !matches!(action, NotifAction::Continue) {
-        crate::resource::rollback_fork_count(&ctx.resource).await;
+        crate::resource::rollback_fork_count(&ctx.resource, notif.id).await;
     }
 
-    // With policy_fn active, fork-like syscalls are traced for exactly
-    // one ptrace event so ProcessIndex becomes complete before the new
-    // child can run user code. That closes the race where a peer
-    // process could exist without ever having produced a notification.
+    // Process-creating fork-like syscalls are traced for exactly one ptrace
+    // event. This binds the reserved process slot to a stable PidKey/pidfd
+    // before the child can run, and also closes the argv-safety race where a
+    // peer could exist without ever having produced a notification.
     let mut creation_trace = None;
     if matches!(action, NotifAction::Continue)
-        && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
+        && crate::resource::requires_process_creation_tracking(&notif, fd)
     {
-        match crate::resource::prepare_process_creation_tracking(ctx, notif.pid as i32).await {
+        match crate::resource::prepare_process_creation_tracking(
+            ctx,
+            notif.pid as i32,
+            notif.id,
+        )
+        .await
+        {
             Ok(trace) => {
                 creation_trace = Some(trace);
             }
             Err(e) => {
                 eprintln!(
                     "sandlock: process-creation tracking failed for pid {}: {} \
-                     — denying fork-like syscall to preserve argv TOCTOU invariant",
+                     — denying fork-like syscall to preserve live-process accounting",
                     notif.pid, e
                 );
                 if fork_counted {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
+                    crate::resource::rollback_fork_count(&ctx.resource, notif.id).await;
                 }
                 action = NotifAction::Errno(libc::EPERM);
             }
@@ -2327,7 +2333,7 @@ async fn handle_notification(
     // are already None — there is nothing to unwind here.)
     if let NotifAction::Defer(deferred) = action {
         if crate::freeze::requires_freeze_on_continue(nr)
-            || crate::resource::requires_process_creation_tracking(&notif, fd, policy)
+            || crate::resource::requires_process_creation_tracking(&notif, fd)
         {
             let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
             return;
@@ -2352,10 +2358,10 @@ async fn handle_notification(
             match crate::resource::finish_process_creation_tracking(trace).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
+                    crate::resource::rollback_fork_count(&ctx.resource, notif.id).await;
                 }
                 Err(e) => {
-                    crate::resource::rollback_fork_count(&ctx.resource).await;
+                    crate::resource::rollback_fork_count(&ctx.resource, notif.id).await;
                     eprintln!(
                         "sandlock: process-creation tracking completion failed for pid {}: {}",
                         notif.pid, e
@@ -2363,7 +2369,7 @@ async fn handle_notification(
                 }
             }
         } else {
-            crate::resource::rollback_fork_count(&ctx.resource).await;
+            crate::resource::rollback_fork_count(&ctx.resource, notif.id).await;
             crate::resource::abort_process_creation_tracking(trace).await;
         }
     }
@@ -2433,7 +2439,10 @@ pub async fn supervisor(
     // child on an old kernel, or its watcher panicked). At 5 minutes
     // this is cheap enough to leave on; the primary cleanup path is
     // still per-child pidfd readiness in `spawn_pid_watcher`.
-    let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
+    let gc = tokio::spawn(process_index_gc(
+        Arc::clone(&ctx.processes),
+        Arc::clone(&ctx.resource),
+    ));
 
     // Bounds the number of in-flight deferred handler futures (see
     // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
@@ -2488,14 +2497,19 @@ pub async fn supervisor(
 /// Periodic sweep that drops `ProcessIndex` entries for exited PIDs.
 /// Per-process state hangs off these entries via `Arc`, so dropping
 /// them releases everything in one step.
-async fn process_index_gc(processes: Arc<super::state::ProcessIndex>) {
+async fn process_index_gc(
+    processes: Arc<super::state::ProcessIndex>,
+    resource: Arc<tokio::sync::Mutex<super::state::ResourceState>>,
+) {
     let interval = std::time::Duration::from_secs(300);
     loop {
         tokio::time::sleep(interval).await;
         if processes.len() == 0 {
             continue;
         }
-        processes.prune_dead();
+        for key in processes.dead_keys() {
+            cleanup_pid_parts(&processes, &resource, key).await;
+        }
     }
 }
 
@@ -2513,28 +2527,78 @@ pub(crate) fn spawn_pid_watcher(
     key: super::state::PidKey,
     pidfd: std::os::unix::io::OwnedFd,
 ) {
+    // Exit tracking needs only the process registry and resource counters.
+    // Avoid retaining the whole supervisor context here: it owns the COW
+    // branch, which must be dropped promptly when an unwaited Sandbox is
+    // abandoned and its supervisor task is aborted.
+    let processes = Arc::clone(&ctx.processes);
+    let resource = Arc::clone(&ctx.resource);
     tokio::spawn(async move {
+        // Keep an independent descriptor for the rare case where Tokio cannot
+        // register the primary pidfd with its IO driver. A blocking poll on
+        // this duplicate still releases quota on process exit; immediate
+        // cleanup here would under-count a process that remains alive.
+        let mut fallback_pidfd = pidfd.try_clone().ok();
         let async_fd = match tokio::io::unix::AsyncFd::with_interest(
             pidfd,
             tokio::io::Interest::READABLE,
         ) {
             Ok(f) => f,
             Err(_) => {
-                // AsyncFd registration failed (extremely unusual);
-                // fall back to immediate cleanup so we don't leak the
-                // index entry. The OwnedFd we passed in is consumed
-                // by `with_interest`'s Err return and will close on
-                // drop here.
-                cleanup_pid(&ctx, key).await;
+                wait_for_pid_exit_fallback(fallback_pidfd.take(), key).await;
+                cleanup_pid_parts(&processes, &resource, key).await;
                 return;
             }
         };
         // pidfd becomes readable when the process exits; we don't
         // read any data, so `readable()` is just an await point.
-        let _ = async_fd.readable().await;
-        cleanup_pid(&ctx, key).await;
+        if async_fd.readable().await.is_err() {
+            // An IO-driver failure is not evidence that the process exited.
+            // Keep waiting on the duplicate instead of releasing quota early.
+            drop(async_fd);
+            wait_for_pid_exit_fallback(fallback_pidfd.take(), key).await;
+        }
+        cleanup_pid_parts(&processes, &resource, key).await;
         // async_fd drops here, closing the pidfd.
     });
+}
+
+async fn wait_for_pid_exit_fallback(
+    pidfd: Option<std::os::unix::io::OwnedFd>,
+    key: super::state::PidKey,
+) {
+    if let Some(pidfd) = pidfd {
+        let pidfd_signaled = tokio::task::spawn_blocking(move || {
+            let mut pollfd = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                if rc > 0 {
+                    return pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0;
+                }
+                if rc < 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if pidfd_signaled {
+            return;
+        }
+    }
+
+    // Last-ditch identity polling if even dup failed. This is deliberately
+    // delayed until /proc says the exact PidKey is gone, rather than crediting
+    // a still-live process.
+    while super::state::read_pid_start_time(key.pid) == Some(key.start_time) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Drop the supervisor's per-process state for `key`. With every
@@ -2550,15 +2614,27 @@ pub(crate) fn spawn_pid_watcher(
 /// forever, and enough such deaths would exhaust the budget and start
 /// killing innocent workloads. Only a thread-group leader's entry carries
 /// a charge, so crediting whatever this entry holds is self-limiting.
+#[cfg(test)]
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
-    if let Some((entry_key, state)) = ctx.processes.entry_for(key.pid) {
+    cleanup_pid_parts(&ctx.processes, &ctx.resource, key).await;
+}
+
+async fn cleanup_pid_parts(
+    processes: &super::state::ProcessIndex,
+    resource: &Arc<tokio::sync::Mutex<super::state::ResourceState>>,
+    key: super::state::PidKey,
+) {
+    if let Some((entry_key, state)) = processes.entry_for(key.pid) {
         if entry_key == key {
             let mut per = state.lock().await;
-            let mut st = ctx.resource.lock().await;
+            let mut st = resource.lock().await;
             crate::resource::release_charge(&mut st, &mut per);
         }
     }
-    ctx.processes.unregister(key);
+    if let Some(process_slot) = processes.unregister(key) {
+        let mut state = resource.lock().await;
+        crate::resource::release_process_slot(&mut state, process_slot);
+    }
 }
 
 // ============================================================

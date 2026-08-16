@@ -79,9 +79,9 @@ fn is_thread_create(notif: &SeccompNotif, notif_fd: RawFd) -> bool {
 ///
 /// Note: `notif.pid` here is the *parent* (the task issuing
 /// fork/clone/vfork). The kernel hasn't run the syscall yet, so we don't
-/// know the child's pid yet. When `policy_fn` is active, the supervisor
-/// wraps the eventual `Continue` in one-shot ptrace fork-event tracking
-/// and registers the new child before it can run user code.
+/// know the child's pid yet. The supervisor wraps the eventual `Continue`
+/// in one-shot ptrace fork-event tracking and binds this notification's
+/// quota slot to the captured child before it can run user code.
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     notif_fd: RawFd,
@@ -130,8 +130,14 @@ pub(crate) async fn handle_fork(
         return NotifAction::Errno(EAGAIN);
     }
 
-    rs.proc_count += 1;
-    rs.peak_proc_count = rs.peak_proc_count.max(rs.proc_count);
+    // The notification ID is the exactly-once identity for this reservation.
+    // A failed syscall rolls it back; a successful fork transfers it to the
+    // captured child's ProcessIndex entry and pidfd exit watcher. Whichever
+    // cleanup path wins removes the ID, so later paths cannot double-credit.
+    if rs.process_slots.insert(notif.id) {
+        rs.proc_count += 1;
+        rs.peak_proc_count = rs.peak_proc_count.max(rs.proc_count);
+    }
     NotifAction::Continue
 }
 
@@ -142,21 +148,45 @@ pub(crate) async fn handle_fork(
 /// run, so handlers can rely on `ProcessIndex::key_for(notif.pid)`
 /// returning a fresh PidKey.
 ///
-/// With `policy_fn` active, fork-like syscalls additionally register
-/// new child processes at creation time via ptrace fork events, before
-/// the child can run user code. Without `policy_fn`, lazy registration
-/// is enough because no argv-based security decision is exposed.
+/// Fork-like syscalls register new child processes at creation time via
+/// ptrace fork events, before the child can run user code. This supplies
+/// the stable PID/pidfd lifecycle used by process-quota accounting; lazy
+/// registration remains a fallback for the top-level process and threads.
 ///
 /// The fast path is a single `RwLock` read: if the pid is already
-/// tracked, we trust the entry. PID-identity correctness comes from
-/// the per-child pidfd watcher — a process can't issue notifications
-/// after it has exited, and the kernel won't recycle a PID until the
-/// parent has waited (which we observe), so a stale entry has no
-/// window in which to be hit. We deliberately do *not* re-stat
-/// /proc/<pid>/stat on every notification.
+/// tracked, we trust the entry. PID-identity correctness primarily comes from
+/// the per-child pidfd watcher, which becomes readable at exit before the PID
+/// can be recycled. Quota-bearing creation also revalidates a colliding PidKey
+/// defensively. We deliberately do *not* re-stat /proc/<pid>/stat on every
+/// ordinary notification.
 pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
+    register_pid_if_new_with_process_slot(ctx, pid, None)
+}
+
+fn register_pid_if_new_with_process_slot(
+    ctx: &Arc<SupervisorCtx>,
+    pid: i32,
+    process_slot: Option<u64>,
+) -> bool {
     if ctx.processes.contains(pid) {
-        return true;
+        if process_slot.is_none() {
+            return true;
+        }
+
+        // A quota-bearing child normally arrives here exactly once at its
+        // ptrace birth-stop. If this numeric PID is still indexed, distinguish
+        // an impossible duplicate from a stale PidKey left by a delayed exit
+        // watcher after PID reuse.
+        if let Some(existing_key) = ctx.processes.key_for(pid) {
+            if crate::seccomp::state::read_pid_start_time(pid)
+                == Some(existing_key.start_time)
+            {
+                return false;
+            }
+            if let Some(displaced_process_slot) = ctx.processes.unregister(existing_key) {
+                release_displaced_process_slot(ctx, displaced_process_slot);
+            }
+        }
     }
 
     let pidfd = match crate::sys::syscall::pidfd_open(pid as u32, 0) {
@@ -177,14 +207,32 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
         }
     };
 
-    let key = match ctx.processes.register(pid) {
-        Some(k) => k,
+    let (key, displaced_process_slot) = match ctx
+        .processes
+        .register_with_process_slot(pid, process_slot)
+    {
+        Some(registered) => registered,
         None => return false, // process exited between pidfd_open and stat read
     };
+
+    // A delayed watcher can leave an exited/reaped PidKey in the index long
+    // enough for Linux to recycle its numeric PID. Replacing that stale entry
+    // must also retire its old quota slot; the old watcher is identity-guarded
+    // and will correctly decline to unregister the new entry.
+    if let Some(displaced_process_slot) = displaced_process_slot {
+        release_displaced_process_slot(ctx, displaced_process_slot);
+    }
 
     // Hand the pidfd to the watcher; it owns the fd's lifetime now.
     spawn_pid_watcher(Arc::clone(ctx), key, pidfd);
     true
+}
+
+fn release_displaced_process_slot(ctx: &Arc<SupervisorCtx>, process_slot: u64) {
+    let resource = Arc::clone(&ctx.resource);
+    tokio::spawn(async move {
+        rollback_fork_count(&resource, process_slot).await;
+    });
 }
 
 pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
@@ -248,14 +296,14 @@ pub(crate) fn fork_counted_on_continue(notif: &SeccompNotif, notif_fd: RawFd) ->
     is_process_creation_notif(notif) && !is_thread_create(notif, notif_fd)
 }
 
-/// True when this notification can create a new task that must be in
-/// `ProcessIndex` before it can race a later execve argv decision.
+/// True when this notification can create a quota-accounted process. Every
+/// such syscall must be tracked through its ptrace creation event so the
+/// reservation can be released from pidfd readiness at actual process exit.
 pub(crate) fn requires_process_creation_tracking(
     notif: &SeccompNotif,
     notif_fd: RawFd,
-    policy: &NotifPolicy,
 ) -> bool {
-    policy.argv_safety_required && fork_counted_on_continue(notif, notif_fd)
+    fork_counted_on_continue(notif, notif_fd)
 }
 
 /// Arm ptrace fork-event tracking on the syscall's calling task.
@@ -272,6 +320,7 @@ pub(crate) fn requires_process_creation_tracking(
 pub(crate) async fn prepare_process_creation_tracking(
     ctx: &Arc<SupervisorCtx>,
     caller_tid: i32,
+    process_slot: u64,
 ) -> io::Result<ProcessCreationTrace> {
     let ctx = Arc::clone(ctx);
     // SEIZE result, reported back as an errno so `io::Error` need not cross
@@ -282,7 +331,7 @@ pub(crate) async fn prepare_process_creation_tracking(
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<TraceCmd>(1);
 
     let join = tokio::task::spawn_blocking(move || {
-        process_creation_worker(caller_tid, ctx, attached_tx, cmd_rx)
+        process_creation_worker(caller_tid, ctx, process_slot, attached_tx, cmd_rx)
     });
 
     match attached_rx.await {
@@ -308,6 +357,7 @@ pub(crate) async fn prepare_process_creation_tracking(
 fn process_creation_worker(
     caller_tid: i32,
     ctx: Arc<SupervisorCtx>,
+    process_slot: u64,
     attached_tx: tokio::sync::oneshot::Sender<Result<(), i32>>,
     cmd_rx: std::sync::mpsc::Receiver<TraceCmd>,
 ) -> io::Result<bool> {
@@ -338,7 +388,7 @@ fn process_creation_worker(
 
     // After `Continue`, watch for the fork-creation event (no INTERRUPT — see
     // `run_creation_event_loop`).
-    let result = run_creation_event_loop(caller_tid, &ctx);
+    let result = run_creation_event_loop(caller_tid, &ctx, process_slot);
     detach_traced(caller_tid);
     result
 }
@@ -406,7 +456,11 @@ const FORK_WATCHDOG_SIGNAL: libc::c_int = libc::SIGURG;
 /// tracee after a deadline, which we observe here as a signal-delivery-stop and
 /// treat as "no child". (We do **not** `PTRACE_INTERRUPT` to force a stop —
 /// that races the fork and is unreliable; and we do not busy-poll.)
-fn run_creation_event_loop(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bool> {
+fn run_creation_event_loop(
+    caller_tid: i32,
+    ctx: &Arc<SupervisorCtx>,
+    process_slot: u64,
+) -> io::Result<bool> {
     loop {
         let mut status: libc::c_int = 0;
         let r = unsafe { libc::waitpid(caller_tid, &mut status, libc::__WALL) };
@@ -430,7 +484,7 @@ fn run_creation_event_loop(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Res
             || event == libc::PTRACE_EVENT_VFORK
             || event == libc::PTRACE_EVENT_CLONE
         {
-            return handle_fork_event(caller_tid, ctx);
+            return handle_fork_event(caller_tid, ctx, process_slot);
         }
 
         let stopsig = libc::WSTOPSIG(status);
@@ -460,7 +514,11 @@ fn ptrace_resume(tid: i32, request: libc::c_uint, data: libc::c_ulong) -> io::Re
 /// On a `PTRACE_EVENT_{FORK,VFORK,CLONE}`: read the new child's pid, register
 /// it in `ProcessIndex` (so the execve argv-freeze can enumerate it), then
 /// detach the child so it can run. Runs on the worker thread.
-fn handle_fork_event(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bool> {
+fn handle_fork_event(
+    caller_tid: i32,
+    ctx: &Arc<SupervisorCtx>,
+    process_slot: u64,
+) -> io::Result<bool> {
     let mut child_pid: libc::c_ulong = 0;
     let ret = unsafe {
         libc::ptrace(
@@ -475,7 +533,7 @@ fn handle_fork_event(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bo
     }
 
     let child_pid = child_pid as i32;
-    if !register_pid_if_new(ctx, child_pid) {
+    if !register_pid_if_new_with_process_slot(ctx, child_pid, Some(process_slot)) {
         let _ = unsafe { libc::kill(child_pid, libc::SIGKILL) };
         detach_traced(child_pid);
         return Err(io::Error::new(
@@ -542,25 +600,25 @@ pub(crate) async fn abort_process_creation_tracking(mut trace: ProcessCreationTr
     }
 }
 
-/// Handle wait4/waitid notifications — decrement the concurrent process count.
-///
-/// Only blocking waits reach the supervisor (WNOHANG/WNOWAIT calls are
-/// filtered out by BPF and allowed without notification).  A blocking wait
-/// will definitely reap a child, so we decrement before the kernel executes it.
-pub(crate) async fn handle_wait(
-    _notif: &SeccompNotif,
+/// Undo the optimistic process-count increment if a fork-like syscall
+/// is denied after `handle_fork` allowed it. Removing the reservation first
+/// makes rollback idempotent with pidfd exit cleanup.
+pub(crate) async fn rollback_fork_count(
     resource: &Arc<Mutex<ResourceState>>,
-) -> NotifAction {
+    process_slot: u64,
+) {
     let mut rs = resource.lock().await;
-    rs.proc_count = rs.proc_count.saturating_sub(1);
-    NotifAction::Continue
+    release_process_slot(&mut rs, process_slot);
 }
 
-/// Undo the optimistic process-count increment if a fork-like syscall
-/// is denied after `handle_fork` allowed it.
-pub(crate) async fn rollback_fork_count(resource: &Arc<Mutex<ResourceState>>) {
-    let mut rs = resource.lock().await;
-    rs.proc_count = rs.proc_count.saturating_sub(1);
+/// Release one quota slot exactly once.
+pub(crate) fn release_process_slot(resource: &mut ResourceState, process_slot: u64) -> bool {
+    if resource.process_slots.remove(&process_slot) {
+        resource.proc_count = resource.proc_count.saturating_sub(1);
+        true
+    } else {
+        false
+    }
 }
 
 /// Handle execve/execveat notifications for memory accounting.
@@ -965,9 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn process_creation_tracking_predicates_follow_argv_safety_gate() {
-        let no_argv_safety = fake_policy(false);
-        let argv_safety = fake_policy(true);
+    fn process_creation_tracking_predicates_follow_process_accounting() {
         let clone_proc = fake_notif(libc::SYS_clone, 0);
         let clone_thread = fake_notif(libc::SYS_clone, CLONE_THREAD);
         let clone3 = fake_notif(libc::SYS_clone3, 0);
@@ -983,21 +1039,20 @@ mod tests {
         assert!(fork_counted_on_continue(&clone3, fd));
         assert!(!fork_counted_on_continue(&openat, fd));
 
-        assert!(!requires_process_creation_tracking(&clone_proc, fd, &no_argv_safety));
-        assert!(requires_process_creation_tracking(&clone_proc, fd, &argv_safety));
-        assert!(!requires_process_creation_tracking(&clone_thread, fd, &argv_safety));
-        assert!(requires_process_creation_tracking(&clone3, fd, &argv_safety));
-        assert!(!requires_process_creation_tracking(&openat, fd, &argv_safety));
+        assert!(requires_process_creation_tracking(&clone_proc, fd));
+        assert!(!requires_process_creation_tracking(&clone_thread, fd));
+        assert!(requires_process_creation_tracking(&clone3, fd));
+        assert!(!requires_process_creation_tracking(&openat, fd));
 
         if let Some(fork_nr) = crate::arch::sys_fork() {
             let fork = fake_notif(fork_nr, 0);
             assert!(fork_counted_on_continue(&fork, fd));
-            assert!(requires_process_creation_tracking(&fork, fd, &argv_safety));
+            assert!(requires_process_creation_tracking(&fork, fd));
         }
         if let Some(vfork_nr) = crate::arch::sys_vfork() {
             let vfork = fake_notif(vfork_nr, 0);
             assert!(fork_counted_on_continue(&vfork, fd));
-            assert!(requires_process_creation_tracking(&vfork, fd, &argv_safety));
+            assert!(requires_process_creation_tracking(&vfork, fd));
         }
     }
 
@@ -1009,6 +1064,53 @@ mod tests {
 
         let action = handle_fork(&notification, -1, &context, &fake_policy(false)).await;
         assert!(matches!(action, NotifAction::Hold));
+    }
+
+    #[tokio::test]
+    async fn process_slot_is_released_once_across_exit_and_rollback() {
+        let context = fake_supervisor_ctx(false);
+        let process_slot = 42;
+        {
+            let mut resource = context.resource.lock().await;
+            resource.proc_count = 2; // root + the registered child below
+            resource.process_slots.insert(process_slot);
+        }
+
+        let pid = std::process::id() as i32;
+        let key = context
+            .processes
+            .register_with_process_slot(pid, Some(process_slot))
+            .expect("register current process with quota slot")
+            .0;
+
+        crate::seccomp::notif::cleanup_pid(&context, key).await;
+        assert_eq!(context.resource.lock().await.proc_count, 1);
+
+        // A late rollback for the same fork notification must not credit the
+        // slot a second time after pidfd cleanup already won the race.
+        rollback_fork_count(&context.resource, process_slot).await;
+        let resource = context.resource.lock().await;
+        assert_eq!(resource.proc_count, 1);
+        assert!(!resource.process_slots.contains(&process_slot));
+        drop(resource);
+
+        // The inverse ordering is idempotent as well: if a failed-fork
+        // rollback wins first, a later watcher cleanup may unregister the
+        // process entry but cannot credit the same slot again.
+        let process_slot = 43;
+        {
+            let mut resource = context.resource.lock().await;
+            resource.proc_count = 2;
+            resource.process_slots.insert(process_slot);
+        }
+        let key = context
+            .processes
+            .register_with_process_slot(pid, Some(process_slot))
+            .expect("register current process with second quota slot")
+            .0;
+        rollback_fork_count(&context.resource, process_slot).await;
+        crate::seccomp::notif::cleanup_pid(&context, key).await;
+        assert_eq!(context.resource.lock().await.proc_count, 1);
     }
 
     struct SharedFlags {
@@ -1164,7 +1266,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let trace = match rt.block_on(prepare_process_creation_tracking(&ctx, caller)) {
+        let trace = match rt.block_on(prepare_process_creation_tracking(&ctx, caller, 1)) {
             Ok(trace) => trace,
             Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
                 eprintln!("skipping ptrace fork-event test: ptrace denied: {e}");

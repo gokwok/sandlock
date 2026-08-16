@@ -1111,7 +1111,7 @@ impl Sandbox {
         // Wait for the top-level child to exit. Prefer the child's pidfd via
         // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
         // `waitpid` loop — it never consumes the child's ptrace-stops, which
-        // the `policy_fn` fork-tracking worker reaps (`waitpid` with any flags
+        // the process-creation tracking worker reaps (`waitpid` with any flags
         // reaps a tracee's ptrace-stops, so a concurrent `waitpid` here would
         // race the worker for fork events and hang it). Mirrors
         // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
@@ -3440,7 +3440,7 @@ fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
 /// Await the top-level child's exit via its `pidfd` (readable on exit only),
 /// then reap the status. Because it never calls `waitpid` until the child has
 /// already exited, it does not consume the child's ptrace-stops the way a
-/// `waitpid`-loop would — so it doesn't race the `policy_fn` fork-tracking
+/// `waitpid`-loop would — so it doesn't race the process-creation tracking
 /// worker. Falls back to the blocking waiter on any pidfd/`AsyncFd` error.
 async fn wait_child_exit_via_pidfd(
     pidfd: std::os::unix::io::OwnedFd,
@@ -3479,7 +3479,7 @@ async fn wait_child_exit_via_pidfd(
 }
 
 /// Blocking `waitpid` fallback for kernels without `pidfd_open`. Used only when
-/// no pidfd is available; on such kernels `policy_fn` fork-tracking is the only
+/// no pidfd is available; on such kernels process-creation tracking is the only
 /// thing that could race it, and the lack of pidfd is itself rare.
 async fn wait_child_exit_blocking(pid: libc::pid_t) -> crate::result::ExitStatus {
     use crate::result::ExitStatus;
