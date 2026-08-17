@@ -97,6 +97,37 @@ jobs:
           CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
         run: cargo build --release --target riscv64gc-unknown-linux-gnu
 
+  rust-musl-aarch64:
+    name: Rust musl (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and musl toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile workspace and tests
+        run: cargo test --workspace --target aarch64-unknown-linux-musl --no-run
+
+      # This exercises the O_PATH rule setup at runtime. A libc-dependent
+      # open flag regression blocks forever on the FIFO, so keep it bounded.
+      - name: Run musl filesystem compatibility tests
+        timeout-minutes: 2
+        run: |
+          cargo test -p sandlock-core --target aarch64-unknown-linux-musl \
+            --lib sys::fs::tests::statx_confines_symlinked_parent -- --exact
+          cargo test -p sandlock-core --target aarch64-unknown-linux-musl \
+            --test integration test_landlock::test_path_rule_on_fifo_does_not_block \
+            -- --exact --test-threads=1
+
   cbindgen-header:
     name: cbindgen header up to date
     runs-on: ubuntu-latest

@@ -1083,7 +1083,7 @@ pub(crate) async fn handle_chroot_exec(
         let child_interp_fd = unsafe {
             libc::ioctl(
                 notif_fd,
-                SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+                SECCOMP_IOCTL_NOTIF_ADDFD as _,
                 &addfd_interp as *const _,
             )
         };
@@ -1132,7 +1132,7 @@ pub(crate) async fn handle_chroot_exec(
     let child_fd = unsafe {
         libc::ioctl(
             notif_fd,
-            SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
+            SECCOMP_IOCTL_NOTIF_ADDFD as _,
             &addfd as *const _,
         )
     };

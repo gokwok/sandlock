@@ -846,9 +846,7 @@ impl NotifPolicy {
 /// ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &notif)
 fn recv_notif(fd: RawFd) -> io::Result<SeccompNotif> {
     let mut notif: SeccompNotif = unsafe { std::mem::zeroed() };
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as libc::c_ulong, &mut notif as *mut _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif as *mut _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -959,9 +957,7 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
         newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
         newfd_flags,
     };
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &addfd as *const _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as _, &addfd as *const _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -979,9 +975,7 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> 
         newfd: targetfd as u32,
         newfd_flags: 0,
     };
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &addfd as *const _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as _, &addfd as *const _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -991,9 +985,7 @@ fn inject_fd(fd: RawFd, id: u64, srcfd: RawFd, targetfd: i32) -> io::Result<()> 
 
 /// Raw ioctl to send a notification response.
 fn send_resp_raw(fd: RawFd, resp: &SeccompNotifResp) -> io::Result<()> {
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as libc::c_ulong, resp as *const _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND as _, resp as *const _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -1004,9 +996,7 @@ fn send_resp_raw(fd: RawFd, resp: &SeccompNotifResp) -> io::Result<()> {
 /// Check whether a notification ID is still valid (TOCTOU guard).
 /// ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id)
 pub(crate) fn id_valid(fd: RawFd, id: u64) -> io::Result<()> {
-    let ret = unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as libc::c_ulong, &id as *const _)
-    };
+    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID as _, &id as *const _) };
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -1018,7 +1008,7 @@ pub(crate) fn id_valid(fd: RawFd, id: u64) -> io::Result<()> {
 fn try_set_sync_wakeup(fd: RawFd) {
     let flags: u64 = SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP as u64;
     unsafe {
-        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SET_FLAGS as libc::c_ulong, &flags as *const _);
+        libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SET_FLAGS as _, &flags as *const _);
     }
 }
 

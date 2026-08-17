@@ -121,7 +121,7 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
     }
 
     let ret = unsafe {
-        libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, tid, 0, 0)
+        libc::ptrace(libc::PTRACE_SEIZE as _, tid, 0, 0)
     };
     if ret < 0 {
         let err = io::Error::last_os_error();
@@ -137,7 +137,7 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
     // before returning so we don't leave the task traced-but-running.
 
     let ret = unsafe {
-        libc::ptrace(libc::PTRACE_INTERRUPT as libc::c_uint, tid, 0, 0)
+        libc::ptrace(libc::PTRACE_INTERRUPT as _, tid, 0, 0)
     };
     if ret < 0 {
         let err = io::Error::last_os_error();

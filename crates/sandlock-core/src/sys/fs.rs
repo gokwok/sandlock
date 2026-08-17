@@ -15,6 +15,12 @@ const SYS_OPENAT2: libc::c_long = crate::arch::SYS_OPENAT2 as libc::c_long;
 /// RESOLVE_IN_ROOT: treat the dirfd as the filesystem root for resolution.
 const RESOLVE_IN_ROOT: u64 = 0x10;
 
+/// Kernel UAPI mask for the basic `statx` fields.
+///
+/// Older musl headers do not expose this constant through the `libc` crate.
+#[cfg(test)]
+const STATX_BASIC_STATS: u32 = 0x07ff;
+
 /// Kernel `struct open_how` for openat2().
 #[repr(C)]
 struct OpenHow {
@@ -707,9 +713,9 @@ mod tests {
         let mut buf = vec![0u8; 256];
 
         // In-tree file resolves; escaping parent does not.
-        skip_if_nosys!(statx_in_root(root, "f", 0, libc::STATX_BASIC_STATS, &mut buf)).unwrap();
+        skip_if_nosys!(statx_in_root(root, "f", 0, STATX_BASIC_STATS, &mut buf)).unwrap();
         assert_eq!(
-            statx_in_root(root, "dirlink/group", 0, libc::STATX_BASIC_STATS, &mut buf),
+            statx_in_root(root, "dirlink/group", 0, STATX_BASIC_STATS, &mut buf),
             Err(libc::ENOENT)
         );
     }
