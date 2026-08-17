@@ -165,6 +165,44 @@ async fn test_run_still_captures_stdout() {
     assert_eq!(res.stdout_str(), Some("captured"));
 }
 
+/// Exec argv freezing must keep ptrace ownership on one OS thread across the
+/// asynchronous policy verdict. Python's subprocess.run waits for every child;
+/// a cross-thread PTRACE_DETACH leaves the parent in ptrace_stop and the child
+/// as a zombie, so this loop is a direct regression for that lifecycle race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_policy_exec_freeze_releases_100_python_subprocesses() {
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .max_processes(8)
+        .policy_fn(|_, _| sandlock_core::policy_fn::Verdict::Allow)
+        .build()
+        .unwrap()
+        .with_name("popen-python-exec-freeze");
+    let script = concat!(
+        "import subprocess, sys\n",
+        "for i in range(100):\n",
+        " r = subprocess.run([sys.executable, '-c', 'raise SystemExit(0)'])\n",
+        " assert r.returncode == 0, (i, r.returncode)\n",
+        "print('all-reaped')\n",
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sb.run(&["/usr/bin/python3", "-c", script]),
+    )
+    .await
+    .expect("100 normal child exits must not leave their parent in ptrace_stop")
+    .unwrap();
+
+    assert!(result.success(), "stderr={:?}", result.stderr_str());
+    assert_eq!(result.stdout_str(), Some("all-reaped"));
+}
+
 /// All three streams piped at once — exercises the relocate/wire path for the
 /// full set (a fd collision or wrong ordering would cross or drop a stream).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2246,28 +2246,32 @@ async fn handle_notification(
         && policy.argv_safety_required
         && crate::freeze::requires_freeze_on_continue(nr)
     {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
+        match crate::freeze::prepare_exec_freeze(
+            Arc::clone(&ctx.processes),
             notif.pid as i32,
-        ) {
-            Ok(outcome) => {
-                exec_freeze = Some(outcome);
+        )
+        .await
+        {
+            Ok(preparation) => {
+                if let Some(error) = preparation.failure.as_deref() {
+                    crate::freeze::emit_exec_freeze_diagnostic(
+                        &ctx.processes,
+                        notif.pid as i32,
+                        "prepare_failed",
+                        error,
+                    );
+                    action = NotifAction::Errno(libc::EPERM);
+                }
+                exec_freeze = Some(preparation.trace);
             }
             Err(e) => {
-                eprintln!(
-                    "sandlock: argv-safety freeze failed for pid {}: {} \
-                     — denying execve to preserve TOCTOU invariant",
-                    notif.pid, e
+                crate::freeze::emit_exec_freeze_diagnostic(
+                    &ctx.processes,
+                    notif.pid as i32,
+                    "worker_start_failed",
+                    &e.to_string(),
                 );
                 action = NotifAction::Errno(libc::EPERM);
-                // Rollback could not release tasks that had not entered
-                // ptrace-stop yet; carry them to the post-send reap.
-                if !e.pending_tids.is_empty() {
-                    exec_freeze = Some(crate::freeze::SandboxFreeze {
-                        pending_tids: e.pending_tids,
-                        ..Default::default()
-                    });
-                }
             }
         }
     }
@@ -2375,15 +2379,19 @@ async fn handle_notification(
     }
 
     if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::detach_peers(&freeze.peer_tids);
-        } else {
-            crate::freeze::detach_all(&freeze);
+        if let Err(error) = crate::freeze::finish_exec_freeze(
+            freeze,
+            exec_continued && send_result.is_ok(),
+        )
+        .await
+        {
+            crate::freeze::emit_exec_freeze_diagnostic(
+                &ctx.processes,
+                notif.pid as i32,
+                "cleanup_failed",
+                &error.to_string(),
+            );
         }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
     }
 }
 
@@ -2619,7 +2627,7 @@ pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::sta
     cleanup_pid_parts(&ctx.processes, &ctx.resource, key).await;
 }
 
-async fn cleanup_pid_parts(
+pub(crate) async fn cleanup_pid_parts(
     processes: &super::state::ProcessIndex,
     resource: &Arc<tokio::sync::Mutex<super::state::ResourceState>>,
     key: super::state::PidKey,

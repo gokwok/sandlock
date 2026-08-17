@@ -197,6 +197,8 @@ pub struct ProcessIndex {
     inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
     /// Fork-like syscalls currently owned by a one-shot ptrace tracker.
     active_creation_traces: std::sync::atomic::AtomicUsize,
+    /// Exec argv freezes currently owned by a pinned ptrace worker.
+    active_exec_freezes: std::sync::atomic::AtomicUsize,
 }
 
 /// A task's current directory as the sandbox believes it to be: the
@@ -230,6 +232,7 @@ impl ProcessIndex {
         Self {
             inner: std::sync::RwLock::new(HashMap::new()),
             active_creation_traces: std::sync::atomic::AtomicUsize::new(0),
+            active_exec_freezes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -246,6 +249,26 @@ impl ProcessIndex {
     pub(crate) fn active_creation_traces(&self) -> usize {
         self.active_creation_traces
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn exec_freeze_started(&self) {
+        self.active_exec_freezes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn exec_freeze_finished(&self) {
+        self.active_exec_freezes
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn active_exec_freezes(&self) -> usize {
+        self.active_exec_freezes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn active_ptrace_trackers(&self) -> usize {
+        self.active_creation_traces()
+            .saturating_add(self.active_exec_freezes())
     }
 
     /// Register a process by reading its start_time once and

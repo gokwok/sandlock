@@ -29,16 +29,17 @@
 //! # Sibling vs peer cleanup
 //!
 //! Sibling threads (same TGID as the caller) are killed by the kernel
-//! during execve's `de_thread` step when execve is allowed, so the
-//! supervisor does not detach them on the allow path — their ptrace
-//! state is reaped along with the threads. If the policy callback
-//! denies execve after argv inspection, the supervisor detaches both
-//! siblings and peers because `de_thread` will not run.
+//! during execve's `de_thread` step when execve is allowed, so the pinned
+//! freeze worker does not detach them on the allow path — their ptrace state
+//! is reaped along with the threads. If the policy callback denies execve
+//! after argv inspection, that same worker detaches both siblings and peers
+//! because `de_thread` will not run.
 //!
-//! Peer threads (different TGID) survive execve. The supervisor must
-//! `PTRACE_DETACH` them after `NOTIF_SEND` so they can resume normal
-//! execution. The freeze function returns the peer TID list for that
-//! purpose; siblings are not returned because they need no follow-up.
+//! Peer threads (different TGID) survive execve. The worker retains ptrace
+//! ownership across the asynchronous policy verdict and `NOTIF_SEND`, then
+//! performs `PTRACE_DETACH` on the same OS thread that seized them. This is
+//! required because Linux ptrace ownership belongs to a tracer task; moving
+//! cleanup to another Tokio worker can leave a parent in `ptrace_stop`.
 //!
 //! # Failure modes (strict)
 //!
@@ -61,6 +62,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::sync::Arc;
 
 /// Read the `State:` field from `/proc/<tid>/status`. Returns the
 /// single-character state code (`R`, `S`, `D`, `T`, `t`, `Z`, `X`)
@@ -114,7 +116,7 @@ enum SeizeOutcome {
 fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
     // Fast path: the kernel is already holding this task; it cannot mutate
     // user memory and does not need an attachment.
-    if read_task_state(tid) == Some('D') {
+    if let Some('D' | 'Z' | 'X') = read_task_state(tid) {
         return Ok(SeizeOutcome::NotNeeded);
     }
 
@@ -125,6 +127,9 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(SeizeOutcome::NotNeeded); // already exited
+        }
+        if matches!(read_task_state(tid), Some('Z' | 'X')) {
+            return Ok(SeizeOutcome::NotNeeded);
         }
         return Err(err);
     }
@@ -234,15 +239,14 @@ pub(crate) struct SandboxFreeze {
     /// TIDs seized with a queued interrupt that had entered an
     /// uninterruptible kernel wait before stopping (the vfork parent racing
     /// the freeze). Kernel-held for the duration of the freeze window; must
-    /// be reaped with [`reap_pending`] after the execve response is sent.
+    /// be reaped by the pinned worker after the execve response is sent.
     pub pending_tids: Vec<i32>,
 }
 
 /// A freeze that could not be completed. Carries any tasks that were left
 /// with a queued interrupt and could not be released during rollback (they
-/// had not entered ptrace-stop yet); the caller must [`reap_pending`] them
-/// after sending its deny response, for the same reason the freeze itself
-/// could not wait for them.
+/// had not entered ptrace-stop yet); the pinned worker reaps them after the
+/// deny response, for the same reason the freeze itself could not wait.
 #[derive(Debug)]
 pub(crate) struct FreezeError {
     pub error: io::Error,
@@ -253,6 +257,298 @@ impl std::fmt::Display for FreezeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.error.fmt(f)
     }
+}
+
+enum ExecFreezeCommand {
+    Finish { exec_continued: bool },
+}
+
+/// Pinned-thread owner for one exec argv freeze.
+///
+/// Linux records ptrace ownership against the tracer *task*, not merely its
+/// thread group. The seccomp notification future awaits the policy callback
+/// while peers are frozen and may resume on another Tokio worker. Keeping the
+/// complete SEIZE/INTERRUPT/WAIT/DETACH lifecycle in one dedicated OS thread
+/// prevents a cross-worker `PTRACE_DETACH` from failing with ESRCH and leaving
+/// a parent permanently in `ptrace_stop` beside a zombie child. Thread exit is
+/// also the kernel-level last-resort detach boundary if cleanup itself fails.
+pub(crate) struct ExecFreezeTrace {
+    cmd_tx: std::sync::mpsc::SyncSender<ExecFreezeCommand>,
+    join: Option<std::thread::JoinHandle<io::Result<()>>>,
+    caller_tid: i32,
+    processes: Arc<crate::seccomp::state::ProcessIndex>,
+    signaled: bool,
+}
+
+impl Drop for ExecFreezeTrace {
+    fn drop(&mut self) {
+        if !self.signaled {
+            let _ = self.cmd_tx.send(ExecFreezeCommand::Finish {
+                exec_continued: false,
+            });
+        }
+    }
+}
+
+/// Result of arming a pinned exec freeze. A failed freeze still returns its
+/// trace owner so partial/pending attachments can be released after the
+/// seccomp denial response is sent.
+pub(crate) struct ExecFreezePreparation {
+    pub trace: ExecFreezeTrace,
+    pub failure: Option<String>,
+}
+
+struct ExecFreezeActivity(Arc<crate::seccomp::state::ProcessIndex>);
+
+impl Drop for ExecFreezeActivity {
+    fn drop(&mut self) {
+        self.0.exec_freeze_finished();
+    }
+}
+
+/// Freeze peers on one dedicated OS thread and retain that same thread until
+/// the caller has sent the execve response and asks it to detach.
+pub(crate) async fn prepare_exec_freeze(
+    processes: Arc<crate::seccomp::state::ProcessIndex>,
+    caller_tid: i32,
+) -> io::Result<ExecFreezePreparation> {
+    let worker_processes = Arc::clone(&processes);
+    let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<ExecFreezeCommand>(1);
+    let join = std::thread::Builder::new()
+        .name("sandlock-exec-freeze".to_owned())
+        .spawn(move || {
+            worker_processes.exec_freeze_started();
+            let _activity = ExecFreezeActivity(Arc::clone(&worker_processes));
+            let freeze = freeze_sandbox_for_execve(&worker_processes, caller_tid);
+            let failure = freeze.as_ref().err().map(ToString::to_string);
+            if prepared_tx.send(failure).is_err() {
+                cleanup_exec_freeze(freeze, false)?;
+                return Ok(());
+            }
+            let exec_continued = matches!(
+                cmd_rx.recv(),
+                Ok(ExecFreezeCommand::Finish {
+                    exec_continued: true
+                })
+            );
+            cleanup_exec_freeze(freeze, exec_continued)
+        })?;
+
+    match prepared_rx.await {
+        Ok(failure) => Ok(ExecFreezePreparation {
+            trace: ExecFreezeTrace {
+                cmd_tx,
+                join: Some(join),
+                caller_tid,
+                processes,
+                signaled: false,
+            },
+            failure,
+        }),
+        Err(_) => {
+            let _ = join_exec_freeze_thread(join).await;
+            Err(io::Error::other(
+                "exec freeze worker exited before reporting readiness",
+            ))
+        }
+    }
+}
+
+/// Release a pinned exec freeze after the seccomp response has been sent.
+/// Cleanup is bounded; if the owner cannot detach, the complete caller process
+/// group is killed before one final reap attempt so the supervisor never
+/// silently returns while retaining a live ptrace attachment.
+pub(crate) async fn finish_exec_freeze(
+    mut trace: ExecFreezeTrace,
+    exec_continued: bool,
+) -> io::Result<()> {
+    const CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    const KILLED_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    trace.signaled = true;
+    let caller_tid = trace.caller_tid;
+    let processes = Arc::clone(&trace.processes);
+    let _ = trace
+        .cmd_tx
+        .send(ExecFreezeCommand::Finish { exec_continued });
+    let join = trace.join.take().expect("exec freeze join handle");
+    let mut join = tokio::task::spawn_blocking(move || join_exec_freeze_thread_blocking(join));
+    match tokio::time::timeout(CLEANUP_DEADLINE, &mut join).await {
+        Ok(result) => result.map_err(|error| {
+            io::Error::other(format!("exec freeze join task failed: {error}"))
+        })?,
+        Err(_) => {
+            kill_execution_group(caller_tid);
+            emit_exec_freeze_diagnostic(
+                &processes,
+                caller_tid,
+                "cleanup_timeout",
+                "pinned exec freeze worker exceeded its cleanup deadline",
+            );
+            match tokio::time::timeout(KILLED_CLEANUP_DEADLINE, &mut join).await {
+                Ok(result) => {
+                    result.map_err(|error| {
+                        io::Error::other(format!("exec freeze join task failed: {error}"))
+                    })??;
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "exec freeze cleanup required terminating the execution group",
+                    ))
+                }
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "exec freeze worker did not terminate after execution-group kill",
+                )),
+            }
+        }
+    }
+}
+
+async fn join_exec_freeze_thread(
+    join: std::thread::JoinHandle<io::Result<()>>,
+) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || join_exec_freeze_thread_blocking(join))
+        .await
+        .map_err(|error| io::Error::other(format!("exec freeze join task failed: {error}")))?
+}
+
+fn join_exec_freeze_thread_blocking(
+    join: std::thread::JoinHandle<io::Result<()>>,
+) -> io::Result<()> {
+    join.join()
+        .map_err(|_| io::Error::other("exec freeze worker panicked"))?
+}
+
+fn cleanup_exec_freeze(
+    freeze: Result<SandboxFreeze, FreezeError>,
+    exec_continued: bool,
+) -> io::Result<()> {
+    let mut cleanup_error = None;
+    let mut record = |result: io::Result<()>| {
+        if let Err(error) = result {
+            if cleanup_error.is_none() {
+                cleanup_error = Some(error);
+            }
+        }
+    };
+    match freeze {
+        Ok(freeze) => {
+            if exec_continued {
+                record(detach_tids_checked(&freeze.peer_tids));
+            } else {
+                record(detach_tids_checked(&freeze.sibling_tids));
+                record(detach_tids_checked(&freeze.peer_tids));
+            }
+            record(reap_pending_checked(&freeze.pending_tids));
+        }
+        Err(error) => record(reap_pending_checked(&error.pending_tids)),
+    }
+    cleanup_error.map_or(Ok(()), Err)
+}
+
+fn detach_tids_checked(tids: &[i32]) -> io::Result<()> {
+    let mut first_error = None;
+    for &tid in tids {
+        let ret = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
+        if ret < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
+                first_error = Some(io::Error::new(
+                    error.kind(),
+                    format!("detach ptrace tid {tid}: {error}"),
+                ));
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn reap_pending_checked(pending: &[i32]) -> io::Result<()> {
+    for &tid in pending {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut status: i32 = 0;
+            let result = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            if result == tid {
+                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    break;
+                }
+                if libc::WIFSTOPPED(status) {
+                    detach_tids_checked(&[tid])?;
+                    break;
+                }
+            } else if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("tid {tid} did not reach its pending ptrace stop"),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    Ok(())
+}
+
+fn kill_execution_group(caller_tid: i32) {
+    let process_group = std::fs::read_to_string(format!("/proc/{caller_tid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, fields)| fields.to_owned()))
+        .and_then(|fields| fields.split_whitespace().nth(2)?.parse::<i32>().ok());
+    if let Some(process_group) = process_group {
+        let _ = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+    }
+    let _ = unsafe { libc::kill(caller_tid, libc::SIGKILL) };
+}
+
+/// Emit a machine-readable snapshot whenever argv-freeze setup or cleanup is
+/// unhealthy. This complements spawn-denial diagnostics with the ptrace state
+/// that commonly explains a later EAGAIN.
+pub(crate) fn emit_exec_freeze_diagnostic(
+    processes: &crate::seccomp::state::ProcessIndex,
+    caller_tid: i32,
+    phase: &str,
+    error: &str,
+) {
+    let mut tasks = Vec::new();
+    for pid in processes.pids_snapshot() {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        tasks.push(serde_json::json!({
+            "pid": pid,
+            "state": field("State:").and_then(|value| value.chars().next()),
+            "parentPid": field("PPid:").and_then(|value| value.parse::<i32>().ok()),
+            "tracerPid": field("TracerPid:").and_then(|value| value.parse::<i32>().ok()),
+            "threads": field("Threads:").and_then(|value| value.parse::<usize>().ok()),
+        }));
+    }
+    let diagnostic = serde_json::json!({
+        "event": "ptrace_freeze_failed",
+        "scope": "execution_domain",
+        "source": "exec_argv_freeze",
+        "phase": phase,
+        "error": error,
+        "callerTid": caller_tid,
+        "trackedTasks": tasks.len(),
+        "activeCreationTraces": processes.active_creation_traces(),
+        "activeExecFreezes": processes.active_exec_freezes(),
+        "activePtraceTrackers": processes.active_ptrace_trackers(),
+        "tasks": tasks,
+    });
+    eprintln!("sandlock: execution_domain_diagnostic {diagnostic}");
 }
 
 /// Freeze every sandbox thread that could mutate execve argv before
@@ -331,64 +627,6 @@ pub(crate) fn freeze_sandbox_for_execve(
         peer_tids,
         pending_tids,
     })
-}
-
-/// Reap and detach tasks that were seized with a queued interrupt while in
-/// an uninterruptible kernel wait. Called strictly AFTER the execve
-/// response is sent: for the vfork parent the wait clears as soon as that
-/// execve resolves, so the queued interrupt fires promptly. Bounded so an
-/// unrelated long uninterruptible wait cannot stall the supervisor loop;
-/// on expiry the attachment is abandoned loudly rather than silently.
-pub(crate) fn reap_pending(pending: &[i32]) {
-    for &tid in pending {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let mut status: i32 = 0;
-            let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
-            if r == tid {
-                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                    break;
-                }
-                if libc::WIFSTOPPED(status) {
-                    detach(tid);
-                    break;
-                }
-            } else if r < 0 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EINTR) {
-                    break; // reaped elsewhere or gone
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                eprintln!(
-                    "sandlock: tid {tid} never left its kernel wait; \
-                     abandoning its ptrace attachment"
-                );
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-}
-
-/// Detach peer TIDs after the kernel has re-read execve argv. Errors
-/// are ignored: a peer that already exited returns ESRCH, which is
-/// harmless.
-pub(crate) fn detach_peers(peer_tids: &[i32]) {
-    for tid in peer_tids {
-        detach(*tid);
-    }
-}
-
-/// Detach every task in a freeze after execve was denied or the
-/// notification response could not be sent.
-pub(crate) fn detach_all(freeze: &SandboxFreeze) {
-    for tid in &freeze.sibling_tids {
-        detach(*tid);
-    }
-    for tid in &freeze.peer_tids {
-        detach(*tid);
-    }
 }
 
 /// Helper called from the dispatch hot path. Returns true if the
@@ -506,7 +744,67 @@ mod tests {
         );
 
         // Cleanup: detach the peer so it can resume and be killed.
-        detach_peers(&outcome.peer_tids);
+        detach_tids_checked(&outcome.peer_tids).expect("detach frozen peer");
+        let _ = peer.kill();
+        let _ = peer.wait();
+        let _ = caller.kill();
+        let _ = caller.wait();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pinned_exec_freeze_detaches_after_async_policy_handoff() {
+        use std::process::{Command, Stdio};
+
+        let mut caller = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn caller sleep");
+        let caller_tid = caller.id() as i32;
+        let mut peer = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn peer sleep");
+        let peer_pid = peer.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let processes = Arc::new(ProcessIndex::new());
+        processes
+            .register(peer_pid)
+            .expect("register peer in ProcessIndex");
+        let preparation = prepare_exec_freeze(Arc::clone(&processes), caller_tid)
+            .await
+            .expect("prepare pinned exec freeze");
+        assert!(preparation.failure.is_none(), "{:?}", preparation.failure);
+        assert_eq!(processes.active_exec_freezes(), 1);
+
+        let status = std::fs::read_to_string(format!("/proc/{peer_pid}/status"))
+            .expect("read frozen peer status");
+        let tracer = status
+            .lines()
+            .find_map(|line| line.strip_prefix("TracerPid:"))
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .unwrap_or_default();
+        assert!(tracer > 0, "peer must be owned by the pinned ptrace worker");
+
+        // Model the async policy callback boundary that used to let the
+        // notification future resume on a different Tokio worker.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        finish_exec_freeze(preparation.trace, false)
+            .await
+            .expect("finish pinned exec freeze");
+        assert_eq!(processes.active_exec_freezes(), 0);
+        let status = std::fs::read_to_string(format!("/proc/{peer_pid}/status"))
+            .expect("read detached peer status");
+        assert!(status.lines().any(|line| line == "TracerPid:\t0"), "{status}");
+
         let _ = peer.kill();
         let _ = peer.wait();
         let _ = caller.kill();
