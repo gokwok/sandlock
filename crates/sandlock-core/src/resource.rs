@@ -127,6 +127,23 @@ pub(crate) async fn handle_fork(
     // Enforce concurrent process limit.
     let limit = live_max.unwrap_or(rs.max_processes);
     if rs.proc_count >= limit {
+        // pidfd readiness and the parent's waitpid are independent wakeups.
+        // A parent can reap a short-lived child and immediately fork again
+        // before Tokio polls that child's pidfd watcher. Reconcile identities
+        // that /proc already proves dead before returning EAGAIN, so scheduling
+        // latency cannot masquerade as concurrent process pressure.
+        drop(rs);
+        for key in ctx.processes.dead_keys() {
+            crate::seccomp::notif::cleanup_pid_parts(
+                &ctx.processes,
+                &ctx.resource,
+                key,
+            )
+            .await;
+        }
+        rs = ctx.resource.lock().await;
+    }
+    if rs.proc_count >= limit {
         rs.process_limit_denials = rs.process_limit_denials.saturating_add(1);
         let denials = rs.process_limit_denials;
         // Log the first denial and then powers of two. A failing program may
@@ -530,7 +547,9 @@ fn emit_spawn_diagnostic(
         "processReservations": resource.map(|state| state.process_slots.len()),
         "trackedTasks": tracked_pids.len(),
         "executionGroupMembers": execution_group_members,
-        "activePtraceTrackers": ctx.processes.active_creation_traces(),
+        "activeCreationTraces": ctx.processes.active_creation_traces(),
+        "activeExecFreezes": ctx.processes.active_exec_freezes(),
+        "activePtraceTrackers": ctx.processes.active_ptrace_trackers(),
         "ptyCount": ptys.len(),
         "supervisorPid": std::process::id(),
         "supervisorFds": proc_entry_count("/proc/self/fd", false),
