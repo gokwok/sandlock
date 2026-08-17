@@ -129,17 +129,17 @@ pub(crate) async fn handle_fork(
     if rs.proc_count >= limit {
         rs.process_limit_denials = rs.process_limit_denials.saturating_add(1);
         let denials = rs.process_limit_denials;
-        let current = rs.proc_count;
-        let reservations = rs.process_slots.len();
         // Log the first denial and then powers of two. A failing program may
         // retry fork in a tight loop; this keeps the diagnostic visible
         // without allowing it to fill the supervisor log.
         if denials.is_power_of_two() {
-            let tracked_tasks = ctx.processes.len();
-            eprintln!(
-                "sandlock: process quota exhausted: caller_tid={} current={} limit={} \
-                 reservations={} tracked_tasks={} denials={}",
-                notif.pid, current, limit, reservations, tracked_tasks, denials
+            emit_spawn_diagnostic(
+                ctx,
+                notif.pid as i32,
+                "sandlock_process_quota",
+                EAGAIN,
+                Some(&rs),
+                Some(denials),
             );
         }
         return NotifAction::Errno(EAGAIN);
@@ -276,6 +276,7 @@ enum TraceCmd {
 pub(crate) struct ProcessCreationTrace {
     cmd_tx: std::sync::mpsc::SyncSender<TraceCmd>,
     join: Option<tokio::task::JoinHandle<io::Result<bool>>>,
+    diagnostic_ctx: Arc<SupervisorCtx>,
     /// The traced (forking) task's tid — `finish`'s watchdog signals it.
     caller_tid: i32,
     /// True once `finish`/`abort` has sent a command; gates the Drop fallback.
@@ -337,7 +338,7 @@ pub(crate) async fn prepare_process_creation_tracking(
     caller_tid: i32,
     process_slot: u64,
 ) -> io::Result<ProcessCreationTrace> {
-    let ctx = Arc::clone(ctx);
+    let worker_ctx = Arc::clone(ctx);
     // SEIZE result, reported back as an errno so `io::Error` need not cross
     // the channel (it is not `Clone`/`Send`-friendly to reconstruct).
     let (attached_tx, attached_rx) = tokio::sync::oneshot::channel::<Result<(), i32>>();
@@ -346,11 +347,17 @@ pub(crate) async fn prepare_process_creation_tracking(
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<TraceCmd>(1);
 
     let join = tokio::task::spawn_blocking(move || {
-        process_creation_worker(caller_tid, ctx, process_slot, attached_tx, cmd_rx)
+        process_creation_worker(caller_tid, worker_ctx, process_slot, attached_tx, cmd_rx)
     });
 
     match attached_rx.await {
-        Ok(Ok(())) => Ok(ProcessCreationTrace { cmd_tx, join: Some(join), caller_tid, signaled: false }),
+        Ok(Ok(())) => Ok(ProcessCreationTrace {
+            cmd_tx,
+            join: Some(join),
+            diagnostic_ctx: Arc::clone(ctx),
+            caller_tid,
+            signaled: false,
+        }),
         Ok(Err(errno)) => {
             let _ = join.await;
             Err(io::Error::from_raw_os_error(errno))
@@ -376,6 +383,8 @@ fn process_creation_worker(
     attached_tx: tokio::sync::oneshot::Sender<Result<(), i32>>,
     cmd_rx: std::sync::mpsc::Receiver<TraceCmd>,
 ) -> io::Result<bool> {
+    ctx.processes.creation_trace_started();
+    let _trace_activity = CreationTraceActivity(&ctx.processes);
     // SEIZE (does NOT stop the tracee) before `Continue`, so the child is born
     // traced/stopped once the fork runs. Because SEIZE itself never blocks on
     // a stop, it is safe against the seccomp-notify wait the tracee sits in.
@@ -408,14 +417,145 @@ fn process_creation_worker(
     result
 }
 
+struct CreationTraceActivity<'a>(&'a crate::seccomp::state::ProcessIndex);
+
+impl Drop for CreationTraceActivity<'_> {
+    fn drop(&mut self) {
+        self.0.creation_trace_finished();
+    }
+}
+
 fn detach_traced(tid: i32) {
     let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
 }
 
+fn ptrace_syscall_errno(tid: i32) -> Option<i32> {
+    let registers = crate::checkpoint::capture::ptrace_getregs(tid).ok()?;
+    #[cfg(target_arch = "x86_64")]
+    let result = *registers.get(10)? as i64;
+    #[cfg(target_arch = "aarch64")]
+    let result = *registers.first()? as i64;
+    #[cfg(target_arch = "riscv64")]
+    let result = *registers.get(10)? as i64;
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    return None;
+
+    if (-4095..=-1).contains(&result) {
+        i32::try_from(-result).ok()
+    } else {
+        None
+    }
+}
+
+fn task_stat(tid: i32) -> Option<(i32, i32, i64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{tid}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    let _state = fields.next()?;
+    let _parent = fields.next()?;
+    let process_group = fields.next()?.parse().ok()?;
+    let session = fields.next()?.parse().ok()?;
+    let tty = fields.next()?.parse().ok()?;
+    Some((process_group, session, tty))
+}
+
+fn proc_entry_count(path: &str, numeric_only: bool) -> Option<usize> {
+    let entries = std::fs::read_dir(path).ok()?;
+    Some(
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                !numeric_only
+                    || entry
+                        .file_name()
+                        .to_string_lossy()
+                        .chars()
+                        .all(|character| character.is_ascii_digit())
+            })
+            .count(),
+    )
+}
+
+fn emit_spawn_diagnostic(
+    ctx: &SupervisorCtx,
+    caller_tid: i32,
+    source: &str,
+    errno: i32,
+    resource: Option<&ResourceState>,
+    denials: Option<u64>,
+) {
+    let caller_tgid = read_tgid_of_tid(caller_tid);
+    let (caller_process_group, caller_session, caller_tty) = task_stat(caller_tid)
+        .map_or((None, None, None), |(group, session, tty)| {
+            (Some(group), Some(session), Some(tty))
+        });
+    let tracked_pids = ctx.processes.pids_snapshot();
+    let mut execution_group_members = 0_usize;
+    let mut ptys = std::collections::HashSet::new();
+    for pid in &tracked_pids {
+        if let Some((group, _, tty)) = task_stat(*pid) {
+            if Some(group) == caller_process_group {
+                execution_group_members += 1;
+            }
+            if tty != 0 {
+                ptys.insert(tty);
+            }
+        }
+    }
+    let errno_name = match errno {
+        libc::EAGAIN => Some("EAGAIN"),
+        libc::ENOMEM => Some("ENOMEM"),
+        libc::EPERM => Some("EPERM"),
+        libc::ETIMEDOUT => Some("ETIMEDOUT"),
+        _ => None,
+    };
+    let diagnostic = serde_json::json!({
+        "event": "spawn_denied",
+        "scope": "execution_domain",
+        "source": source,
+        "errno": errno,
+        "errnoName": errno_name,
+        "callerTid": caller_tid,
+        "callerTgid": caller_tgid,
+        "callerProcessGroup": caller_process_group,
+        "callerSession": caller_session,
+        "callerTty": caller_tty,
+        "currentProcesses": resource.map(|state| state.proc_count),
+        "peakProcesses": resource.map(|state| state.peak_proc_count),
+        "processLimit": resource.map(|state| state.max_processes),
+        "processReservations": resource.map(|state| state.process_slots.len()),
+        "trackedTasks": tracked_pids.len(),
+        "executionGroupMembers": execution_group_members,
+        "activePtraceTrackers": ctx.processes.active_creation_traces(),
+        "ptyCount": ptys.len(),
+        "supervisorPid": std::process::id(),
+        "supervisorFds": proc_entry_count("/proc/self/fd", false),
+        "supervisorThreads": proc_entry_count("/proc/self/task", false),
+        "hostProcesses": proc_entry_count("/proc", true),
+        "denials": denials,
+    });
+    eprintln!("sandlock: execution_domain_diagnostic {diagnostic}");
+}
+
 fn wait_for_ptrace_stop(tid: i32) -> io::Result<libc::c_int> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut status: libc::c_int = 0;
     loop {
-        let ret = unsafe { libc::waitpid(tid, &mut status, libc::__WALL) };
+        let ret = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+        if ret == 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("tid {tid} did not enter its ptrace birth-stop before the deadline"),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -507,6 +647,16 @@ fn run_creation_event_loop(
             // `finish`'s watchdog fired: the fork-like syscall created no child
             // (it returned without a fork event, e.g. EAGAIN/ENOMEM). Swallow
             // the wake signal — the worker detaches the tracee next.
+            let errno = ptrace_syscall_errno(caller_tid).unwrap_or(0);
+            let resource = ctx.resource.try_lock().ok();
+            emit_spawn_diagnostic(
+                ctx,
+                caller_tid,
+                "kernel_fork_result",
+                errno,
+                resource.as_deref(),
+                None,
+            );
             return Ok(false);
         }
 
@@ -560,10 +710,17 @@ fn handle_fork_event(
     child_registered_for_test(child_pid);
 
     // The child is born stopped under PTRACE_O_TRACEFORK; wait for its
-    // birth-stop, then detach so it can run. Result ignored: a racing exit is
-    // possible and detach is harmless either way. The caller (parent) is
-    // detached by `process_creation_worker`.
-    let _ = wait_for_ptrace_stop(child_pid);
+    // birth-stop, then detach so it can run. This wait must be bounded: an
+    // abandoned tracer would otherwise pin the child in `ptrace_stop`, retain
+    // its process quota slot, and wedge the execution-domain teardown.
+    if let Err(error) = wait_for_ptrace_stop(child_pid) {
+        let _ = unsafe { libc::kill(child_pid, libc::SIGKILL) };
+        detach_traced(child_pid);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("child pid {child_pid} ptrace birth-stop failed: {error}"),
+        ));
+    }
     detach_traced(child_pid);
     Ok(true)
 }
@@ -580,9 +737,11 @@ pub(crate) async fn finish_process_creation_tracking(
     /// delivered synchronously with the fork (sub-millisecond), so this only
     /// elapses for a fork that created no child (e.g. EAGAIN/ENOMEM).
     const FORK_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+    const TRACKER_TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
     trace.signaled = true;
     let caller_tid = trace.caller_tid;
+    let diagnostic_ctx = Arc::clone(&trace.diagnostic_ctx);
     // Send is non-blocking (capacity-1 channel, single sender) — the worker is
     // parked waiting to receive, then blocks in `waitpid` for the fork event.
     let _ = trace.cmd_tx.send(TraceCmd::Proceed);
@@ -599,7 +758,35 @@ pub(crate) async fn finish_process_creation_tracking(
         res = &mut join => res.map_err(join_err)?,
         _ = tokio::time::sleep(FORK_EVENT_DEADLINE) => {
             unsafe { libc::kill(caller_tid, FORK_WATCHDOG_SIGNAL); }
-            join.await.map_err(join_err)?
+            match tokio::time::timeout(TRACKER_TEARDOWN_DEADLINE, &mut join).await {
+                Ok(result) => result.map_err(join_err)?,
+                Err(_) => {
+                    // A tracker that cannot observe the watchdog must not hold
+                    // the notification loop or a tracee forever. Kill the
+                    // complete process group before abandoning the worker so a
+                    // late fork cannot escape accounting.
+                    if let Some((process_group, _, _)) = task_stat(caller_tid) {
+                        let _ = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+                    }
+                    let _ = unsafe { libc::kill(caller_tid, libc::SIGKILL) };
+                    let resource = diagnostic_ctx.resource.try_lock().ok();
+                    emit_spawn_diagnostic(
+                        &diagnostic_ctx,
+                        caller_tid,
+                        "ptrace_tracker_timeout",
+                        libc::ETIMEDOUT,
+                        resource.as_deref(),
+                        None,
+                    );
+                    return match tokio::time::timeout(TRACKER_TEARDOWN_DEADLINE, &mut join).await {
+                        Ok(result) => result.map_err(join_err)?,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("process-creation ptrace tracker for tid {caller_tid} did not terminate"),
+                        )),
+                    };
+                }
+            }
         }
     }
 }
@@ -1312,6 +1499,11 @@ mod tests {
             .block_on(finish_process_creation_tracking(trace))
             .expect("finish process-creation tracking");
         assert!(created, "fork/clone should produce a ptrace process-creation event");
+        assert_eq!(
+            ctx.processes.active_creation_traces(),
+            0,
+            "a completed creation tracker must release its diagnostic slot"
+        );
 
         let registered_pid = flags.read(REGISTERED_PID);
         assert!(registered_pid > 0, "child pid should be captured by hook");

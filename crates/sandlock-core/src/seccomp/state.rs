@@ -195,6 +195,8 @@ pub struct PerProcessState {
 /// deregister a recycled fd from epoll.
 pub struct ProcessIndex {
     inner: std::sync::RwLock<HashMap<i32, ProcessEntry>>,
+    /// Fork-like syscalls currently owned by a one-shot ptrace tracker.
+    active_creation_traces: std::sync::atomic::AtomicUsize,
 }
 
 /// A task's current directory as the sandbox believes it to be: the
@@ -227,7 +229,23 @@ impl ProcessIndex {
     pub fn new() -> Self {
         Self {
             inner: std::sync::RwLock::new(HashMap::new()),
+            active_creation_traces: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn creation_trace_started(&self) {
+        self.active_creation_traces
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn creation_trace_finished(&self) {
+        self.active_creation_traces
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn active_creation_traces(&self) -> usize {
+        self.active_creation_traces
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register a process by reading its start_time once and

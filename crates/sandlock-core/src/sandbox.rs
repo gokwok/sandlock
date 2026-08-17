@@ -1116,10 +1116,19 @@ impl Sandbox {
         // race the worker for fork events and hang it). Mirrors
         // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
         // pidfd is available (kernel without `pidfd_open`).
-        let exit_status = match self.rt_mut().pidfd.take() {
-            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
+        // Wait on a duplicate so cancellation never consumes the runtime's
+        // sole pidfd. A timeout around `wait()` must be able to kill the
+        // process group and retry this path without falling back to waitpid,
+        // which can steal a ptrace fork/exec stop from the notification
+        // supervisor and mistake that stop for terminal child exit.
+        let exit_status = match self.rt().pidfd.as_ref() {
+            Some(pidfd) => {
+                let duplicate = pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
+                wait_child_exit_via_pidfd(duplicate, pid).await
+            }
             None => wait_child_exit_blocking(pid).await,
         };
+        drop(self.rt_mut().pidfd.take());
 
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
 

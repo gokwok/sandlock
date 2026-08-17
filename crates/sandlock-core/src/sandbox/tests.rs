@@ -33,6 +33,45 @@ async fn shared_cow_checkpoint_waits_for_a_complete_notification_operation() {
     assert_eq!(snapshot.read_range("file", 0, 16).unwrap(), b"lower");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_wait_retains_pidfd_for_ptrace_safe_reap() {
+    let mut sandbox = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .max_processes(8)
+        .build()
+        .unwrap();
+    let process = sandbox
+        .popen(
+            &["/bin/sleep", "60"],
+            StdioMode::Null,
+            StdioMode::Null,
+            StdioMode::Null,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), process.wait())
+            .await
+            .is_err(),
+        "the initial wait must be cancelled while the process is alive"
+    );
+    assert!(
+        sandbox.rt().pidfd.is_some(),
+        "a cancelled wait must retain the original pidfd for a ptrace-safe retry"
+    );
+
+    sandbox.kill().unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), sandbox.wait())
+        .await
+        .expect("killed sandbox reap deadline")
+        .unwrap();
+    assert!(matches!(result.exit_status, crate::result::ExitStatus::Killed));
+}
+
 #[test]
 fn run_as_parses_uid_and_gid() {
     let r = RunAs::from_str("1000:2000").unwrap();
