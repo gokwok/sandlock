@@ -2,6 +2,19 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+#[test]
+fn vanished_proc_entries_are_not_cleanup_failures() {
+    assert!(process_lookup_disappeared(&std::io::Error::from_raw_os_error(
+        libc::ENOENT,
+    )));
+    assert!(process_lookup_disappeared(&std::io::Error::from_raw_os_error(
+        libc::ESRCH,
+    )));
+    assert!(!process_lookup_disappeared(&std::io::Error::from_raw_os_error(
+        libc::EACCES,
+    )));
+}
+
 #[tokio::test]
 async fn shared_cow_checkpoint_waits_for_a_complete_notification_operation() {
     let workdir = tempfile::tempdir().unwrap();

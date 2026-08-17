@@ -3332,23 +3332,36 @@ enum ProcessGroupState {
     Running,
 }
 
+fn process_lookup_disappeared(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
+}
+
 fn process_group_state(pgid: i32) -> std::io::Result<ProcessGroupState> {
     let mut found_live = false;
     for process in std::fs::read_dir("/proc")? {
-        let process = process?;
+        let process = match process {
+            Ok(process) => process,
+            Err(error) if process_lookup_disappeared(&error) => continue,
+            Err(error) => return Err(error),
+        };
         if process.file_name().to_string_lossy().parse::<i32>().is_err() {
             continue;
         }
         let tasks = match std::fs::read_dir(process.path().join("task")) {
             Ok(tasks) => tasks,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if process_lookup_disappeared(&error) => continue,
             Err(error) => return Err(error),
         };
         for task in tasks {
-            let task = task?;
+            let task = match task {
+                Ok(task) => task,
+                Err(error) if process_lookup_disappeared(&error) => continue,
+                Err(error) => return Err(error),
+            };
             let stat = match std::fs::read_to_string(task.path().join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if process_lookup_disappeared(&error) => continue,
                 Err(error) => return Err(error),
             };
             let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
