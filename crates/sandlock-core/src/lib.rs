@@ -46,8 +46,11 @@ pub use sandbox::{
     StdioMode,
 };
 pub use snapshot::{
-    FsSnapshot, FsSnapshotDescriptor, SnapshotChange, SnapshotChangeKind, SnapshotDiff,
-    SnapshotEntry, SnapshotEntryKind, SnapshotList,
+    FsSnapshot, FsSnapshotDescriptor, SnapshotChange, SnapshotChangeKind, SnapshotCompareLimits,
+    SnapshotCompareScope, SnapshotComparison, SnapshotDelta, SnapshotDeltaApplyMode,
+    SnapshotDeltaLimits, SnapshotDeltaPolicy, SnapshotDeltaSummary, SnapshotDiff, SnapshotEntry,
+    SnapshotEntryKind, SnapshotList, SnapshotMutation, SnapshotMutationLimits,
+    SnapshotRequirement,
 };
 pub use result::{RunResult, ExitStatus};
 pub use branch::{BranchInspection, BranchState, FsBranch, PendingBranch, PendingRunResult};

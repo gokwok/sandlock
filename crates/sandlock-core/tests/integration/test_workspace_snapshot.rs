@@ -556,6 +556,163 @@ async fn attached_checkpoint_captures_a_stopped_writer_boundary() {
 }
 
 #[tokio::test]
+async fn paused_attached_branch_applies_a_validated_snapshot_delta_before_resume() {
+    let source = tempfile::tempdir().unwrap();
+    let base_storage = tempfile::tempdir().unwrap();
+    let target_storage = tempfile::tempdir().unwrap();
+    let branch_storage = tempfile::tempdir().unwrap();
+    let validation_storage = tempfile::tempdir().unwrap();
+    let checkpoint_storage = tempfile::tempdir().unwrap();
+    let signal = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("value"), b"base").unwrap();
+    fs::write(source.path().join("deleted"), b"gone").unwrap();
+    let mut base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+    fs::write(source.path().join("value"), b"target").unwrap();
+    fs::remove_file(source.path().join("deleted")).unwrap();
+    fs::write(source.path().join("added"), b"new").unwrap();
+    let mut target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+    let delta = base
+        .delta_to(
+            &target,
+            sandlock_core::SnapshotDeltaLimits::default(),
+            &sandlock_core::SnapshotDeltaPolicy {
+                allow_symlinks: false,
+                protected_paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut sandbox = snapshot_sandbox(base.root_dir(), branch_storage.path(), Some(signal.path()));
+    let mut branch = sandbox.create_fs_branch_from_snapshot(&base).unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+    let command = format!(
+        "touch {1}/ready; while test ! -e {1}/continue; do sleep 0.01; done; \
+         test \"$(cat {0}/value)\" = target; \
+         test \"$(cat {0}/added)\" = new; \
+         test ! -e {0}/deleted; \
+         touch {1}/observed; while :; do sleep 1; done",
+        base.root_dir().display(),
+        signal.path().display(),
+    );
+    sandbox.spawn(&["sh", "-c", &command]).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !signal.path().join("ready").exists() {
+        assert!(tokio::time::Instant::now() < deadline, "writer never became ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let guard = sandbox
+        .pause_and_wait(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        guard
+            .apply_attached_fs_delta(
+                &delta,
+                &[],
+                sandlock_core::SnapshotCompareLimits::default(),
+                validation_storage.path(),
+            )
+            .await
+            .unwrap(),
+        delta.summary()
+    );
+    guard.resume().unwrap();
+    fs::write(signal.path().join("continue"), b"").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !signal.path().join("observed").exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resumed process did not observe the committed delta"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    sandbox.kill().unwrap();
+    sandbox.wait().await.unwrap();
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    let mut checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+    assert_eq!(checkpoint.read_range("value", 0, 16).unwrap(), b"target");
+    assert_eq!(checkpoint.read_range("added", 0, 16).unwrap(), b"new");
+    assert!(checkpoint.stat("deleted").is_err());
+    branch.abort().unwrap();
+    checkpoint.destroy().unwrap();
+    target.destroy().unwrap();
+    base.destroy().unwrap();
+}
+
+#[tokio::test]
+async fn paused_attached_delta_rejects_a_stale_declared_dependency_without_writing() {
+    let source = tempfile::tempdir().unwrap();
+    let base_storage = tempfile::tempdir().unwrap();
+    let target_storage = tempfile::tempdir().unwrap();
+    let branch_storage = tempfile::tempdir().unwrap();
+    let validation_storage = tempfile::tempdir().unwrap();
+    let checkpoint_storage = tempfile::tempdir().unwrap();
+    let signal = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("value"), b"base").unwrap();
+    fs::write(source.path().join("dependency"), b"base").unwrap();
+    let mut base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+    fs::write(source.path().join("value"), b"target").unwrap();
+    let mut target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+    let delta = base
+        .delta_to(
+            &target,
+            sandlock_core::SnapshotDeltaLimits::default(),
+            &sandlock_core::SnapshotDeltaPolicy::default(),
+        )
+        .unwrap();
+    let mut sandbox = snapshot_sandbox(base.root_dir(), branch_storage.path(), Some(signal.path()));
+    let mut branch = sandbox.create_fs_branch_from_snapshot(&base).unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+    let command = format!(
+        "printf stale > {0}/dependency; touch {1}/ready; while :; do sleep 1; done",
+        base.root_dir().display(),
+        signal.path().display(),
+    );
+    sandbox.spawn(&["sh", "-c", &command]).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !signal.path().join("ready").exists() {
+        assert!(tokio::time::Instant::now() < deadline, "writer never became ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let guard = sandbox
+        .pause_and_wait(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let error = guard
+        .apply_attached_fs_delta(
+            &delta,
+            &[sandlock_core::SnapshotRequirement {
+                path: "dependency".into(),
+                scope: sandlock_core::SnapshotCompareScope::Content,
+            }],
+            sandlock_core::SnapshotCompareLimits::default(),
+            validation_storage.path(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::Branch(
+            BranchError::Snapshot(SnapshotError::DeltaConflict { .. })
+        ))
+    ));
+    guard.resume().unwrap();
+
+    sandbox.kill().unwrap();
+    sandbox.wait().await.unwrap();
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    let mut checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+    assert_eq!(checkpoint.read_range("value", 0, 16).unwrap(), b"base");
+    assert_eq!(checkpoint.read_range("dependency", 0, 16).unwrap(), b"stale");
+    branch.abort().unwrap();
+    checkpoint.destroy().unwrap();
+    target.destroy().unwrap();
+    base.destroy().unwrap();
+}
+
+#[tokio::test]
 async fn attached_checkpoint_stays_quiescent_with_cpu_throttling() {
     let source = tempfile::tempdir().unwrap();
     let snapshot_storage = tempfile::tempdir().unwrap();

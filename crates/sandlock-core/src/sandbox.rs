@@ -369,6 +369,49 @@ impl SharedCow {
         let branch = state.branch.as_ref().ok_or(crate::error::BranchError::Unavailable)?;
         branch.checkpoint(snapshot_storage)
     }
+
+    async fn validate_and_apply_snapshot_delta(
+        &self,
+        delta: &crate::snapshot::SnapshotDelta<'_>,
+        requirements: &[crate::snapshot::SnapshotRequirement],
+        compare_limits: crate::snapshot::SnapshotCompareLimits,
+        validation_storage: &std::path::Path,
+    ) -> Result<crate::snapshot::SnapshotDeltaSummary, crate::error::BranchError> {
+        let operation_gate = {
+            let state = self.state.lock().await;
+            std::sync::Arc::clone(&state.operation_gate)
+        };
+        // Keep the exclusive branch-operation gate across checkpoint, CAS validation, and upper
+        // mutation. A paused process cannot start new work, and draining this gate closes handler
+        // copy-up that began before the pause became observable.
+        let _quiesced = operation_gate.write_owned().await;
+        let mut state = self.state.lock().await;
+        let branch = state
+            .branch
+            .as_mut()
+            .ok_or(crate::error::BranchError::Unavailable)?;
+        let mut current = branch.checkpoint(validation_storage)?;
+        if let Err(error) =
+            delta.validate_snapshot(&current, crate::snapshot::SnapshotDeltaApplyMode::Initial)
+        {
+            let _ = current.destroy();
+            return Err(crate::error::BranchError::Snapshot(error));
+        }
+        let comparison = delta
+            .base
+            .compare_requirements(&current, requirements, compare_limits)
+            .map_err(crate::error::BranchError::Snapshot)?;
+        if !comparison.matched {
+            let _ = current.destroy();
+            return Err(crate::error::BranchError::Snapshot(
+                crate::error::SnapshotError::DeltaConflict { count: 1 },
+            ));
+        }
+        current
+            .destroy()
+            .map_err(crate::error::BranchError::Snapshot)?;
+        branch.apply_snapshot_delta(delta)
+    }
 }
 
 /// Lifecycle state for the runtime.
@@ -752,6 +795,43 @@ impl PauseGuard<'_> {
         // The process group is stopped, so once existing handlers drain no
         // new branch operation can begin.
         shared.checkpoint(snapshot_storage.as_ref()).await
+            .map_err(SandboxRuntimeError::Branch)
+            .map_err(Into::into)
+    }
+
+    /// Validate and apply a BASE-to-TARGET snapshot delta to the paused attached branch.
+    ///
+    /// The complete managed process group remains stopped. The current merged branch view is
+    /// checkpointed into `validation_storage`, compared with the delta base and declared
+    /// requirements, and only then is the delta written into the existing upper/whiteout state.
+    /// The branch remains attached and this guard decides when execution resumes.
+    pub async fn apply_attached_fs_delta(
+        &self,
+        delta: &crate::snapshot::SnapshotDelta<'_>,
+        requirements: &[crate::snapshot::SnapshotRequirement],
+        compare_limits: crate::snapshot::SnapshotCompareLimits,
+        validation_storage: impl AsRef<std::path::Path>,
+    ) -> Result<crate::snapshot::SnapshotDeltaSummary, crate::error::SandlockError> {
+        use crate::error::{BranchError, SandboxRuntimeError};
+
+        if !self.active {
+            return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+        }
+        let runtime = self.sandbox.runtime.as_ref()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        if !runtime.attached_execution || !matches!(runtime.state, RuntimeState::Paused) {
+            return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
+        }
+        let shared = runtime.shared_cow.clone()
+            .ok_or(SandboxRuntimeError::Branch(BranchError::Unavailable))?;
+        shared
+            .validate_and_apply_snapshot_delta(
+                delta,
+                requirements,
+                compare_limits,
+                validation_storage.as_ref(),
+            )
+            .await
             .map_err(SandboxRuntimeError::Branch)
             .map_err(Into::into)
     }

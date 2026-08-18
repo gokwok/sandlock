@@ -34,6 +34,24 @@ pub enum SnapshotError {
     #[error("snapshot inspection budget was exceeded: {0}")]
     LimitExceeded(String),
 
+    #[error("snapshot delta conflicts with {count} destination path(s)")]
+    DeltaConflict { count: usize },
+
+    #[error("snapshot delta apply was deferred: {0}")]
+    DeltaDeferred(String),
+
+    #[error("snapshot delta was rejected at {path}: {reason}")]
+    DeltaRejected {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+
+    #[error("snapshot delta apply started but did not complete: {message}")]
+    DeltaApplyIncomplete {
+        applied_paths: Option<usize>,
+        message: String,
+    },
+
     #[error("snapshot was published but durability could not be confirmed: {message}")]
     Published {
         descriptor: Box<crate::snapshot::FsSnapshotDescriptor>,

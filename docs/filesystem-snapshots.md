@@ -153,6 +153,69 @@ instead of presenting the operation as side-effect free.
 Likewise, snapshot deletion returns `SnapshotError::Destroyed` if the tree was
 removed but the parent-directory durability barrier could not be confirmed.
 
+## Typed derivation
+
+`FsSnapshot::derive` applies an ordered, bounded `SnapshotMutation` batch to a
+private copy of the immutable base and publishes a new snapshot through the
+same durability boundary as capture/checkpoint. The base never changes.
+
+Supported mutations are regular-file put/remove and directory make/remove.
+Regular-file payloads are trusted controller files opened without following
+their final symlink and checked for replacement while copied. Mutation count,
+aggregate payload bytes, relative paths, modes, duplicate targets, symlink
+parents and entry types are validated before publication. This API does not
+assign application revision identity or provide a payload upload protocol.
+
+## Scoped comparison
+
+`FsSnapshot::compare_requirements` compares two immutable trees under bounded
+generic filesystem scopes:
+
+- `Content`: exact state of one path;
+- `Entries`: immediate child names and kinds;
+- `TreeEntries`: recursive descendant names and kinds;
+- `TreeContent`: recursive exact kinds, modes, symlink targets and file bytes.
+
+The caller supplies dependencies. Sandlock does not infer tool reads, ignore
+files, query semantics or application cache keys. Requirements, scanned entries,
+path bytes and compared content bytes all have explicit caller limits.
+
+## Snapshot delta
+
+`FsSnapshot::delta_to` prepares a complete bounded BASE-to-TARGET
+`SnapshotDelta`. It rejects a delta that exceeds changed-path/replacement-byte
+limits, overlaps caller-supplied protected paths, or contains symlinks when the
+selected generic policy disables them.
+
+`SnapshotDelta::apply_to_directory` takes the same per-workdir commit lock used
+by ordinary COW commits, validates every changed destination path against BASE,
+and then applies only those paths. Unrelated destination changes are preserved.
+`Initial` mode rejects conflicts before writing; `Resume` accepts paths already
+equal to TARGET and converges an earlier partial application.
+
+The operation is not a cross-path atomic filesystem transaction. Each file
+replacement is atomic, but an I/O failure after the first mutation returns
+`SnapshotError::DeltaApplyIncomplete`. A durable controller must keep the
+destination quiescent, persist its own operation journal, and retry the same
+BASE/TARGET delta with `Resume` before allowing its managed writer to continue.
+Sandlock keeps no application operation registry or daemon.
+
+## Paused attached branch delta
+
+`PauseGuard::apply_attached_fs_delta` keeps the managed process group stopped
+and holds the branch operation gate across three steps:
+
+1. checkpoint the current attached merged view into caller-owned validation
+   storage;
+2. validate changed paths and generic declared requirements against BASE;
+3. write the delta into the existing upper/whiteout state without detaching or
+   replacing the branch.
+
+The temporary validation snapshot is destroyed before the method returns. The
+guard still owns resume/kill. A failed upper mutation can leave a partial but
+checkpointable branch; the controller must retain the stopped boundary and
+derive a remainder delta during recovery.
+
 ## Filesystem fidelity in the first implementation
 
 The first implementation preserves regular-file bytes, directory structure,

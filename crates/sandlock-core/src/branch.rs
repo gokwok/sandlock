@@ -189,6 +189,18 @@ impl FsBranch {
         self.pending()?.checkpoint(snapshot_storage.as_ref())
     }
 
+    /// Apply a validated immutable snapshot delta to this pending branch.
+    ///
+    /// The delta is written into the existing upper and whiteout state. The branch stays pending
+    /// and may be checkpointed or used by later sandbox runs. Callers must first validate the
+    /// branch's quiescent merged view against the delta base.
+    pub fn apply_snapshot_delta(
+        &mut self,
+        delta: &crate::snapshot::SnapshotDelta<'_>,
+    ) -> Result<crate::snapshot::SnapshotDeltaSummary, BranchError> {
+        self.pending_mut()?.apply_snapshot_delta(delta)
+    }
+
     /// Whether this branch uses an immutable snapshot as its lower.
     pub fn is_snapshot_backed(&self) -> bool {
         self.inner
@@ -776,5 +788,45 @@ mod tests {
         let preserved = branch.persist().unwrap();
         let mut reopened = FsBranch::reopen(preserved).unwrap();
         reopened.abort().unwrap();
+    }
+
+    #[test]
+    fn snapshot_delta_updates_a_pending_snapshot_branch_without_resolving_it() {
+        let source = tempfile::tempdir().unwrap();
+        let base_storage = tempfile::tempdir().unwrap();
+        let target_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        let checkpoint_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("value"), b"base").unwrap();
+        fs::write(source.path().join("deleted"), b"gone").unwrap();
+        let mut base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+        fs::write(source.path().join("value"), b"target").unwrap();
+        fs::remove_file(source.path().join("deleted")).unwrap();
+        fs::write(source.path().join("added"), b"new").unwrap();
+        let mut target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+        let delta = base
+            .delta_to(
+                &target,
+                crate::snapshot::SnapshotDeltaLimits::default(),
+                &crate::snapshot::SnapshotDeltaPolicy {
+                    allow_symlinks: false,
+                    protected_paths: Vec::new(),
+                },
+            )
+            .unwrap();
+        let mut branch = FsBranch::from_snapshot(&base, branch_storage.path()).unwrap();
+
+        assert_eq!(branch.apply_snapshot_delta(&delta).unwrap(), delta.summary());
+        assert_eq!(branch.state(), BranchState::Pending);
+        let mut checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+        assert_eq!(checkpoint.read_range("value", 0, 16).unwrap(), b"target");
+        assert_eq!(checkpoint.read_range("added", 0, 16).unwrap(), b"new");
+        assert!(checkpoint.stat("deleted").is_err());
+        assert_eq!(base.read_range("value", 0, 16).unwrap(), b"base");
+
+        branch.abort().unwrap();
+        checkpoint.destroy().unwrap();
+        target.destroy().unwrap();
+        base.destroy().unwrap();
     }
 }

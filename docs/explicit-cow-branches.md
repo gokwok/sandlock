@@ -230,6 +230,13 @@ PTY lifecycle APIs. After the process has stopped,
 changes. The caller must recover that handle before reusing the sandbox.
 The source handle reports `BranchState::Attached` during this interval.
 
+While a public `PauseGuard` holds the complete execution domain stopped,
+`apply_attached_fs_delta` can checkpoint and validate the merged view, then
+apply a bounded immutable snapshot delta to the same upper/whiteout state. It
+does not commit the snapshot-backed branch into its immutable lower and does
+not detach it. Generic read dependencies may be supplied so their comparison
+and changed-path CAS share the same paused branch-operation boundary.
+
 An on-disk `Attached` marker is an ownership warning, not a recoverable
 handoff. A controller must not reopen, apply, or remove it merely because the
 recorded PID exited: sandbox descendants can outlive that process and retain

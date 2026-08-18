@@ -1400,6 +1400,254 @@ impl SeccompCowBranch {
         }
     }
 
+    /// Apply an already validated immutable snapshot delta to this branch's merged view.
+    ///
+    /// The caller must hold the branch operation gate and keep every process using the branch
+    /// stopped. Changes are written only to the existing upper/whiteout state; the lower remains
+    /// immutable and the branch stays open. A failure may leave a partial upper, which remains
+    /// recoverable through checkpoint plus a newly prepared remainder delta.
+    pub(crate) fn apply_snapshot_delta(
+        &mut self,
+        delta: &crate::snapshot::SnapshotDelta<'_>,
+    ) -> Result<crate::snapshot::SnapshotDeltaSummary, BranchError> {
+        if !matches!(
+            self.state,
+            BranchState::Open
+                | BranchState::Preserved(PreserveReason::CommitDeferred)
+                | BranchState::Preserved(PreserveReason::Attached)
+        ) {
+            return Err(BranchError::AlreadyResolved);
+        }
+        let directory_bytes = delta
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.after.as_ref().is_some_and(|after| {
+                    after.kind == crate::snapshot::SnapshotEntryKind::Directory
+                })
+            })
+            .count()
+            .saturating_mul(4096);
+        let additional = delta
+            .summary()
+            .changed_bytes
+            .saturating_add(u64::try_from(directory_bytes).unwrap_or(u64::MAX));
+        self.check_quota(additional)?;
+
+        let result = (|| {
+
+        let mut removals = delta
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.before.is_some()
+                    && entry.after.as_ref().is_none_or(|after| {
+                        entry
+                            .before
+                            .as_ref()
+                            .is_some_and(|before| before.kind != after.kind)
+                    })
+            })
+            .collect::<Vec<_>>();
+        removals.sort_by(|left, right| {
+            right
+                .change
+                .path
+                .components()
+                .count()
+                .cmp(&left.change.path.components().count())
+        });
+        for entry in removals {
+            let before = entry.before.as_ref().expect("removal has a base entry");
+            let path = self.workdir.join(&entry.change.path);
+            let path = path.to_str().ok_or_else(|| {
+                BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                    entry.change.path.display().to_string(),
+                ))
+            })?;
+            let removed = self
+                .handle_unlink(
+                    path,
+                    before.kind == crate::snapshot::SnapshotEntryKind::Directory,
+                )
+                .map_err(|errno| {
+                    BranchError::Operation(format!(
+                        "apply snapshot delta removal {}: {}",
+                        entry.change.path.display(),
+                        std::io::Error::from_raw_os_error(errno)
+                    ))
+                })?;
+            if !removed {
+                return Err(BranchError::Operation(format!(
+                    "snapshot delta removal escaped branch: {}",
+                    entry.change.path.display()
+                )));
+            }
+        }
+
+        let mut directories = delta
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.after.as_ref().is_some_and(|after| {
+                    after.kind == crate::snapshot::SnapshotEntryKind::Directory
+                }) && entry.before.as_ref().is_none_or(|before| {
+                    before.kind != crate::snapshot::SnapshotEntryKind::Directory
+                })
+            })
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|entry| entry.change.path.components().count());
+        for entry in directories {
+            let after = entry.after.as_ref().expect("directory has a target entry");
+            let path = self.workdir.join(&entry.change.path);
+            let path = path.to_str().ok_or_else(|| {
+                BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                    entry.change.path.display().to_string(),
+                ))
+            })?;
+            if !self.handle_mkdir(path, after.mode)? {
+                return Err(BranchError::Operation(format!(
+                    "apply snapshot delta directory {}",
+                    entry.change.path.display()
+                )));
+            }
+        }
+
+        for entry in delta.entries.iter().filter(|entry| {
+            entry.after.as_ref().is_some_and(|after| {
+                after.kind != crate::snapshot::SnapshotEntryKind::Directory
+            }) && entry.change.kind != crate::snapshot::SnapshotChangeKind::Deleted
+        }) {
+            let after = entry.after.as_ref().expect("put has a target entry");
+            self.put_snapshot_delta_entry(delta.target, after)?;
+        }
+
+        let mut directory_modes = delta
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry.after.as_ref().filter(|after| {
+                    after.kind == crate::snapshot::SnapshotEntryKind::Directory
+                })
+            })
+            .collect::<Vec<_>>();
+        directory_modes.sort_by(|left, right| {
+            right
+                .path
+                .components()
+                .count()
+                .cmp(&left.path.components().count())
+        });
+        for after in directory_modes {
+            let rel = after.path.to_str().ok_or_else(|| {
+                BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                    after.path.display().to_string(),
+                ))
+            })?;
+            let upper = self.ensure_cow_copy(rel)?;
+            crate::sys::fs::chmod_in_root(&self.upper, rel, after.mode).map_err(|errno| {
+                BranchError::Operation(format!(
+                    "set snapshot delta directory mode {}: {}",
+                    after.path.display(),
+                    std::io::Error::from_raw_os_error(errno)
+                ))
+            })?;
+            debug_assert!(upper.starts_with(&self.upper));
+            self.directory_modes.insert(rel.to_string(), after.mode);
+        }
+        self.recalc_disk_used();
+        self.sync_upper_tree()?;
+        Ok(delta.summary())
+        })();
+        result.map_err(|error: BranchError| {
+            BranchError::Snapshot(crate::error::SnapshotError::DeltaApplyIncomplete {
+                applied_paths: None,
+                message: error.to_string(),
+            })
+        })
+    }
+
+    fn put_snapshot_delta_entry(
+        &mut self,
+        target: &crate::snapshot::FsSnapshot,
+        entry: &crate::snapshot::SnapshotEntry,
+    ) -> Result<(), BranchError> {
+        let rel = entry.path.to_str().ok_or_else(|| {
+            BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                entry.path.display().to_string(),
+            ))
+        })?;
+        self.record_base(rel);
+        if let Some(parent) = parent_rel(rel) {
+            crate::sys::fs::mkdirp_in_root(&self.upper, parent, 0o700).map_err(|errno| {
+                BranchError::Operation(format!(
+                    "create snapshot delta upper parent: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ))
+            })?;
+        }
+        match crate::sys::fs::statat_in_root(&self.upper, rel, false) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => {
+                crate::sys::fs::remove_dir_all_in_root(&self.upper, rel).map_err(|errno| {
+                    BranchError::Operation(format!(
+                        "replace snapshot delta upper directory: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    ))
+                })?;
+            }
+            Ok(_) => {
+                crate::sys::fs::unlinkat_in_root(&self.upper, rel, false).map_err(|errno| {
+                    BranchError::Operation(format!(
+                        "replace snapshot delta upper entry: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    ))
+                })?;
+            }
+            Err(libc::ENOENT) => {}
+            Err(errno) => {
+                return Err(BranchError::Operation(format!(
+                    "inspect snapshot delta upper entry: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                )));
+            }
+        }
+        let upper = self.upper.join(rel);
+        match entry.kind {
+            crate::snapshot::SnapshotEntryKind::File => {
+                crate::snapshot::copy_regular_file(
+                    &target.root_dir().join(&entry.path),
+                    &upper,
+                    entry.mode,
+                )
+                .map_err(BranchError::Snapshot)?;
+            }
+            crate::snapshot::SnapshotEntryKind::Symlink => {
+                let target = entry.symlink_target.as_ref().ok_or_else(|| {
+                    BranchError::Operation("snapshot delta symlink target is missing".to_string())
+                })?;
+                crate::sys::fs::symlinkat_in_root(
+                    &self.upper,
+                    rel,
+                    &target.to_string_lossy(),
+                )
+                .map_err(|errno| {
+                    BranchError::Operation(format!(
+                        "create snapshot delta symlink: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    ))
+                })?;
+            }
+            crate::snapshot::SnapshotEntryKind::Directory => {
+                return Err(BranchError::Operation(
+                    "directory passed to snapshot delta entry writer".to_string(),
+                ));
+            }
+        }
+        self.has_changes = true;
+        self.forget_directory_modes_under(rel);
+        Ok(())
+    }
+
     /// The workdir as a string (for fast prefix matching).
     pub fn workdir_str(&self) -> &str {
         &self.workdir_str

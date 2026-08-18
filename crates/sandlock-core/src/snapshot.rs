@@ -16,6 +16,22 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+#[path = "snapshot/compare.rs"]
+mod compare;
+#[path = "snapshot/delta.rs"]
+mod delta;
+#[path = "snapshot/mutation.rs"]
+mod mutation;
+
+pub use compare::{
+    SnapshotCompareLimits, SnapshotCompareScope, SnapshotComparison, SnapshotRequirement,
+};
+pub use delta::{
+    SnapshotDelta, SnapshotDeltaApplyMode, SnapshotDeltaLimits, SnapshotDeltaPolicy,
+    SnapshotDeltaSummary,
+};
+pub use mutation::{SnapshotMutation, SnapshotMutationLimits};
+
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_METADATA: &str = "SNAPSHOT.json";
 const SNAPSHOT_DIRECTORY_MODES: &str = "DIRECTORY_MODES.json";
@@ -1423,7 +1439,11 @@ fn read_backend_directory_modes(
     Ok(Some(modes))
 }
 
-fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<(), SnapshotError> {
+pub(crate) fn copy_regular_file(
+    source: &Path,
+    destination: &Path,
+    mode: u32,
+) -> Result<(), SnapshotError> {
     let before = fs::symlink_metadata(source)
         .map_err(|error| operation("inspect source file before copy", error))?;
     let mut input = fs::OpenOptions::new()
