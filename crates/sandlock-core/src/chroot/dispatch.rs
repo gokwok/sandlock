@@ -651,6 +651,23 @@ pub(crate) async fn handle_chroot_open(
         return NotifAction::Errno(libc::EACCES);
     }
 
+    // An identity root has no namespace translation outside explicit mounts.
+    // After the deny/read/write checks above, letting the kernel perform the
+    // original open preserves its exact dynamic-loader and open-file semantics
+    // and avoids routing every host executable/shared-library read through
+    // seccomp ADDFD. Mounted paths must still be opened on-behalf so their
+    // virtual target resolves to the configured snapshot/COW source.
+    let cow_managed = {
+        let state = cow_state.lock().await;
+        state
+            .branch
+            .as_ref()
+            .is_some_and(|cow| cow.matches(&host_path.to_string_lossy()))
+    };
+    if identity_root_passthrough(ctx, &virtual_path) && !cow_managed {
+        return NotifAction::Continue;
+    }
+
     // COW path — COW operates on host paths, must use libc::open.
     {
         let mut cs = cow_state.lock().await;
@@ -731,6 +748,10 @@ pub(crate) async fn handle_chroot_open(
         Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
         Err(errno) => NotifAction::Errno(errno),
     }
+}
+
+fn identity_root_passthrough(ctx: &ChrootCtx<'_>, virtual_path: &Path) -> bool {
+    ctx.root == Path::new("/") && ctx.mount_target(virtual_path).is_none()
 }
 
 /// Open `virtual_path` within the child's virtual namespace, returning an fd to
@@ -2605,7 +2626,7 @@ mod self_rewrite_tests {
 
 #[cfg(test)]
 mod mount_ro_tests {
-    use super::{ChrootCtx, ProcessIndex};
+    use super::{identity_root_passthrough, ChrootCtx, ProcessIndex};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -2649,5 +2670,45 @@ mod mount_ro_tests {
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
+    }
+
+    #[test]
+    fn identity_root_bypasses_fd_injection_only_outside_mounts() {
+        let mounts = vec![(
+            PathBuf::from("/workspace"),
+            PathBuf::from("/snapshot/tree"),
+        )];
+        let processes = Arc::new(ProcessIndex::new());
+        let identity = ChrootCtx {
+            root: Path::new("/"),
+            readable: &[PathBuf::from("/usr"), PathBuf::from("/lib")],
+            writable: &[],
+            denied: &[],
+            mounts: &mounts,
+            mount_ro: &[],
+            processes: &processes,
+        };
+        assert!(identity_root_passthrough(
+            &identity,
+            Path::new("/lib/aarch64-linux-gnu/libc.so.6")
+        ));
+        assert!(!identity_root_passthrough(
+            &identity,
+            Path::new("/workspace/value")
+        ));
+
+        let rooted = ChrootCtx {
+            root: Path::new("/rootfs"),
+            readable: &[],
+            writable: &[],
+            denied: &[],
+            mounts: &[],
+            mount_ro: &[],
+            processes: &processes,
+        };
+        assert!(!identity_root_passthrough(
+            &rooted,
+            Path::new("/lib/libc.so.6")
+        ));
     }
 }
