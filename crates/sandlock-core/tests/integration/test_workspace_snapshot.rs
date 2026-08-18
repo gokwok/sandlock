@@ -713,6 +713,29 @@ async fn paused_attached_delta_rejects_a_stale_declared_dependency_without_writi
 }
 
 #[tokio::test]
+async fn paused_attached_guard_can_kill_without_resuming_user_code() {
+    let source = tempfile::tempdir().unwrap();
+    let snapshot_storage = tempfile::tempdir().unwrap();
+    let branch_storage = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("value"), b"base").unwrap();
+    let mut base = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+    let mut sandbox = snapshot_sandbox(base.root_dir(), branch_storage.path(), None);
+    let mut branch = sandbox.create_fs_branch_from_snapshot(&base).unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+    sandbox.spawn(&["sh", "-c", "while :; do sleep 1; done"]).await.unwrap();
+
+    let guard = sandbox
+        .pause_and_wait(Duration::from_secs(5))
+        .await
+        .unwrap();
+    guard.kill().unwrap();
+    sandbox.wait().await.unwrap();
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    branch.abort().unwrap();
+    base.destroy().unwrap();
+}
+
+#[tokio::test]
 async fn attached_checkpoint_stays_quiescent_with_cpu_throttling() {
     let source = tempfile::tempdir().unwrap();
     let snapshot_storage = tempfile::tempdir().unwrap();

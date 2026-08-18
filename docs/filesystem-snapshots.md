@@ -212,7 +212,7 @@ and holds the branch operation gate across three steps:
    replacing the branch.
 
 The temporary validation snapshot is destroyed before the method returns. The
-guard still owns resume/kill. A failed upper mutation can leave a partial but
+guard still owns `resume` or a kill that never briefly resumes user code. A failed upper mutation can leave a partial but
 checkpointable branch; the controller must retain the stopped boundary and
 derive a remainder delta during recovery.
 

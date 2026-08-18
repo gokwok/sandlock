@@ -843,6 +843,14 @@ impl PauseGuard<'_> {
         Ok(())
     }
 
+    /// Kill the stopped execution domain without briefly resuming user code.
+    pub fn kill(mut self) -> Result<(), crate::error::SandlockError> {
+        self.sandbox.kill()?;
+        self.restart_throttle = false;
+        self.active = false;
+        Ok(())
+    }
+
     fn resume_inner(&mut self) -> Result<(), crate::error::SandlockError> {
         self.sandbox.resume()?;
         if self.restart_throttle {
