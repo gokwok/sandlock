@@ -3,7 +3,8 @@
 use super::{
     compare_entry, copy_regular_file, files_equal, inventory_bounded_with_modes,
     normalize_relative, operation, snapshot_entry, sync_directory, validate_plain_directory,
-    EntryStamp, FsSnapshot, SnapshotChange, SnapshotChangeKind, SnapshotEntry, SnapshotEntryKind,
+    EntryStamp, FsSnapshot, SnapshotChange, SnapshotChangeKind, SnapshotCompareLimits,
+    SnapshotEntry, SnapshotEntryKind, SnapshotRequirement,
 };
 use crate::cow::seccomp::{acquire_commit_lock_polling, LockFailure};
 use crate::error::SnapshotError;
@@ -217,6 +218,48 @@ impl SnapshotDelta<'_> {
         mode: SnapshotDeltaApplyMode,
         lock_wait: Duration,
     ) -> Result<SnapshotDeltaSummary, SnapshotError> {
+        self.apply_to_directory_with_requirements(
+            destination,
+            mode,
+            &[],
+            SnapshotCompareLimits::default(),
+            lock_wait,
+        )
+    }
+
+    /// Validate declared dependencies and apply this delta under one destination commit lock.
+    ///
+    /// Initial mode requires every dependency to match BASE before the first write. Resume mode
+    /// accepts BASE or TARGET dependency state so an interrupted apply can converge. After apply,
+    /// every dependency must match TARGET; a mismatch after any mutation is reported as
+    /// `DeltaApplyIncomplete` so the caller keeps its writer fence and recovery marker.
+    pub fn apply_to_directory_with_requirements(
+        &self,
+        destination: impl AsRef<Path>,
+        mode: SnapshotDeltaApplyMode,
+        requirements: &[SnapshotRequirement],
+        compare_limits: SnapshotCompareLimits,
+        lock_wait: Duration,
+    ) -> Result<SnapshotDeltaSummary, SnapshotError> {
+        self.apply_to_directory_inner(
+            destination.as_ref(),
+            mode,
+            requirements,
+            compare_limits,
+            lock_wait,
+            || {},
+        )
+    }
+
+    fn apply_to_directory_inner(
+        &self,
+        destination: &Path,
+        mode: SnapshotDeltaApplyMode,
+        requirements: &[SnapshotRequirement],
+        compare_limits: SnapshotCompareLimits,
+        lock_wait: Duration,
+        before_apply: impl FnOnce(),
+    ) -> Result<SnapshotDeltaSummary, SnapshotError> {
         let destination = destination.as_ref();
         validate_plain_directory(destination, "snapshot delta destination")?;
         let _lock = acquire_commit_lock_polling(destination, lock_wait, std::thread::sleep)
@@ -226,6 +269,24 @@ impl SnapshotDelta<'_> {
                 )),
                 LockFailure::Io(error) => operation("lock snapshot delta destination", error),
             })?;
+        let dependencies_match = if mode == SnapshotDeltaApplyMode::Resume {
+            self.base
+                .compare_directory_requirements_allowing(
+                    self.target,
+                    destination,
+                    requirements,
+                    compare_limits,
+                )?
+                .matched
+        } else {
+            self.base
+                .compare_directory_requirements(destination, requirements, compare_limits)?
+                .matched
+        };
+        if !dependencies_match {
+            return Err(SnapshotError::DeltaConflict { count: 1 });
+        }
+        before_apply();
         let destination_modes = None;
         let inventory = inventory_bounded_with_modes(
             destination,
@@ -263,6 +324,21 @@ impl SnapshotDelta<'_> {
                 applied_paths: Some(applied_paths),
                 message: format!("target verification found {conflicts} conflicting path(s)"),
             });
+        }
+        let target_dependencies = self.target.compare_directory_requirements(
+            destination,
+            requirements,
+            compare_limits,
+        )?;
+        if !target_dependencies.matched {
+            return if applied_paths == 0 {
+                Err(SnapshotError::DeltaConflict { count: 1 })
+            } else {
+                Err(SnapshotError::DeltaApplyIncomplete {
+                    applied_paths: Some(applied_paths),
+                    message: "dependency changed while applying snapshot delta".to_string(),
+                })
+            };
         }
         sync_directory(destination)?;
         Ok(self.summary)
@@ -942,5 +1018,127 @@ mod tests {
         ));
         assert_eq!(fs::read(workspace.join("modify")).unwrap(), b"base");
         assert!(workspace.join("delete").exists());
+    }
+
+    #[test]
+    fn dependency_conflict_is_checked_under_the_delta_lock_before_writing() {
+        let source = tempfile::tempdir().unwrap();
+        let base_storage = tempfile::tempdir().unwrap();
+        let target_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("dependency"), b"base").unwrap();
+        fs::write(source.path().join("output"), b"base").unwrap();
+        let base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+        fs::write(source.path().join("output"), b"target").unwrap();
+        let target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+        let workspace_parent = tempfile::tempdir().unwrap();
+        base.materialize(workspace_parent.path().join("workspace"))
+            .unwrap();
+        let workspace = workspace_parent.path().join("workspace");
+        fs::write(workspace.join("dependency"), b"stale").unwrap();
+        let delta = base
+            .delta_to(
+                &target,
+                SnapshotDeltaLimits::default(),
+                &SnapshotDeltaPolicy::default(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            delta.apply_to_directory_with_requirements(
+                &workspace,
+                SnapshotDeltaApplyMode::Initial,
+                &[SnapshotRequirement {
+                    path: "dependency".into(),
+                    scope: crate::snapshot::SnapshotCompareScope::Content,
+                }],
+                SnapshotCompareLimits::default(),
+                Duration::from_secs(1),
+            ),
+            Err(SnapshotError::DeltaConflict { .. })
+        ));
+        assert_eq!(fs::read(workspace.join("output")).unwrap(), b"base");
+    }
+
+    #[test]
+    fn dependency_change_during_apply_is_fail_closed_after_writing() {
+        let source = tempfile::tempdir().unwrap();
+        let base_storage = tempfile::tempdir().unwrap();
+        let target_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("dependency"), b"base").unwrap();
+        fs::write(source.path().join("output"), b"base").unwrap();
+        let base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+        fs::write(source.path().join("output"), b"target").unwrap();
+        let target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+        let workspace_parent = tempfile::tempdir().unwrap();
+        base.materialize(workspace_parent.path().join("workspace"))
+            .unwrap();
+        let workspace = workspace_parent.path().join("workspace");
+        let delta = base
+            .delta_to(
+                &target,
+                SnapshotDeltaLimits::default(),
+                &SnapshotDeltaPolicy::default(),
+            )
+            .unwrap();
+        let dependency = workspace.join("dependency");
+
+        assert!(matches!(
+            delta.apply_to_directory_inner(
+                &workspace,
+                SnapshotDeltaApplyMode::Initial,
+                &[SnapshotRequirement {
+                    path: "dependency".into(),
+                    scope: crate::snapshot::SnapshotCompareScope::Content,
+                }],
+                SnapshotCompareLimits::default(),
+                Duration::from_secs(1),
+                || fs::write(dependency, b"raced").unwrap(),
+            ),
+            Err(SnapshotError::DeltaApplyIncomplete { .. })
+        ));
+        assert_eq!(fs::read(workspace.join("output")).unwrap(), b"target");
+        assert_eq!(fs::read(workspace.join("dependency")).unwrap(), b"raced");
+    }
+
+    #[test]
+    fn resume_accepts_each_dependency_at_base_or_target_state() {
+        let source = tempfile::tempdir().unwrap();
+        let base_storage = tempfile::tempdir().unwrap();
+        let target_storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("one"), b"base").unwrap();
+        fs::write(source.path().join("two"), b"base").unwrap();
+        let base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+        fs::write(source.path().join("one"), b"target").unwrap();
+        fs::write(source.path().join("two"), b"target").unwrap();
+        let target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+        let workspace_parent = tempfile::tempdir().unwrap();
+        base.materialize(workspace_parent.path().join("workspace"))
+            .unwrap();
+        let workspace = workspace_parent.path().join("workspace");
+        fs::write(workspace.join("one"), b"target").unwrap();
+        let delta = base
+            .delta_to(
+                &target,
+                SnapshotDeltaLimits::default(),
+                &SnapshotDeltaPolicy::default(),
+            )
+            .unwrap();
+        let requirements = ["one", "two"].map(|path| SnapshotRequirement {
+            path: path.into(),
+            scope: crate::snapshot::SnapshotCompareScope::Content,
+        });
+
+        delta
+            .apply_to_directory_with_requirements(
+                &workspace,
+                SnapshotDeltaApplyMode::Resume,
+                &requirements,
+                SnapshotCompareLimits::default(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(workspace.join("one")).unwrap(), b"target");
+        assert_eq!(fs::read(workspace.join("two")).unwrap(), b"target");
     }
 }

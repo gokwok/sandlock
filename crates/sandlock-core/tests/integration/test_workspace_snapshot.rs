@@ -712,6 +712,52 @@ async fn paused_attached_delta_rejects_a_stale_declared_dependency_without_writi
     base.destroy().unwrap();
 }
 
+#[test]
+fn live_directory_delta_combines_dependency_proof_and_path_cas() {
+    let source = tempfile::tempdir().unwrap();
+    let base_storage = tempfile::tempdir().unwrap();
+    let target_storage = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("dependency"), b"base").unwrap();
+    fs::write(source.path().join("output"), b"base").unwrap();
+    let mut base = FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+    fs::write(source.path().join("output"), b"target").unwrap();
+    let mut target = FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+    base.materialize(destination.path().join("workspace")).unwrap();
+    let workspace = destination.path().join("workspace");
+    let requirements = [sandlock_core::SnapshotRequirement {
+        path: "dependency".into(),
+        scope: sandlock_core::SnapshotCompareScope::Content,
+    }];
+    assert!(base
+        .compare_directory_requirements(
+            &workspace,
+            &requirements,
+            sandlock_core::SnapshotCompareLimits::default(),
+        )
+        .unwrap()
+        .matched);
+    let delta = base
+        .delta_to(
+            &target,
+            sandlock_core::SnapshotDeltaLimits::default(),
+            &sandlock_core::SnapshotDeltaPolicy::default(),
+        )
+        .unwrap();
+    delta
+        .apply_to_directory_with_requirements(
+            &workspace,
+            sandlock_core::SnapshotDeltaApplyMode::Initial,
+            &requirements,
+            sandlock_core::SnapshotCompareLimits::default(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(fs::read(workspace.join("output")).unwrap(), b"target");
+    target.destroy().unwrap();
+    base.destroy().unwrap();
+}
+
 #[tokio::test]
 async fn paused_attached_guard_can_kill_without_resuming_user_code() {
     let source = tempfile::tempdir().unwrap();
