@@ -294,10 +294,78 @@ pub(crate) struct ProcessCreationTrace {
     cmd_tx: std::sync::mpsc::SyncSender<TraceCmd>,
     join: Option<tokio::task::JoinHandle<io::Result<bool>>>,
     diagnostic_ctx: Arc<SupervisorCtx>,
-    /// The traced (forking) task's tid — `finish`'s watchdog signals it.
-    caller_tid: i32,
+    /// Stable identity of the traced task. The watchdog uses `tgkill`, not a
+    /// process-directed signal, and revalidates this identity before a
+    /// teardown kill so a recycled numeric pid cannot be targeted.
+    caller: TracedTaskIdentity,
     /// True once `finish`/`abort` has sent a command; gates the Drop fallback.
     signaled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TracedTaskIdentity {
+    tid: i32,
+    tgid: i32,
+    start_time: u64,
+    process_group: i32,
+}
+
+impl TracedTaskIdentity {
+    fn capture(tid: i32) -> io::Result<Self> {
+        let tgid = read_tgid_of_tid(tid).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("tid {tid} has no tgid"))
+        })?;
+        let start_time = crate::seccomp::state::read_pid_start_time(tid).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("tid {tid} has no readable start time"),
+            )
+        })?;
+        let process_group = task_stat(tid)
+            .map(|(process_group, _, _)| process_group)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("tid {tid} has no readable process group"),
+                )
+            })?;
+        Ok(Self {
+            tid,
+            tgid,
+            start_time,
+            process_group,
+        })
+    }
+
+    fn is_current(self) -> bool {
+        read_tgid_of_tid(self.tid) == Some(self.tgid)
+            && crate::seccomp::state::read_pid_start_time(self.tid) == Some(self.start_time)
+            && task_stat(self.tid).is_some_and(|(process_group, _, _)| {
+                process_group == self.process_group
+            })
+    }
+
+    fn signal_thread(self, signal: libc::c_int) -> io::Result<()> {
+        if !self.is_current() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("traced task {} no longer has its captured identity", self.tid),
+            ));
+        }
+        let result = unsafe { libc::syscall(libc::SYS_tgkill, self.tgid, self.tid, signal) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn kill_execution(self) {
+        if !self.is_current() {
+            return;
+        }
+        let _ = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+        let _ = unsafe { libc::syscall(libc::SYS_tgkill, self.tgid, self.tid, libc::SIGKILL) };
+    }
 }
 
 impl Drop for ProcessCreationTrace {
@@ -355,6 +423,7 @@ pub(crate) async fn prepare_process_creation_tracking(
     caller_tid: i32,
     process_slot: u64,
 ) -> io::Result<ProcessCreationTrace> {
+    let caller = TracedTaskIdentity::capture(caller_tid)?;
     let worker_ctx = Arc::clone(ctx);
     // SEIZE result, reported back as an errno so `io::Error` need not cross
     // the channel (it is not `Clone`/`Send`-friendly to reconstruct).
@@ -372,7 +441,7 @@ pub(crate) async fn prepare_process_creation_tracking(
             cmd_tx,
             join: Some(join),
             diagnostic_ctx: Arc::clone(ctx),
-            caller_tid,
+            caller,
             signaled: false,
         }),
         Ok(Err(errno)) => {
@@ -609,11 +678,13 @@ fn child_registered_for_test(child_pid: i32) {
     }
 }
 
-/// Signal `finish`'s watchdog sends to the tracee to wake this blocking wait
-/// when a fork created no child (a failed fork emits no ptrace event). SIGURG
-/// is effectively unused by normal programs and ignored by default, so it is a
-/// safe wake poke that we recognise and swallow.
-const FORK_WATCHDOG_SIGNAL: libc::c_int = libc::SIGURG;
+/// Signal `finish`'s watchdog sends to the exact traced thread to wake this
+/// blocking wait when a fork created no child (a failed fork emits no ptrace
+/// event). `SIGSTOP` cannot be caught or blocked, unlike the former `SIGURG`
+/// wake-up used here. Under ptrace it first produces a signal-delivery-stop;
+/// the tracker recognises and suppresses it before detach, so no group-stop is
+/// delivered to the candidate.
+const FORK_WATCHDOG_SIGNAL: libc::c_int = libc::SIGSTOP;
 
 /// Watch the SEIZE'd parent for the fork-creation event after `Continue`.
 ///
@@ -759,7 +830,8 @@ pub(crate) async fn finish_process_creation_tracking(
     const TRACKER_TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
     trace.signaled = true;
-    let caller_tid = trace.caller_tid;
+    let caller = trace.caller;
+    let caller_tid = caller.tid;
     let diagnostic_ctx = Arc::clone(&trace.diagnostic_ctx);
     // Send is non-blocking (capacity-1 channel, single sender) — the worker is
     // parked waiting to receive, then blocks in `waitpid` for the fork event.
@@ -772,11 +844,12 @@ pub(crate) async fn finish_process_creation_tracking(
     // Race the worker against a watchdog. The worker's `waitpid` is blocking, so
     // a *failed* fork (no ptrace event) would hang it forever; on the deadline
     // we poke the tracee so its `waitpid` returns and the worker reports "no
-    // child". `kill` does not need the tracer thread, so this is safe from here.
+    // child". `tgkill` targets the exact traced thread so another thread in a
+    // multicall runtime cannot consume the wake signal.
     tokio::select! {
         res = &mut join => res.map_err(join_err)?,
         _ = tokio::time::sleep(FORK_EVENT_DEADLINE) => {
-            unsafe { libc::kill(caller_tid, FORK_WATCHDOG_SIGNAL); }
+            let _ = caller.signal_thread(FORK_WATCHDOG_SIGNAL);
             match tokio::time::timeout(TRACKER_TEARDOWN_DEADLINE, &mut join).await {
                 Ok(result) => result.map_err(join_err)?,
                 Err(_) => {
@@ -784,10 +857,7 @@ pub(crate) async fn finish_process_creation_tracking(
                     // the notification loop or a tracee forever. Kill the
                     // complete process group before abandoning the worker so a
                     // late fork cannot escape accounting.
-                    if let Some((process_group, _, _)) = task_stat(caller_tid) {
-                        let _ = unsafe { libc::killpg(process_group, libc::SIGKILL) };
-                    }
-                    let _ = unsafe { libc::kill(caller_tid, libc::SIGKILL) };
+                    caller.kill_execution();
                     let resource = diagnostic_ctx.resource.try_lock().ok();
                     emit_spawn_diagnostic(
                         &diagnostic_ctx,
@@ -1466,6 +1536,86 @@ mod tests {
 
         ptr::write_volatile(flags.offset(FORK_FAILED), 1);
         libc::_exit(1);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    unsafe fn caller_block_sigurg_then_wait(flags: *mut i32) -> ! {
+        let mut blocked: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGURG);
+        libc::sigprocmask(libc::SIG_BLOCK, &blocked, ptr::null_mut());
+
+        // Keep the watchdog's teardown fallback scoped to this fixture. The
+        // production execution launcher likewise gives each candidate its own
+        // process group.
+        libc::setpgid(0, 0);
+        ptr::write_volatile(flags.offset(CHILD_RAN), 1);
+        while ptr::read_volatile(flags.offset(GO)) == 0 {
+            core::hint::spin_loop();
+        }
+        while ptr::read_volatile(flags.offset(DONE)) == 0 {
+            core::hint::spin_loop();
+        }
+        libc::_exit(0);
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
+    #[test]
+    fn process_creation_watchdog_wakes_the_exact_thread_with_sigurg_blocked() {
+        let flags = SharedFlags::new();
+        let caller = unsafe { libc::fork() };
+        assert!(caller >= 0, "fork caller");
+        if caller == 0 {
+            unsafe { caller_block_sigurg_then_wait(flags.ptr) };
+        }
+        let mut caller_guard = CallerGuard::new(caller, &flags);
+
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while flags.read(CHILD_RAN) == 0 {
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "caller did not install its signal mask"
+            );
+            std::thread::yield_now();
+        }
+
+        let ctx = fake_supervisor_ctx(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let trace = match rt.block_on(prepare_process_creation_tracking(&ctx, caller, 1)) {
+            Ok(trace) => trace,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+                eprintln!("skipping ptrace watchdog test: ptrace denied: {e}");
+                return;
+            }
+            Err(e) => panic!("prepare process-creation tracking: {e}"),
+        };
+
+        flags.write(GO, 1);
+        let started = std::time::Instant::now();
+        let created = rt
+            .block_on(finish_process_creation_tracking(trace))
+            .expect("watchdog should cleanly finish a creation trace with no fork event");
+        assert!(!created, "the caller deliberately issued no fork");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3500),
+            "the thread-directed watchdog should avoid the teardown timeout"
+        );
+        assert_eq!(
+            unsafe { libc::kill(caller, 0) },
+            0,
+            "the wake signal must be swallowed instead of killing the candidate"
+        );
+        assert_eq!(ctx.processes.active_creation_traces(), 0);
+
+        flags.write(DONE, 1);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(caller, &mut status, 0) }, caller);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        caller_guard.disarm();
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
