@@ -122,6 +122,8 @@ pub enum SandboxRuntimeError {
         stage: String,
         /// Raw Linux errno when the failed stage published one.
         errno: Option<i32>,
+        /// Whether a fresh launch may succeed after transient Host pressure clears.
+        transient: bool,
     },
 
     #[error("branch error: {0}")]

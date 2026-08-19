@@ -462,8 +462,8 @@ let result = dynamic.run(&["python3", "agent.py"]).await?;
 
 Streaming callers that must distinguish a launcher failure from a program that legitimately exits
 with code 127 should use `Sandbox::popen_checked`. It waits for the close-on-exec confirmation and
-returns `SandboxRuntimeError::ExecLaunch { stage, errno }` when confinement or the initial `execve`
-fails; `Sandbox::popen` retains its release-immediately streaming behavior.
+returns `SandboxRuntimeError::ExecLaunch { stage, errno, transient }` when confinement or the
+initial `execve` fails; `Sandbox::popen` retains its release-immediately streaming behavior.
 
 ## Profiles
 

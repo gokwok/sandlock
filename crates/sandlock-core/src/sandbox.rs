@@ -1516,6 +1516,7 @@ impl Sandbox {
                 return Err(SandboxRuntimeError::ExecLaunch {
                     stage: "exec confirmation deadline exceeded".to_owned(),
                     errno: None,
+                    transient: true,
                 }
                 .into());
             }
@@ -1524,6 +1525,7 @@ impl Sandbox {
             return Err(SandboxRuntimeError::ExecLaunch {
                 stage: failure.stage,
                 errno: failure.errno,
+                transient: matches!(failure.errno, Some(libc::EFAULT | libc::EAGAIN)),
             }
             .into());
         }
