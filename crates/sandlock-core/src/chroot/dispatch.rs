@@ -337,6 +337,74 @@ fn proc_exe_link_pid(virtual_path: &str) -> Option<i32> {
     pid.parse().ok()
 }
 
+/// The pid named by an exact `/proc/<pid>/root` magic link.
+fn proc_root_link_pid(virtual_path: &str) -> Option<i32> {
+    let rest = virtual_path.strip_prefix("/proc/")?;
+    let (pid, tail) = rest.split_once('/')?;
+    if tail != "root" {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Return the host procfs link whose metadata may be exposed for an exact
+/// tracked-process magic link.
+///
+/// `openat2(RESOLVE_IN_ROOT)` intentionally refuses procfs magic links, so the
+/// generic chroot resolver cannot service `lstat` on them. Metadata is safe to
+/// return on behalf of the child after the stable process-incarnation gate:
+/// no link target bytes or host paths are disclosed. Following `exe` and
+/// `fd/N` is also supported because callers such as Node probe the referred
+/// object before opening it. `cwd` and `root` follow semantics remain with the
+/// virtual namespace resolver; only their link metadata is handled here.
+fn tracked_proc_magic_metadata_path(
+    virtual_path: &Path,
+    follow: bool,
+    processes: &ProcessIndex,
+) -> Result<Option<PathBuf>, NotifAction> {
+    let path = virtual_path
+        .to_str()
+        .ok_or(NotifAction::Errno(libc::EINVAL))?;
+    let (pid, may_follow) = if let Some(pid) = proc_exe_link_pid(path) {
+        (pid, true)
+    } else if let Some((pid, _)) = proc_fd_link(path) {
+        (pid, true)
+    } else if let Some((pid, tail)) = proc_cwd_link_pid(path) {
+        if !tail.is_empty() {
+            return Ok(None);
+        }
+        (pid, false)
+    } else if let Some(pid) = proc_root_link_pid(path) {
+        (pid, false)
+    } else {
+        return Ok(None);
+    };
+    if !processes.contains_current(pid) {
+        return Err(NotifAction::Errno(libc::EACCES));
+    }
+    if follow && !may_follow {
+        return Ok(None);
+    }
+    Ok(Some(PathBuf::from(path)))
+}
+
+/// Canonical virtual spelling used only to recognize exact procfs magic
+/// links before the generic resolver rejects them.
+async fn proc_magic_virtual_path(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
+) -> Option<PathBuf> {
+    if Path::new(path).is_absolute() {
+        return Some(confine(&canon_proc_self(path, notif.pid)));
+    }
+    build_merged_virtual_path(notif, dirfd, path, ctx, cow_state)
+        .await
+        .map(|path| confine(&path))
+}
+
 /// Name an open file the sandbox has no path for.
 ///
 /// Modelled on the kernel's own `pipe:[inode]` spelling for fds that are not
@@ -553,26 +621,6 @@ async fn read_and_resolve_nofollow(
         resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, false, false)
             .await
             .ok_or(NotifAction::Errno(libc::EACCES))?;
-    Ok((path, host_path, virtual_path))
-}
-
-/// Like [`read_and_resolve`] but requires the path to already exist.
-/// Returns a fully kernel-resolved host path with no unresolved symlinks.
-async fn read_and_resolve_existing(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    ctx: &ChrootCtx<'_>,
-    cow_state: &Arc<Mutex<CowState>>,
-    dirfd_idx: usize,
-    path_idx: usize,
-) -> Result<(String, PathBuf, PathBuf), NotifAction> {
-    let path = read_path(notif, notif.data.args[path_idx], notif_fd)
-        .ok_or(NotifAction::Continue)?;
-    let dirfd = notif.data.args[dirfd_idx] as i64;
-    let (host_path, virtual_path) =
-        resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, true, true)
-            .await
-            .ok_or(NotifAction::Errno(libc::ENOENT))?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -1635,14 +1683,39 @@ pub(crate) async fn handle_chroot_stat(
         return NotifAction::Continue;
     }
 
-    let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
-        read_and_resolve_nofollow(notif, notif_fd, ctx, cow_state, 0, 1).await
-    } else {
-        read_and_resolve_existing(notif, notif_fd, ctx, cow_state, 0, 1).await
+    let path = match read_path(notif, notif.data.args[1], notif_fd) {
+        Some(path) => path,
+        None => return NotifAction::Continue,
     };
-    let (_, host_path, vp) = match resolved {
-        Ok(r) => r,
-        Err(a) => return a,
+    let dirfd = notif.data.args[0] as i64;
+    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW as u64) == 0;
+
+    if let Some(virtual_path) = proc_magic_virtual_path(notif, dirfd, &path, ctx, cow_state).await {
+        let metadata_path =
+            match tracked_proc_magic_metadata_path(&virtual_path, follow, ctx.processes) {
+                Ok(path) => path,
+                Err(action) => return action,
+            };
+        if let Some(metadata_path) = metadata_path {
+            if !ctx.can_read(&virtual_path) {
+                return NotifAction::Errno(libc::EACCES);
+            }
+            if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
+                return if metadata_path.exists() || metadata_path.is_symlink() {
+                    NotifAction::ReturnValue(0)
+                } else {
+                    NotifAction::Errno(libc::ENOENT)
+                };
+            }
+            return stat_and_write(notif, notif_fd, &metadata_path);
+        }
+    }
+
+    let resolved =
+        resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, follow, follow).await;
+    let (host_path, vp) = match resolved {
+        Some(resolved) => resolved,
+        None => return NotifAction::Errno(if follow { libc::ENOENT } else { libc::EACCES }),
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 
@@ -1662,6 +1735,37 @@ pub(crate) async fn handle_chroot_stat(
     stat_and_write(notif, notif_fd, &real_path)
 }
 
+fn statx_and_write(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    path: &Path,
+    flags: i32,
+    mask: u32,
+) -> NotifAction {
+    let c_path = match path_cstr(path, libc::ENOENT) {
+        Ok(c) => c,
+        Err(a) => return a,
+    };
+    let mut stx_buf = vec![0u8; 256];
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            flags,
+            mask,
+            stx_buf.as_mut_ptr(),
+        )
+    };
+    if ret < 0 {
+        return NotifAction::Errno(last_errno(libc::ENOENT));
+    }
+    if write_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[4], &stx_buf).is_err() {
+        return NotifAction::Continue;
+    }
+    NotifAction::ReturnValue(0)
+}
+
 // ============================================================
 // statx handler
 // ============================================================
@@ -1677,7 +1781,6 @@ pub(crate) async fn handle_chroot_statx(
     let path_ptr = notif.data.args[1];
     let flags = notif.data.args[2] as i32;
     let mask = notif.data.args[3] as u32;
-    let statxbuf_addr = notif.data.args[4];
 
     // AT_EMPTY_PATH: stat the fd directly, no chroot path resolution needed.
     if (flags & libc::AT_EMPTY_PATH) != 0 {
@@ -1690,6 +1793,19 @@ pub(crate) async fn handle_chroot_statx(
     };
 
     let follow_final = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
+    if let Some(virtual_path) = proc_magic_virtual_path(notif, dirfd, &path, ctx, cow_state).await {
+        let metadata_path =
+            match tracked_proc_magic_metadata_path(&virtual_path, follow_final, ctx.processes) {
+                Ok(path) => path,
+                Err(action) => return action,
+            };
+        if let Some(metadata_path) = metadata_path {
+            if !ctx.can_read(&virtual_path) {
+                return NotifAction::Errno(libc::EACCES);
+            }
+            return statx_and_write(notif, notif_fd, &metadata_path, flags, mask);
+        }
+    }
     let resolved = resolve_merged_chroot_path(
         notif,
         dirfd,
@@ -1711,22 +1827,7 @@ pub(crate) async fn handle_chroot_statx(
         Err(a) => return a,
     };
 
-    let c_path = match path_cstr(&real_path, libc::ENOENT) {
-        Ok(c) => c,
-        Err(a) => return a,
-    };
-    let mut stx_buf = vec![0u8; 256];
-    let ret = unsafe {
-        libc::syscall(libc::SYS_statx, libc::AT_FDCWD, c_path.as_ptr(), flags, mask, stx_buf.as_mut_ptr())
-    };
-    if ret < 0 {
-        return NotifAction::Errno(last_errno(libc::ENOENT));
-    }
-
-    if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
-        return NotifAction::Continue;
-    }
-    NotifAction::ReturnValue(0)
+    statx_and_write(notif, notif_fd, &real_path, flags, mask)
 }
 
 // ============================================================

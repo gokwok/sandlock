@@ -152,6 +152,49 @@ async fn run_concurrent_executable_identity_probe(with_cow: bool) {
     cleanup_rootfs(&rootfs);
 }
 
+async fn run_proc_magic_metadata_probe(with_cow: bool) {
+    let name = if with_cow {
+        "proc-magic-metadata-cow"
+    } else {
+        "proc-magic-metadata"
+    };
+    let rootfs = build_test_rootfs(name);
+
+    for (command, path, expected) in [
+        ("legacy-lstat", "/proc/self/exe", "type=link"),
+        ("legacy-lstat", "/proc/self/fd/1", "type=link"),
+        ("legacy-stat", "/proc/self/exe", "OK "),
+        ("legacy-stat", "/proc/self/fd/1", "OK "),
+    ] {
+        let mut builder = minimal_exec_policy(&rootfs).fs_mount("/proc", "/proc");
+        if with_cow {
+            builder = builder
+                .fs_read("/tmp")
+                .workdir(rootfs.join("tmp"))
+                .on_exit(BranchAction::Abort);
+        }
+        let result = builder
+            .build()
+            .unwrap()
+            .run(&["rootfs-helper", command, path])
+            .await
+            .unwrap();
+        assert!(
+            result.success(),
+            "{command} {path} must succeed, cow={with_cow}, stdout={}, stderr={}",
+            result.stdout_str().unwrap_or_default(),
+            result.stderr_str().unwrap_or_default(),
+        );
+        assert!(
+            result.stdout_str().unwrap_or_default().contains(expected),
+            "{command} {path} returned unexpected metadata, cow={with_cow}, stdout={}",
+            result.stdout_str().unwrap_or_default(),
+        );
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 #[tokio::test]
 async fn test_chroot_proc_exe_is_scoped_to_each_process_image() {
     run_concurrent_executable_identity_probe(false).await;
@@ -160,6 +203,16 @@ async fn test_chroot_proc_exe_is_scoped_to_each_process_image() {
 #[tokio::test]
 async fn test_chroot_cow_proc_exe_is_scoped_to_each_process_image() {
     run_concurrent_executable_identity_probe(true).await;
+}
+
+#[tokio::test]
+async fn test_chroot_proc_magic_link_metadata_is_virtualized() {
+    run_proc_magic_metadata_probe(false).await;
+}
+
+#[tokio::test]
+async fn test_chroot_cow_proc_magic_link_metadata_is_virtualized() {
+    run_proc_magic_metadata_probe(true).await;
 }
 
 #[tokio::test]
