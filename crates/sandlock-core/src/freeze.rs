@@ -75,6 +75,29 @@ fn read_task_state(tid: i32) -> Option<char> {
     line.split_whitespace().nth(1).and_then(|s| s.chars().next())
 }
 
+fn read_task_wchan(tid: i32) -> Option<String> {
+    let wchan = fs::read_to_string(format!("/proc/{tid}/wchan")).ok()?;
+    Some(wchan.trim().to_owned())
+}
+
+fn read_task_tracer(tid: i32) -> Option<i32> {
+    let status = fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("TracerPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn traced_by_this_supervisor(tid: i32) -> bool {
+    let Some(tracer_tid) = read_task_tracer(tid).filter(|tracer| *tracer > 0) else {
+        return false;
+    };
+    crate::seccomp::state::read_tgid_of_tid(tracer_tid)
+        == i32::try_from(std::process::id()).ok()
+}
+
 /// What `seize_and_interrupt` did with one tid.
 #[derive(Debug, PartialEq, Eq)]
 enum SeizeOutcome {
@@ -120,18 +143,44 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         return Ok(SeizeOutcome::NotNeeded);
     }
 
-    let ret = unsafe {
-        libc::ptrace(libc::PTRACE_SEIZE as _, tid, 0, 0)
-    };
-    if ret < 0 {
+    // A just-created child can trap into exec before the one-shot fork-event
+    // tracker has detached its parent. In that short overlap the parent is
+    // already stopped by another tracer thread in this supervisor and a
+    // second PTRACE_SEIZE returns EPERM. Wait for that owned tracker to hand
+    // off instead of denying the child's exec. An unrelated tracer remains a
+    // hard failure.
+    let handoff_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE as _, tid, 0, 0) };
+        if ret >= 0 {
+            break;
+        }
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(SeizeOutcome::NotNeeded); // already exited
         }
-        if matches!(read_task_state(tid), Some('Z' | 'X')) {
+        if matches!(read_task_state(tid), Some('D' | 'Z' | 'X')) {
             return Ok(SeizeOutcome::NotNeeded);
         }
-        return Err(err);
+        if err.raw_os_error() == Some(libc::EPERM) && traced_by_this_supervisor(tid) {
+            if std::time::Instant::now() < handoff_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("owned ptrace handoff for tid {tid} exceeded the freeze budget"),
+            ));
+        }
+        return Err(io::Error::new(
+            err.kind(),
+            format!(
+                "ptrace seize tid {tid}: {err}; state={:?}; wchan={:?}; tracer={:?}",
+                read_task_state(tid),
+                read_task_wchan(tid),
+                read_task_tracer(tid),
+            ),
+        ));
     }
     // PTRACE_SEIZE succeeded; from here, any error path must DETACH
     // before returning so we don't leave the task traced-but-running.
@@ -145,7 +194,10 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(SeizeOutcome::NotNeeded);
         }
-        return Err(err);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("ptrace interrupt tid {tid}: {err}"),
+        ));
     }
 
     // Bounded reap. A runnable task stops within a scheduling quantum; the
@@ -576,7 +628,17 @@ pub(crate) fn freeze_sandbox_for_execve(
 ) -> Result<SandboxFreeze, FreezeError> {
     let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
     let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
-    let mut tgids: HashSet<i32> = processes.pids_snapshot();
+    // ProcessIndex is keyed by seccomp notification pid, which is a TID. A
+    // multithreaded runtime therefore contributes several keys for one TGID.
+    // Canonicalize before walking `/proc/<tgid>/task`; otherwise the same
+    // threads are seized once per indexed TID and the second pass collides
+    // with this freeze worker's own ptrace attachments.
+    let mut tgids = HashSet::new();
+    for pid in processes.pids_snapshot() {
+        if let Ok(tgid) = read_tgid_of_tid(pid) {
+            tgids.insert(tgid);
+        }
+    }
     tgids.insert(caller_tgid);
 
     let mut sibling_tids: Vec<i32> = Vec::new();
@@ -745,6 +807,126 @@ mod tests {
 
         // Cleanup: detach the peer so it can resume and be killed.
         detach_tids_checked(&outcome.peer_tids).expect("detach frozen peer");
+        let _ = peer.kill();
+        let _ = peer.wait();
+        let _ = caller.kill();
+        let _ = caller.wait();
+    }
+
+    #[test]
+    fn exec_freeze_waits_for_an_owned_creation_tracker_handoff() {
+        use std::process::{Command, Stdio};
+
+        let mut peer = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn peer sleep");
+        let peer_pid = peer.id() as i32;
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let first_tracer = std::thread::spawn(move || {
+            let seized = unsafe { libc::ptrace(libc::PTRACE_SEIZE as _, peer_pid, 0, 0) };
+            if seized < 0 {
+                let errno = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EPERM);
+                let _ = ready_tx.send(Err(errno));
+                return;
+            }
+            let interrupted = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT as _, peer_pid, 0, 0) };
+            if interrupted < 0 {
+                let errno = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EPERM);
+                let _ = ready_tx.send(Err(errno));
+                detach(peer_pid);
+                return;
+            }
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(peer_pid, &mut status, libc::__WALL) };
+            if waited != peer_pid || !libc::WIFSTOPPED(status) {
+                let _ = ready_tx.send(Err(libc::EIO));
+                detach(peer_pid);
+                return;
+            }
+            ready_tx.send(Ok(())).expect("publish ptrace stop");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            detach(peer_pid);
+        });
+
+        match ready_rx.recv().expect("receive first tracer readiness") {
+            Ok(()) => {}
+            Err(errno) if matches!(errno, libc::EPERM | libc::EACCES) => {
+                eprintln!("skipping owned ptrace handoff test: ptrace denied with {errno}");
+                first_tracer.join().expect("join denied tracer");
+                let _ = peer.kill();
+                let _ = peer.wait();
+                return;
+            }
+            Err(errno) => panic!("first tracer failed with errno {errno}"),
+        }
+
+        let outcome = seize_and_interrupt(peer_pid)
+            .expect("exec freeze should wait for the supervisor-owned tracer to detach");
+        assert_eq!(outcome, SeizeOutcome::Frozen);
+        first_tracer.join().expect("join first tracer");
+        detach(peer_pid);
+        let _ = peer.kill();
+        let _ = peer.wait();
+    }
+
+    #[test]
+    fn exec_freeze_canonicalizes_indexed_threads_to_one_tgid_walk() {
+        use std::process::{Command, Stdio};
+
+        let mut caller = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn caller sleep");
+        let caller_tid = caller.id() as i32;
+        let mut peer = Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import threading,time\nfor _ in range(4): threading.Thread(target=time.sleep,args=(60,),daemon=True).start()\ntime.sleep(60)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn multithreaded peer");
+        let peer_pid = peer.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let peer_tids = loop {
+            let tids = list_threads_of_tgid(peer_pid).unwrap_or_default();
+            if tids.len() >= 5 {
+                break tids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "python peer did not create its worker threads"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let processes = ProcessIndex::new();
+        for tid in &peer_tids {
+            processes
+                .register(*tid)
+                .unwrap_or_else(|| panic!("register peer tid {tid}"));
+        }
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid)
+            .expect("each peer thread must be seized exactly once");
+        assert_eq!(
+            outcome.peer_tids.iter().copied().collect::<HashSet<_>>().len(),
+            peer_tids.len()
+        );
+        detach_tids_checked(&outcome.peer_tids).expect("detach multithreaded peer");
+
         let _ = peer.kill();
         let _ = peer.wait();
         let _ = caller.kill();
