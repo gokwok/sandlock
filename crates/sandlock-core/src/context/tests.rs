@@ -8,18 +8,44 @@ fn test_pipe_pair_creation() {
     assert!(pipes.notif_w.as_raw_fd() >= 0);
     assert!(pipes.ready_r.as_raw_fd() >= 0);
     assert!(pipes.ready_w.as_raw_fd() >= 0);
-    // All four fds should be distinct
+    assert!(pipes.exec_status_r.as_raw_fd() >= 0);
+    assert!(pipes.exec_status_w.as_raw_fd() >= 0);
+    // All six fds should be distinct
     let fds = [
         pipes.notif_r.as_raw_fd(),
         pipes.notif_w.as_raw_fd(),
         pipes.ready_r.as_raw_fd(),
         pipes.ready_w.as_raw_fd(),
+        pipes.exec_status_r.as_raw_fd(),
+        pipes.exec_status_w.as_raw_fd(),
     ];
-    for i in 0..4 {
-        for j in (i + 1)..4 {
+    for i in 0..fds.len() {
+        for j in (i + 1)..fds.len() {
             assert_ne!(fds[i], fds[j]);
         }
     }
+}
+
+#[test]
+fn exec_status_distinguishes_success_from_structured_failure() {
+    let success = PipePair::new().expect("pipe creation failed");
+    drop(success.exec_status_w);
+    assert_eq!(read_exec_status(success.exec_status_r).unwrap(), None);
+
+    let failure = PipePair::new().expect("pipe creation failed");
+    report_exec_failure(
+        failure.exec_status_w.as_raw_fd(),
+        "execvp '/usr/bin/python3'",
+        Some(libc::EFAULT),
+    );
+    drop(failure.exec_status_w);
+    assert_eq!(
+        read_exec_status(failure.exec_status_r).unwrap(),
+        Some(ChildExecFailure {
+            stage: "execvp '/usr/bin/python3'".to_owned(),
+            errno: Some(libc::EFAULT),
+        })
+    );
 }
 
 #[test]

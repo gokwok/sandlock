@@ -31,13 +31,18 @@ pub struct PipePair {
     pub ready_r: OwnedFd,
     /// Parent writes the "supervisor ready" signal to the child.
     pub ready_w: OwnedFd,
+    /// Parent reads a pre-exec failure record; EOF without bytes confirms exec success.
+    pub exec_status_r: OwnedFd,
+    /// Child reports pre-exec failure here. `O_CLOEXEC` closes it on successful exec.
+    pub exec_status_w: OwnedFd,
 }
 
 impl PipePair {
-    /// Create two pipe pairs using `pipe2(O_CLOEXEC)`.
+    /// Create synchronization pipes using `pipe2(O_CLOEXEC)`.
     pub fn new() -> io::Result<Self> {
         let mut notif_fds = [0i32; 2];
         let mut ready_fds = [0i32; 2];
+        let mut exec_status_fds = [0i32; 2];
 
         // SAFETY: pipe2 with valid pointers and O_CLOEXEC
         let ret = unsafe { libc::pipe2(notif_fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -55,14 +60,123 @@ impl PipePair {
             return Err(io::Error::last_os_error());
         }
 
+        let ret = unsafe { libc::pipe2(exec_status_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret < 0 {
+            unsafe {
+                libc::close(notif_fds[0]);
+                libc::close(notif_fds[1]);
+                libc::close(ready_fds[0]);
+                libc::close(ready_fds[1]);
+            }
+            return Err(io::Error::last_os_error());
+        }
+
         // SAFETY: pipe2 returned valid fds
         Ok(PipePair {
             notif_r: unsafe { OwnedFd::from_raw_fd(notif_fds[0]) },
             notif_w: unsafe { OwnedFd::from_raw_fd(notif_fds[1]) },
             ready_r: unsafe { OwnedFd::from_raw_fd(ready_fds[0]) },
             ready_w: unsafe { OwnedFd::from_raw_fd(ready_fds[1]) },
+            exec_status_r: unsafe { OwnedFd::from_raw_fd(exec_status_fds[0]) },
+            exec_status_w: unsafe { OwnedFd::from_raw_fd(exec_status_fds[1]) },
         })
     }
+}
+
+const EXEC_FAILURE_MAGIC: [u8; 4] = *b"SLXF";
+const MAX_EXEC_FAILURE_STAGE_BYTES: usize = 512;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ChildExecFailure {
+    pub(crate) stage: String,
+    pub(crate) errno: Option<i32>,
+}
+
+/// Report a child failure before the requested image has replaced the confined launcher.
+///
+/// The record is deliberately bounded and written before stderr. The parent treats EOF with no
+/// record as the only successful exec boundary because the write end is `O_CLOEXEC`.
+pub(crate) fn report_exec_failure(fd: RawFd, stage: &str, errno: Option<i32>) {
+    let stage = stage.as_bytes();
+    let stage = &stage[..stage.len().min(MAX_EXEC_FAILURE_STAGE_BYTES)];
+    let mut frame = Vec::with_capacity(10 + stage.len());
+    frame.extend_from_slice(&EXEC_FAILURE_MAGIC);
+    frame.extend_from_slice(&errno.unwrap_or(0).to_le_bytes());
+    frame.extend_from_slice(&(stage.len() as u16).to_le_bytes());
+    frame.extend_from_slice(stage);
+    let mut written = 0;
+    while written < frame.len() {
+        let result = unsafe {
+            libc::write(
+                fd,
+                frame[written..].as_ptr().cast::<libc::c_void>(),
+                frame.len() - written,
+            )
+        };
+        if result > 0 {
+            written += result as usize;
+        } else if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Block until exec closes the status pipe or the failed child publishes one bounded record.
+pub(crate) fn read_exec_status(fd: OwnedFd) -> io::Result<Option<ChildExecFailure>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 256];
+    loop {
+        let read = unsafe {
+            libc::read(
+                fd.as_raw_fd(),
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        bytes.extend_from_slice(&buffer[..read as usize]);
+        if bytes.len() > 10 + MAX_EXEC_FAILURE_STAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "child exec status exceeds its fixed budget",
+            ));
+        }
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() < 10 || bytes[..4] != EXEC_FAILURE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "child exec status has an invalid header",
+        ));
+    }
+    let errno = i32::from_le_bytes(bytes[4..8].try_into().expect("fixed errno field"));
+    let stage_len = u16::from_le_bytes(bytes[8..10].try_into().expect("fixed length field"));
+    if bytes.len() != 10 + usize::from(stage_len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "child exec status has an invalid length",
+        ));
+    }
+    let stage = std::str::from_utf8(&bytes[10..])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child exec stage is not UTF-8"))?
+        .to_owned();
+    Ok(Some(ChildExecFailure {
+        stage,
+        errno: (errno != 0).then_some(errno),
+    }))
 }
 
 // ============================================================
@@ -297,7 +411,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     macro_rules! fail {
         ($msg:expr) => {{
             let err = std::io::Error::last_os_error();
-            let _ = write!(std::io::stderr(), "sandlock child: {}: {}\n", $msg, err);
+            let stage = $msg.to_string();
+            report_exec_failure(pipes.exec_status_w.as_raw_fd(), &stage, err.raw_os_error());
+            let _ = write!(std::io::stderr(), "sandlock child: {}: {}\n", stage, err);
             unsafe { libc::_exit(127) };
         }};
     }
@@ -534,6 +650,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     // 12. Close all fds above stderr (always on for isolation)
     let mut fds_to_keep: Vec<RawFd> = keep_fds.to_vec();
+    fds_to_keep.push(pipes.exec_status_w.as_raw_fd());
     if keep_fd >= 0 {
         fds_to_keep.push(keep_fd);
     }
@@ -606,6 +723,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             // supervisor, so `run`'s code is already mapped; running it directly
             // avoids an execve that Landlock would otherwise have to authorize.
             set_proc_name(name);
+            unsafe { libc::close(pipes.exec_status_w.as_raw_fd()) };
             run();
             unsafe { libc::_exit(0) };
         }

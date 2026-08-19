@@ -37,7 +37,7 @@ pub mod dry_run;
 pub mod control;
 mod transparent_proxy;
 
-pub use error::{BranchError, SandlockError, SnapshotError};
+pub use error::{BranchError, SandboxRuntimeError, SandlockError, SnapshotError};
 pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};

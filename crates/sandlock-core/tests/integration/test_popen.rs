@@ -7,7 +7,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 
-use sandlock_core::{Sandbox, StdioMode};
+use sandlock_core::{Sandbox, SandboxRuntimeError, SandlockError, StdioMode};
 
 fn base() -> Sandbox {
     Sandbox::builder()
@@ -20,6 +20,44 @@ fn base() -> Sandbox {
         .fs_read("/dev")
         .build()
         .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_popen_checked_reports_pre_exec_failure() {
+    let mut sb = base().with_name("popen-checked-missing");
+    let result = sb
+        .popen_checked(
+            &["/definitely/missing/sandlock-executable"],
+            StdioMode::Null,
+            StdioMode::Null,
+            StdioMode::Null,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(SandlockError::Runtime(SandboxRuntimeError::ExecLaunch {
+            errno: Some(libc::ENOENT),
+            ..
+        }))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_popen_checked_preserves_guest_exit_127() {
+    let mut sb = base().with_name("popen-checked-guest-127");
+    let child = sb
+        .popen_checked(
+            &["/bin/sh", "-c", "exit 127"],
+            StdioMode::Null,
+            StdioMode::Null,
+            StdioMode::Null,
+        )
+        .await
+        .expect("the shell image completed exec");
+    assert_eq!(
+        child.wait().await.unwrap().exit_status,
+        sandlock_core::ExitStatus::Code(127)
+    );
 }
 
 /// stdin + stdout piped: write to the child and read its streamed output

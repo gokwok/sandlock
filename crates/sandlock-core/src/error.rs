@@ -115,6 +115,15 @@ pub enum SandboxRuntimeError {
     #[error("child process error: {0}")]
     Child(String),
 
+    /// The confined launcher failed before the requested image completed exec.
+    #[error("child exec launch failed at {stage} (errno {errno:?})")]
+    ExecLaunch {
+        /// Bounded internal launch stage; callers must not expose it to untrusted guests.
+        stage: String,
+        /// Raw Linux errno when the failed stage published one.
+        errno: Option<i32>,
+    },
+
     #[error("branch error: {0}")]
     Branch(#[from] BranchError),
 

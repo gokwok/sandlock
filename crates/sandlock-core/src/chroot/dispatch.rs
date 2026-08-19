@@ -1169,11 +1169,14 @@ pub(crate) async fn handle_chroot_exec(
     // literal to execve, which process_vm_writev can't overwrite. No length
     // guard needed — execve replaces the address space on success, so a write
     // past the original buffer is harmless.
-    if crate::seccomp::notif::rewrite_exec_path_to_fd(
+    if let Err(error) = crate::seccomp::notif::rewrite_exec_path_to_fd(
         notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, child_fd,
     )
-    .is_err()
     {
+        eprintln!(
+            "sandlock: exec path rewrite failed for child {}: {}",
+            notif.pid, error
+        );
         return NotifAction::Errno(libc::EFAULT);
     }
 

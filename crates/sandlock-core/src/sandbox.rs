@@ -306,6 +306,8 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
+    /// Pre-exec status pipe. EOF without a record is the successful exec boundary.
+    exec_status_r: Option<std::os::fd::OwnedFd>,
     /// Set when an external owner shares one COW upper with this sandbox. When
     /// present, `do_create_stdio` reuses this `CowState`, and neither `wait()`
     /// nor `Drop` takes or resolves the branch. See [`SharedCow`].
@@ -1374,6 +1376,23 @@ impl Sandbox {
         Ok(Process { sandbox: self })
     }
 
+    /// Like [`Sandbox::popen`], but does not return a process until the requested image has
+    /// completed exec. A confinement or exec failure is returned as
+    /// [`SandboxRuntimeError::ExecLaunch`] instead of being confused with a guest exit code 127.
+    pub async fn popen_checked(
+        &mut self,
+        cmd: &[&str],
+        stdin: StdioMode,
+        stdout: StdioMode,
+        stderr: StdioMode,
+    ) -> Result<Process<'_>, crate::error::SandlockError> {
+        self.do_create_stdio(cmd, StdioSpec { stdin, stdout, stderr })
+            .await?;
+        self.start()?;
+        self.wait_until_exec().await?;
+        Ok(Process { sandbox: self })
+    }
+
     /// Restore a checkpoint into a fresh, fully-sandboxed process.
     ///
     /// Reuses the normal create path to fork a child with the saved policy and
@@ -1476,36 +1495,28 @@ impl Sandbox {
         &self.restore_skipped
     }
 
-    /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
-    /// no longer matching `/proc/self/exe` (before execve the child still
-    /// shares the supervisor's binary). A child that exits between samples is
-    /// also considered released; [`Sandbox::wait`] retains and reports its
-    /// status. The kernel offers no direct exec event, so this polls every 1ms
-    /// with a 5s ceiling.
+    /// Wait for the child to finish `execve` using the close-on-exec status pipe.
     async fn wait_until_exec(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
-        let Some(our_exe) = std::fs::read_link("/proc/self/exe").ok() else {
-            return Ok(());
-        };
-        let child_link = format!("/proc/{}/exe", pid);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Ok(child_exe) = std::fs::read_link(&child_link) {
-                if child_exe != our_exe {
-                    return Ok(());
-                }
+        let status = self
+            .rt_mut()
+            .exec_status_r
+            .take()
+            .ok_or_else(|| SandboxRuntimeError::Child("child exec status is unavailable".into()))?;
+        let failure = tokio::task::spawn_blocking(move || crate::context::read_exec_status(status))
+            .await
+            .map_err(|error| {
+                SandboxRuntimeError::Child(format!("child exec status task failed: {error}"))
+            })?
+            .map_err(SandboxRuntimeError::Io)?;
+        if let Some(failure) = failure {
+            return Err(SandboxRuntimeError::ExecLaunch {
+                stage: failure.stage,
+                errno: failure.errno,
             }
-            if child_has_exited(pid) {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(SandboxRuntimeError::Child(
-                    "child did not exec() within 5s".into(),
-                ).into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            .into());
         }
+        Ok(())
     }
 
     /// Create with explicit stdin/stdout/stderr fd redirection. Child is
@@ -2105,6 +2116,7 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                exec_status_r: None,
                 shared_cow: None,
                 attached_execution: false,
                 tty_foreground_taken: false,
@@ -2228,6 +2240,7 @@ impl Sandbox {
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
+            exec_status_r: None,
             shared_cow: None,
             attached_execution: false,
             tty_foreground_taken: false,
@@ -2487,6 +2500,12 @@ impl Sandbox {
                     || unsafe { libc::dup2(fd, 1) } < 0
                     || unsafe { libc::dup2(fd, 2) } < 0
                 {
+                    let error = std::io::Error::last_os_error();
+                    crate::context::report_exec_failure(
+                        pipes.exec_status_w.as_raw_fd(),
+                        "PTY setup",
+                        error.raw_os_error(),
+                    );
                     unsafe { libc::_exit(127) };
                 }
                 true
@@ -2572,6 +2591,7 @@ impl Sandbox {
         // ===== PARENT PROCESS =====
         drop(pipes.notif_w);
         drop(pipes.ready_r);
+        drop(pipes.exec_status_w);
 
         self.rt_mut()._stdin_write = stdin_p.map(|(_r, w)| w);
         self.rt_mut()._stdout_read = stdout_p.map(|(r, _w)| r);
@@ -2579,6 +2599,7 @@ impl Sandbox {
 
         self.rt_mut().child_pid = Some(pid);
         self.rt_mut().tty_foreground_taken = tty_foreground_taken;
+        self.rt_mut().exec_status_r = Some(pipes.exec_status_r);
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
@@ -3401,16 +3422,6 @@ fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = file.read_to_end(&mut buf);
     buf
-}
-
-fn child_has_exited(pid: i32) -> bool {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
-    };
-    stat.rsplit_once(')')
-        .and_then(|(_, fields)| fields.split_whitespace().next())
-        .is_some_and(|state| matches!(state.as_bytes().first(), Some(b'Z' | b'X')))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
