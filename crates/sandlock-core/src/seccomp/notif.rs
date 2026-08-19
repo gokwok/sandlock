@@ -1085,6 +1085,40 @@ pub fn read_child_mem(
     Ok(result)
 }
 
+/// Read an exact range through `/proc/<pid>/mem`, forcing access through VMA
+/// protection in the same way a debugger reads an execute-only or otherwise
+/// non-readable mapping.
+///
+/// This is intentionally restricted to supervisor-owned exec argument
+/// rewriting. The kernel will re-read those arguments after `Continue`, and
+/// the notification ID checks keep the read bound to the trapped syscall.
+/// Generic handlers should continue using [`read_child_mem`] so an invalid
+/// userspace pointer retains ordinary syscall `EFAULT` semantics.
+fn read_child_mem_force(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    addr: u64,
+    len: usize,
+) -> Result<Vec<u8>, NotifError> {
+    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+    let result = read_child_mem_proc(pid, addr, len)?;
+    id_valid(notif_fd, id).map_err(NotifError::Ioctl)?;
+    Ok(result)
+}
+
+fn read_child_mem_proc(pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, NotifError> {
+    use std::os::unix::fs::FileExt;
+    let mem = std::fs::OpenOptions::new()
+        .read(true)
+        .open(format!("/proc/{pid}/mem"))
+        .map_err(NotifError::ChildMemoryRead)?;
+    let mut data = vec![0_u8; len];
+    mem.read_exact_at(&mut data, addr)
+        .map_err(NotifError::ChildMemoryRead)?;
+    Ok(data)
+}
+
 /// Read a NUL-terminated string from child memory without crossing unmapped
 /// page boundaries in a single `process_vm_readv` call.
 ///
@@ -1440,7 +1474,13 @@ pub(crate) fn rewrite_exec_path_to_fd(
     child_fd: i32,
 ) -> Result<(), NotifError> {
     let fd_path = format!("/proc/self/fd/{}\0", child_fd);
-    let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
+    let mut read = |addr: u64, len: usize| {
+        read_child_mem_force(notif_fd, id, pid, addr, len).map_err(|error| {
+            NotifError::Supervisor(format!(
+                "exec rewrite read at {addr:#x} for {len} bytes failed: {error}"
+            ))
+        })
+    };
     let plan = plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr)?;
     write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
     for (slot, new_ptr) in plan.patches {
@@ -3068,6 +3108,43 @@ mod tests {
         let result = write_child_mem_vm(pid, addr, &payload);
         assert!(result.is_ok());
         assert_eq!(data, 0x1234567890ABCDEF);
+    }
+
+    #[test]
+    fn read_child_mem_proc_forces_past_nonreadable_page() {
+        const PAGE: usize = 4096;
+        let expected = b"exec-argument";
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED, "mmap failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), addr.cast::<u8>(), expected.len())
+        };
+        assert_eq!(
+            unsafe { libc::mprotect(addr, PAGE, libc::PROT_NONE) },
+            0,
+            "mprotect PROT_NONE failed"
+        );
+
+        let pid = std::process::id();
+        let uaddr = addr as u64;
+        assert!(
+            read_child_mem_vm(pid, uaddr, expected.len()).is_err(),
+            "process_vm_readv must honor a non-readable mapping"
+        );
+        let got = read_child_mem_proc(pid, uaddr, expected.len())
+            .expect("/proc/pid/mem must force-read the mapped exec argument");
+        assert_eq!(got, expected);
+
+        unsafe { libc::munmap(addr, PAGE) };
     }
 
     /// The force-write path (`/proc/<pid>/mem`, FOLL_FORCE) must overwrite a
