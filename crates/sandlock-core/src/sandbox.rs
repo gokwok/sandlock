@@ -1503,12 +1503,23 @@ impl Sandbox {
             .exec_status_r
             .take()
             .ok_or_else(|| SandboxRuntimeError::Child("child exec status is unavailable".into()))?;
-        let failure = tokio::task::spawn_blocking(move || crate::context::read_exec_status(status))
-            .await
-            .map_err(|error| {
-                SandboxRuntimeError::Child(format!("child exec status task failed: {error}"))
-            })?
-            .map_err(SandboxRuntimeError::Io)?;
+        let status_task =
+            tokio::task::spawn_blocking(move || crate::context::read_exec_status(status));
+        let failure = match tokio::time::timeout(std::time::Duration::from_secs(5), status_task).await
+        {
+            Ok(result) => result
+                .map_err(|error| {
+                    SandboxRuntimeError::Child(format!("child exec status task failed: {error}"))
+                })?
+                .map_err(SandboxRuntimeError::Io)?,
+            Err(_) => {
+                return Err(SandboxRuntimeError::ExecLaunch {
+                    stage: "exec confirmation deadline exceeded".to_owned(),
+                    errno: None,
+                }
+                .into());
+            }
+        };
         if let Some(failure) = failure {
             return Err(SandboxRuntimeError::ExecLaunch {
                 stage: failure.stage,
