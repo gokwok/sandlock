@@ -324,6 +324,19 @@ fn proc_fd_link(virtual_path: &str) -> Option<(i32, i32)> {
     Some((pid.parse().ok()?, fd.parse().ok()?))
 }
 
+/// The pid named by an exact `/proc/<pid>/exe` magic link.
+///
+/// Callers canonicalize `/proc/self` first and apply the tracked-process gate
+/// before using this result.
+fn proc_exe_link_pid(virtual_path: &str) -> Option<i32> {
+    let rest = virtual_path.strip_prefix("/proc/")?;
+    let (pid, tail) = rest.split_once('/')?;
+    if tail != "exe" {
+        return None;
+    }
+    pid.parse().ok()
+}
+
 /// Name an open file the sandbox has no path for.
 ///
 /// Modelled on the kernel's own `pipe:[inode]` spelling for fds that are not
@@ -1012,7 +1025,7 @@ fn memfd_with_patched_interp(
 
 pub(crate) async fn handle_chroot_exec(
     notif: &SeccompNotif,
-    chroot_state: &Arc<Mutex<ChrootState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1134,13 +1147,6 @@ pub(crate) async fn handle_chroot_exec(
         unsafe { OwnedFd::from_raw_fd(src_fd) }
     };
 
-    // Record the virtual exe path so /proc/self/exe queries return the
-    // correct path (memfd-backed binaries would otherwise show the memfd path).
-    {
-        let mut cs = chroot_state.lock().await;
-        cs.chroot_exe = Some(virtual_path.clone());
-    }
-
     // Inject the (possibly patched) binary fd into the child and rewrite
     // the path to /proc/self/fd/N so the kernel loads it.
     let addfd = SeccompNotifAddfd {
@@ -1157,7 +1163,6 @@ pub(crate) async fn handle_chroot_exec(
             &addfd as *const _,
         )
     };
-    drop(exec_fd);
 
     if child_fd < 0 {
         return NotifAction::Errno(libc::EIO);
@@ -1179,6 +1184,27 @@ pub(crate) async fn handle_chroot_exec(
         );
         return NotifAction::Errno(libc::EFAULT);
     }
+
+    // Record the virtual path only after every supervisor-side step needed to
+    // launch the pinned executable has succeeded. The cell is process-image
+    // scoped: concurrent pipeline children cannot overwrite one another, and
+    // the stable key prevents a recycled numeric PID from receiving this
+    // notification's identity.
+    let executable_staged = i32::try_from(notif.pid)
+        .ok()
+        .and_then(|pid| ctx.processes.key_for(pid))
+        .is_some_and(|key| {
+            ctx.processes.stage_virtual_executable(
+                key,
+                virtual_path.clone(),
+                exec_fd.as_raw_fd(),
+            )
+        });
+    if !executable_staged {
+        drop(exec_fd);
+        return NotifAction::Errno(libc::EIO);
+    }
+    drop(exec_fd);
 
     NotifAction::Continue
 }
@@ -1709,7 +1735,7 @@ pub(crate) async fn handle_chroot_statx(
 
 pub(crate) async fn handle_chroot_readlink(
     notif: &SeccompNotif,
-    chroot_state: &Arc<Mutex<ChrootState>>,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
     cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
@@ -1793,17 +1819,20 @@ pub(crate) async fn handle_chroot_readlink(
         return write_target(named.as_bytes());
     }
 
-    // Special case: /proc/<pid>/exe -> return the virtual path recorded during exec
-    // (needed because memfd-backed binaries would show "/memfd:sandlock-exec" otherwise).
-    if path == format!("{}/exe", own_proc) {
-        let cs = chroot_state.lock().await;
-        if let Some(ref exe) = cs.chroot_exe {
-            let s = exe.to_string_lossy();
-            return write_target(s.as_bytes());
+    // Special case: /proc/<pid>/exe -> return the executable identity tracked
+    // for that exact process image. Memfd-backed binaries otherwise expose the
+    // injected host implementation, and a sandbox-global value lets concurrent
+    // pipeline children rename one another.
+    if let Some(pid) = proc_exe_link_pid(&path) {
+        if !ctx.processes.contains_current(pid) {
+            return NotifAction::Errno(libc::EACCES);
         }
-        drop(cs);
-        // Fallback: strip chroot prefix from /proc/{pid}/exe
-        if let Ok(real_exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid)) {
+        if let Some(executable) = ctx.processes.virtual_executable(pid) {
+            return write_target(executable.to_string_lossy().as_bytes());
+        }
+        // Fallback for a task that has not passed through the chroot rewrite:
+        // strip the chroot or mount prefix from the kernel's real link.
+        if let Ok(real_exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
             let virtual_exe = ctx.host_to_virtual(&real_exe).unwrap_or(real_exe);
             let s = virtual_exe.to_string_lossy();
             return write_target(s.as_bytes());
@@ -2605,7 +2634,7 @@ pub(crate) async fn handle_chroot_legacy_chown(
 
 #[cfg(test)]
 mod self_rewrite_tests {
-    use super::canon_proc_self;
+    use super::{canon_proc_self, proc_exe_link_pid};
 
     #[test]
     fn rewrites_self_and_thread_self_to_pid() {
@@ -2624,6 +2653,14 @@ mod self_rewrite_tests {
         assert_eq!(canon_proc_self("/proc/cpuinfo", 42), "/proc/cpuinfo");
         assert_eq!(canon_proc_self("/proc/selfish", 42), "/proc/selfish");
         assert_eq!(canon_proc_self("/etc/passwd", 42), "/etc/passwd");
+    }
+
+    #[test]
+    fn recognizes_only_exact_numeric_proc_exe_links() {
+        assert_eq!(proc_exe_link_pid("/proc/42/exe"), Some(42));
+        assert_eq!(proc_exe_link_pid("/proc/self/exe"), None);
+        assert_eq!(proc_exe_link_pid("/proc/42/exe/child"), None);
+        assert_eq!(proc_exe_link_pid("/proc/42/status"), None);
     }
 }
 

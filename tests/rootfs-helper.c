@@ -14,6 +14,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
@@ -834,6 +837,166 @@ static int cmd_write_fd_link(int argc, char **argv) {
     return 0;
 }
 
+/* ── executable identity concurrency probe ─────────────────── */
+
+/*
+ * Two hardlink aliases exec this applet concurrently. Each image announces
+ * that exec completed, waits until both aliases are live, then verifies that
+ * /proc/self/exe still names its own alias. A sandbox-global virtual exe value
+ * deterministically makes one child observe the other alias.
+ */
+static int cmd_exe_probe(const char *alias, int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "%s: need <ready-fd> <release-fd>\n", alias);
+        return 1;
+    }
+    int ready_fd = atoi(argv[0]);
+    int release_fd = atoi(argv[1]);
+    if (write(ready_fd, "R", 1) != 1) {
+        fprintf(stderr, "%s: ready write failed: %s\n", alias, strerror(errno));
+        return 1;
+    }
+    char release = 0;
+    if (read(release_fd, &release, 1) != 1) {
+        fprintf(stderr, "%s: release read failed: %s\n", alias, strerror(errno));
+        return 1;
+    }
+
+    char actual[4096];
+    ssize_t length = readlink("/proc/self/exe", actual, sizeof(actual) - 1);
+    if (length < 0) {
+        fprintf(stderr, "%s: readlink /proc/self/exe: %s\n", alias, strerror(errno));
+        return 1;
+    }
+    actual[length] = '\0';
+
+    char expected[256];
+    snprintf(expected, sizeof(expected), "/usr/bin/%s", alias);
+    if (strcmp(actual, expected) != 0) {
+        fprintf(stderr, "%s: expected %s, got %s\n", alias, expected, actual);
+        return 1;
+    }
+    printf("%s=%s\n", alias, actual);
+    return 0;
+}
+
+static int cmd_exe_race(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "exe-race: need <alias-a> <alias-b>\n");
+        return 1;
+    }
+    int ready[2];
+    int release[2];
+    if (pipe(ready) != 0 || pipe(release) != 0) {
+        fprintf(stderr, "exe-race: pipe failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    pid_t children[2] = {-1, -1};
+    for (int i = 0; i < 2; i++) {
+        children[i] = fork();
+        if (children[i] < 0) {
+            fprintf(stderr, "exe-race: fork failed: %s\n", strerror(errno));
+            goto fail;
+        }
+        if (children[i] == 0) {
+            close(ready[0]);
+            close(release[1]);
+            char ready_fd[32];
+            char release_fd[32];
+            snprintf(ready_fd, sizeof(ready_fd), "%d", ready[1]);
+            snprintf(release_fd, sizeof(release_fd), "%d", release[0]);
+            execl(argv[i], argv[i], ready_fd, release_fd, (char *)NULL);
+            _exit(127);
+        }
+    }
+
+    close(ready[1]);
+    close(release[0]);
+    int announced = 0;
+    while (announced < 2) {
+        struct pollfd event = {.fd = ready[0], .events = POLLIN};
+        int polled = poll(&event, 1, 5000);
+        if (polled <= 0) {
+            fprintf(stderr, "exe-race: aliases did not reach the barrier\n");
+            goto fail_parent;
+        }
+        char buffer[2];
+        ssize_t count = read(ready[0], buffer, sizeof(buffer));
+        if (count <= 0) {
+            fprintf(stderr, "exe-race: ready pipe closed early\n");
+            goto fail_parent;
+        }
+        announced += (int)count;
+    }
+    if (write(release[1], "GG", 2) != 2) {
+        fprintf(stderr, "exe-race: release write failed: %s\n", strerror(errno));
+        goto fail_parent;
+    }
+    close(ready[0]);
+    close(release[1]);
+
+    int result = 0;
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+        if (waitpid(children[i], &status, 0) != children[i]
+            || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            result = 1;
+        }
+    }
+    return result;
+
+fail_parent:
+    close(ready[0]);
+    close(release[1]);
+fail:
+    for (int i = 0; i < 2; i++) {
+        if (children[i] > 0) kill(children[i], SIGKILL);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (children[i] > 0) waitpid(children[i], NULL, 0);
+    }
+    return 1;
+}
+
+static int cmd_failed_exec_exe(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "failed-exec-exe: need <bad-executable> <expected-exe>\n");
+        return 1;
+    }
+    char bad_executable[4096];
+    char expected[4096];
+    snprintf(bad_executable, sizeof(bad_executable), "%s", argv[0]);
+    snprintf(expected, sizeof(expected), "%s", argv[1]);
+    char *const bad_argv[] = {bad_executable, NULL};
+    execv(bad_executable, bad_argv);
+
+    char actual[4096];
+    ssize_t length = readlink("/proc/self/exe", actual, sizeof(actual) - 1);
+    if (length < 0) {
+        fprintf(stderr, "failed-exec-exe: readlink: %s\n", strerror(errno));
+        return 1;
+    }
+    actual[length] = '\0';
+    if (strcmp(actual, expected) != 0) {
+        fprintf(stderr, "failed-exec-exe: expected %s, got %s\n", expected, actual);
+        return 1;
+    }
+    printf("failed-exec-preserved=%s\n", actual);
+    return 0;
+}
+
+static int cmd_exec_chain(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "exec-chain: need <alias> <bad-executable> <expected-exe>\n");
+        return 1;
+    }
+    char *const chain_argv[] = {argv[0], argv[1], argv[2], NULL};
+    execv(argv[0], chain_argv);
+    fprintf(stderr, "exec-chain: execv failed: %s\n", strerror(errno));
+    return 1;
+}
+
 /* ── dispatch ───────────────────────────────────────────────── */
 
 static int dispatch(const char *cmd, int argc, char **argv) {
@@ -843,6 +1006,9 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
+    if (strcmp(cmd, "exe-race") == 0)       return cmd_exe_race(argc, argv);
+    if (strcmp(cmd, "exec-chain") == 0)     return cmd_exec_chain(argc, argv);
+    if (strcmp(cmd, "failed-exec-exe") == 0) return cmd_failed_exec_exe(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);
@@ -1014,6 +1180,10 @@ int main(int argc, char **argv) {
     const char *base = strrchr(argv[0], '/');
     base = base ? base + 1 : argv[0];
     if (strcmp(base, "rootfs-helper") != 0 && strcmp(base, "helper") != 0) {
+        if (strcmp(base, "exe-probe-a") == 0 || strcmp(base, "exe-probe-b") == 0)
+            return cmd_exe_probe(base, argc - 1, argv + 1);
+        if (strcmp(base, "exe-chain") == 0)
+            return cmd_failed_exec_exe(argc - 1, argv + 1);
         if (strcmp(base, "sh") == 0)
             return cmd_sh(argc - 1, argv + 1);
         return dispatch(base, argc - 1, argv + 1);

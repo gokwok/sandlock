@@ -212,6 +212,53 @@ pub struct ProcessIndex {
 /// because path resolution reads it from synchronous helpers.
 pub type SharedCwd = Arc<std::sync::Mutex<Option<PathBuf>>>;
 
+/// The virtual executable path associated with one process image.
+///
+/// Threads share the same cell because they share one executable image. A
+/// forked process receives a new cell initialized from its parent, matching
+/// the kernel's copy-on-fork semantics. Keeping the cell in `ProcessIndex`
+/// binds it to a stable [`PidKey`] and lets ordinary process cleanup discard
+/// it without a second lifecycle registry.
+type SharedExecutable = Arc<std::sync::Mutex<ExecutableState>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableRecord {
+    virtual_path: PathBuf,
+    device: u64,
+    inode: u64,
+    kernel_path: PathBuf,
+}
+
+#[derive(Default)]
+struct ExecutableState {
+    current: Option<ExecutableRecord>,
+    pending: Option<ExecutableRecord>,
+}
+
+fn executable_record_matches(record: &ExecutableRecord, pid: i32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let proc_exe = format!("/proc/{pid}/exe");
+    let Ok(metadata) = std::fs::metadata(&proc_exe) else {
+        return false;
+    };
+    let Ok(kernel_path) = std::fs::read_link(proc_exe) else {
+        return false;
+    };
+    metadata.dev() == record.device
+        && metadata.ino() == record.inode
+        && kernel_path == record.kernel_path
+}
+
+fn resolve_executable(cell: &SharedExecutable, pid: i32) -> Option<ExecutableRecord> {
+    let mut state = cell.lock().ok()?;
+    if let Some(pending) = state.pending.take() {
+        if executable_record_matches(&pending, pid) {
+            state.current = Some(pending);
+        }
+    }
+    state.current.clone()
+}
+
 #[derive(Clone)]
 struct ProcessEntry {
     key: PidKey,
@@ -222,6 +269,7 @@ struct ProcessEntry {
     tgid: i32,
     state: Arc<AsyncMutex<PerProcessState>>,
     cwd: SharedCwd,
+    executable: SharedExecutable,
     /// Fork-notification ID whose quota slot belongs to this process.  The
     /// top-level sandbox process and lazily discovered threads have no slot.
     process_slot: Option<u64>,
@@ -300,6 +348,7 @@ impl ProcessIndex {
             tgid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             cwd: self.inherited_cwd(pid, tgid),
+            executable: self.inherited_executable(pid, tgid),
             process_slot,
         };
         let displaced_process_slot = self
@@ -335,6 +384,40 @@ impl ProcessIndex {
             .and_then(|p| guard.get(&p))
             .and_then(|e| e.cwd.lock().ok().and_then(|c| c.clone()));
         Arc::new(std::sync::Mutex::new(parent_cwd))
+    }
+
+    /// The executable-image cell a task starts life with.
+    ///
+    /// A thread shares its leader's image. A process created by fork copies
+    /// the parent's current virtual path so a later exec in either process
+    /// cannot rename the other's `/proc/<pid>/exe` view.
+    fn inherited_executable(&self, pid: i32, tgid: i32) -> SharedExecutable {
+        let ppid = if tgid == pid { read_ppid(pid) } else { None };
+        let Ok(guard) = self.inner.read() else {
+            return SharedExecutable::default();
+        };
+        if tgid != pid {
+            if let Some(leader) = guard.get(&tgid) {
+                return Arc::clone(&leader.executable);
+            }
+        }
+        let parent = ppid.and_then(|parent| {
+            guard
+                .get(&parent)
+                .map(|entry| (parent, entry.key, Arc::clone(&entry.executable)))
+        });
+        drop(guard);
+        let current = parent.and_then(|(parent, key, cell)| {
+            if read_pid_start_time(parent) == Some(key.start_time) {
+                resolve_executable(&cell, parent)
+            } else {
+                None
+            }
+        });
+        Arc::new(std::sync::Mutex::new(ExecutableState {
+            current,
+            pending: None,
+        }))
     }
 
     /// The cwd cell to read or write for `pid`.
@@ -387,6 +470,69 @@ impl ProcessIndex {
         }
     }
 
+    /// Return the tracked virtual executable for the current incarnation of
+    /// `pid`. `None` means the task is untracked or has not passed through the
+    /// chroot exec rewrite yet.
+    pub(crate) fn virtual_executable(&self, pid: i32) -> Option<PathBuf> {
+        let (key, cell) = {
+            let guard = self.inner.read().ok()?;
+            let entry = guard.get(&pid)?;
+            (entry.key, Arc::clone(&entry.executable))
+        };
+        if read_pid_start_time(pid) != Some(key.start_time) {
+            return None;
+        }
+        resolve_executable(&cell, pid).map(|record| record.virtual_path)
+    }
+
+    /// Stage a chroot exec rewrite for one stable process identity.
+    ///
+    /// The next lookup compares `/proc/<pid>/exe` with the pinned fd before
+    /// promoting this candidate to current. A failed kernel exec therefore
+    /// preserves the old image, while a recycled numeric PID cannot receive
+    /// the candidate because the entry's [`PidKey`] must still match.
+    pub(crate) fn stage_virtual_executable(
+        &self,
+        key: PidKey,
+        executable: PathBuf,
+        executable_fd: std::os::unix::io::RawFd,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if read_pid_start_time(key.pid) != Some(key.start_time) {
+            return false;
+        }
+        let Ok(metadata) = std::fs::metadata(format!("/proc/self/fd/{executable_fd}")) else {
+            return false;
+        };
+        let Ok(kernel_path) = std::fs::read_link(format!("/proc/self/fd/{executable_fd}")) else {
+            return false;
+        };
+        let pending = ExecutableRecord {
+            virtual_path: executable,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            kernel_path,
+        };
+        let cell = {
+            let Ok(guard) = self.inner.read() else {
+                return false;
+            };
+            let Some(entry) = guard.get(&key.pid).filter(|entry| entry.key == key) else {
+                return false;
+            };
+            Arc::clone(&entry.executable)
+        };
+        // A process can exec again without reading `/proc/self/exe` between
+        // images. Resolve the previous candidate against the image that is
+        // still running before replacing it with this new attempt.
+        let _ = resolve_executable(&cell, key.pid);
+        let Ok(mut slot) = cell.lock() else {
+            return false;
+        };
+        slot.pending = Some(pending);
+        true
+    }
+
     /// Look up the canonical PidKey for a notification's raw pid.
     /// Returns None if this pid was never registered (e.g. pidfd_open
     /// failed at fork) — callers should fall back to a no-op.
@@ -430,6 +576,13 @@ impl ProcessIndex {
             .read()
             .map(|g| g.contains_key(&pid))
             .unwrap_or(false)
+    }
+
+    /// Whether `pid` still names the tracked process incarnation rather than
+    /// a task that reused the same numeric PID after delayed cleanup.
+    pub(crate) fn contains_current(&self, pid: i32) -> bool {
+        self.key_for(pid)
+            .is_some_and(|key| read_pid_start_time(pid) == Some(key.start_time))
     }
 
     /// Number of tracked processes (for /proc/loadavg total).
@@ -806,22 +959,26 @@ impl PolicyFnState {
 // ChrootState — chroot-specific runtime state
 // ============================================================
 
-/// Chroot-specific runtime state.
-pub struct ChrootState {
-    /// Virtual exe path for chroot (set by handle_chroot_exec when memfd patching
-    /// rewrites PT_INTERP, since /proc/self/exe would otherwise show the memfd path).
-    pub chroot_exe: Option<std::path::PathBuf>,
-}
+/// Chroot-specific sandbox-global runtime state.
+///
+/// Executable identity deliberately does not live here: one sandbox can host
+/// many concurrent process images, so that state belongs to `ProcessIndex`.
+pub struct ChrootState;
 
 impl ChrootState {
     pub fn new() -> Self {
-        Self { chroot_exe: None }
+        Self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+
+    fn current_executable() -> std::fs::File {
+        std::fs::File::open("/proc/self/exe").expect("open current executable")
+    }
 
     #[test]
     fn process_index_register_lookup_unregister() {
@@ -834,14 +991,27 @@ mod tests {
 
         assert_eq!(idx.key_for(self_pid), Some(key));
         assert!(idx.contains(self_pid));
+        assert!(idx.contains_current(self_pid));
         assert_eq!(idx.key_for(self_pid + 999_999), None);
         assert!(!idx.contains(self_pid + 999_999));
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.max_pid(), Some(self_pid));
+        let executable = current_executable();
+        assert!(idx.stage_virtual_executable(
+            key,
+            PathBuf::from("/usr/bin/current"),
+            executable.as_raw_fd(),
+        ));
+        assert_eq!(
+            idx.virtual_executable(self_pid),
+            Some(PathBuf::from("/usr/bin/current"))
+        );
 
         idx.unregister(key);
         assert_eq!(idx.key_for(self_pid), None);
+        assert_eq!(idx.virtual_executable(self_pid), None);
         assert!(!idx.contains(self_pid));
+        assert!(!idx.contains_current(self_pid));
         assert_eq!(idx.len(), 0);
         assert_eq!(idx.max_pid(), None);
     }
@@ -853,7 +1023,13 @@ mod tests {
         // cwd rather than start a private one.
         let leader = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
-        idx.register(leader).expect("leader registers");
+        let leader_key = idx.register(leader).expect("leader registers");
+        let executable = current_executable();
+        assert!(idx.stage_virtual_executable(
+            leader_key,
+            PathBuf::from("/usr/bin/leader"),
+            executable.as_raw_fd(),
+        ));
 
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -864,10 +1040,23 @@ mod tests {
             let _ = stop_rx.recv();
         });
         let tid = tid_rx.recv().unwrap();
-        idx.register(tid).expect("thread registers");
+        let tid_key = idx.register(tid).expect("thread registers");
 
         idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
         assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
+        assert_eq!(
+            idx.virtual_executable(tid),
+            Some(PathBuf::from("/usr/bin/leader"))
+        );
+        assert!(idx.stage_virtual_executable(
+            tid_key,
+            PathBuf::from("/usr/bin/replaced"),
+            executable.as_raw_fd(),
+        ));
+        assert_eq!(
+            idx.virtual_executable(leader),
+            Some(PathBuf::from("/usr/bin/replaced"))
+        );
 
         let _ = stop_tx.send(());
         thread.join().unwrap();
@@ -908,8 +1097,14 @@ mod tests {
         // and its later chdir must not move the parent.
         let parent = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
-        idx.register(parent).expect("parent registers");
+        let parent_key = idx.register(parent).expect("parent registers");
         idx.set_virtual_cwd(parent, PathBuf::from("/workspace"));
+        let executable = current_executable();
+        assert!(idx.stage_virtual_executable(
+            parent_key,
+            PathBuf::from("/usr/bin/parent"),
+            executable.as_raw_fd(),
+        ));
 
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
@@ -920,11 +1115,24 @@ mod tests {
             unsafe { libc::_exit(0) };
         }
 
-        idx.register(child).expect("child registers");
+        let child_key = idx.register(child).expect("child registers");
         assert_eq!(idx.virtual_cwd(child), Some(PathBuf::from("/workspace")));
+        assert_eq!(
+            idx.virtual_executable(child),
+            Some(PathBuf::from("/usr/bin/parent"))
+        );
 
         idx.set_virtual_cwd(child, PathBuf::from("/tmp"));
         assert_eq!(idx.virtual_cwd(parent), Some(PathBuf::from("/workspace")));
+        assert!(idx.stage_virtual_executable(
+            child_key,
+            PathBuf::from("/usr/bin/child"),
+            executable.as_raw_fd(),
+        ));
+        assert_eq!(
+            idx.virtual_executable(parent),
+            Some(PathBuf::from("/usr/bin/parent"))
+        );
 
         unsafe { libc::kill(child, libc::SIGKILL) };
         let mut status = 0;
@@ -943,20 +1151,37 @@ mod tests {
                 tgid: self_pid,
                 state: Arc::new(AsyncMutex::new(PerProcessState::default())),
                 cwd: SharedCwd::default(),
+                executable: SharedExecutable::default(),
                 process_slot: None,
             };
             idx.inner.write().unwrap().insert(self_pid, stale);
         }
+        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        let executable = current_executable();
+        assert!(!idx.stage_virtual_executable(
+            stale_key,
+            PathBuf::from("/stale"),
+            executable.as_raw_fd(),
+        ));
+        assert!(!idx.contains_current(self_pid));
+        assert_eq!(idx.virtual_executable(self_pid), None);
 
         let new_key = idx.register(self_pid).unwrap();
         assert_ne!(new_key.start_time, 0);
         assert_eq!(idx.key_for(self_pid), Some(new_key));
+        assert!(idx.contains_current(self_pid));
+        assert_eq!(idx.virtual_executable(self_pid), None);
 
         // Unregistering by the stale key must NOT clobber the fresh
         // registration; only an exact-match unregister wins.
-        let stale_key = PidKey { pid: self_pid, start_time: 0 };
+        assert!(!idx.stage_virtual_executable(
+            stale_key,
+            PathBuf::from("/stale"),
+            executable.as_raw_fd(),
+        ));
         idx.unregister(stale_key);
         assert_eq!(idx.key_for(self_pid), Some(new_key));
+        assert_eq!(idx.virtual_executable(self_pid), None);
     }
 
     #[tokio::test]
@@ -1004,6 +1229,7 @@ mod tests {
             tgid: self_pid,
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             cwd: SharedCwd::default(),
+            executable: SharedExecutable::default(),
             process_slot: None,
         };
         idx.inner.write().unwrap().insert(self_pid, stale);

@@ -278,6 +278,13 @@ filesystem isolation.
 
 Landlock rules are kernel-evaluated and TOCTOU-immune.
 
+With chroot mediation, `/proc/<pid>/exe` is virtualized per process image rather
+than per sandbox. Threads share one image identity, forked children inherit the
+parent's current identity, and a successful exec updates only the calling
+process. The record is keyed by the process start-time identity and removed with
+the process entry, so concurrent hardlink aliases and recycled numeric PIDs do
+not cross-contaminate one another.
+
 ## `[network]`
 
 Outbound allowlist, bind allowlist, and port virtualization. Each

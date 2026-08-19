@@ -94,6 +94,116 @@ fn cleanup_rootfs(rootfs: &PathBuf) {
     let _ = fs::remove_dir_all(rootfs);
 }
 
+fn install_executable_identity_aliases(rootfs: &PathBuf) {
+    let executable = rootfs.join("usr/bin/rootfs-helper");
+    for alias in ["exe-probe-a", "exe-probe-b"] {
+        let alias_path = rootfs.join("usr/bin").join(alias);
+        let _ = fs::remove_file(&alias_path);
+        fs::hard_link(&executable, alias_path).expect("hardlink executable alias");
+    }
+}
+
+async fn run_concurrent_executable_identity_probe(with_cow: bool) {
+    let name = if with_cow {
+        "proc-exe-per-process-cow"
+    } else {
+        "proc-exe-per-process"
+    };
+    let rootfs = build_test_rootfs(name);
+    install_executable_identity_aliases(&rootfs);
+
+    let mut builder = minimal_exec_policy(&rootfs);
+    if with_cow {
+        builder = builder
+            .fs_read("/tmp")
+            .workdir(rootfs.join("tmp"))
+            .on_exit(BranchAction::Abort);
+    }
+    let result = builder
+        .build()
+        .unwrap()
+        .run(&[
+            "rootfs-helper",
+            "exe-race",
+            "/usr/bin/exe-probe-a",
+            "/usr/bin/exe-probe-b",
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        result.success(),
+        "concurrent hardlink aliases must retain independent /proc/self/exe identities, \
+         cow={with_cow}, exit={:?}, stdout={}, stderr={}",
+        result.code(),
+        result.stdout_str().unwrap_or_default(),
+        result.stderr_str().unwrap_or_default(),
+    );
+    let stdout = result.stdout_str().unwrap_or_default();
+    assert!(
+        stdout.contains("exe-probe-a=/usr/bin/exe-probe-a"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("exe-probe-b=/usr/bin/exe-probe-b"),
+        "stdout={stdout}"
+    );
+
+    cleanup_rootfs(&rootfs);
+}
+
+#[tokio::test]
+async fn test_chroot_proc_exe_is_scoped_to_each_process_image() {
+    run_concurrent_executable_identity_probe(false).await;
+}
+
+#[tokio::test]
+async fn test_chroot_cow_proc_exe_is_scoped_to_each_process_image() {
+    run_concurrent_executable_identity_probe(true).await;
+}
+
+#[tokio::test]
+async fn test_chroot_failed_exec_preserves_previous_executable_identity() {
+    let rootfs = build_test_rootfs("proc-exe-failed-exec");
+    fs::hard_link(
+        rootfs.join("usr/bin/rootfs-helper"),
+        rootfs.join("usr/bin/exe-chain"),
+    )
+    .expect("hardlink executable chain alias");
+    let bad_executable = rootfs.join("usr/bin/not-an-executable");
+    fs::write(&bad_executable, b"not an executable\n").expect("write invalid executable");
+    fs::set_permissions(&bad_executable, fs::Permissions::from_mode(0o755))
+        .expect("make invalid executable runnable");
+
+    let result = minimal_exec_policy(&rootfs)
+        .build()
+        .unwrap()
+        .run(&[
+            "rootfs-helper",
+            "exec-chain",
+            "/usr/bin/exe-chain",
+            "/usr/bin/not-an-executable",
+            "/usr/bin/exe-chain",
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        result.success(),
+        "failed exec must preserve the last successful /proc/self/exe identity, exit={:?}, \
+         stdout={}, stderr={}",
+        result.code(),
+        result.stdout_str().unwrap_or_default(),
+        result.stderr_str().unwrap_or_default(),
+    );
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "failed-exec-preserved=/usr/bin/exe-chain",
+    );
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// List / inside chroot shows rootfs contents (should see "usr", "tmp", "bin", "etc")
 #[tokio::test]
 async fn test_chroot_ls_root() {
