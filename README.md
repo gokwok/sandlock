@@ -390,6 +390,9 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   before they can run user code. If the freeze or creation tracking
 >   cannot be established (e.g., YAMA blocks ptrace), the syscall is
 >   denied with `EPERM`; the safety invariant is never silently relaxed.
+>   Indexed TIDs are canonicalized to one TGID walk, and a bounded
+>   same-supervisor ptrace handoff covers a child that reaches exec while
+>   its fork event is still being retired.
 
 **Context methods:**
 - `ctx.restrict_network(ips)` / `ctx.grant_network(ips)` — network control
