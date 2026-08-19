@@ -278,6 +278,11 @@ filesystem isolation.
 
 Landlock rules are kernel-evaluated and TOCTOU-immune.
 
+A virtual mount also grants metadata traversal on each of its ancestor
+directories. This lets runtimes resolve a nested mounted entry point one
+component at a time (for example `lstat("/Users")` before entering a Workspace
+mount) without granting reads of sibling paths under those ancestors.
+
 With chroot mediation, `/proc/<pid>/exe` is virtualized per process image rather
 than per sandbox. Threads share one image identity, forked children inherit the
 parent's current identity, and a successful exec updates only the calling
@@ -289,6 +294,14 @@ describe `/proc/<pid>/{exe,fd/*,cwd,root}` as links, while following `exe` or an
 open `fd` describes the referred object. This supports runtimes that probe a
 `/proc/self/fd/N` shebang before opening it without exposing the Host link
 target.
+Successful shebang execution is treated as an interpreter image transition:
+if the staged script inode does not match the new kernel image, Sandlock drops
+the inherited executable record and reports the actual interpreter identity.
+A failed exec still preserves the previous record because that image continues
+to match. Exec path rewriting reads its own argv relocation inputs through the
+notification-gated `/proc/<pid>/mem` path, which can read valid execute-only or
+otherwise non-readable mappings without turning an invalid pointer into an
+allowed exec.
 
 ## `[network]`
 
