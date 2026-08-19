@@ -256,6 +256,19 @@ fn resolve_executable(cell: &SharedExecutable, pid: i32) -> Option<ExecutableRec
             state.current = Some(pending);
         }
     }
+    // A successful script exec replaces the process image with the kernel's
+    // shebang interpreter, not with the script inode staged above. In that
+    // case the inherited/current record is stale as well. Drop it so the
+    // chroot procfs handler falls back to the actual interpreter identity.
+    // A failed exec still leaves the previous image in place, so its current
+    // record continues to match and is preserved.
+    if state
+        .current
+        .as_ref()
+        .is_some_and(|current| !executable_record_matches(current, pid))
+    {
+        state.current = None;
+    }
     state.current.clone()
 }
 

@@ -257,6 +257,51 @@ async fn test_chroot_failed_exec_preserves_previous_executable_identity() {
     cleanup_rootfs(&rootfs);
 }
 
+#[tokio::test]
+async fn test_chroot_shebang_exec_discards_inherited_executable_identity() {
+    let env_target = match fs::read_link("/usr/bin/env") {
+        Ok(target) if target.to_string_lossy().contains("cargo/bin/coreutils") => target,
+        _ => {
+            eprintln!("skipping uutils shebang identity regression: /usr/bin/env is not uutils");
+            return;
+        }
+    };
+    assert!(!env_target.as_os_str().is_empty());
+    let script_dir = temp_dir("proc-exe-shebang");
+    let script = script_dir.join("probe-script");
+    fs::write(&script, "#!/usr/bin/env true\n").expect("write shebang probe");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("make shebang probe executable");
+
+    let command = script.to_string_lossy().into_owned();
+    let mut builder = Sandbox::builder()
+        .chroot("/")
+        .fs_read("/bin")
+        .fs_read("/usr")
+        .fs_read(&script_dir)
+        .fs_mount("/proc", "/proc")
+        .cwd(&script_dir);
+    for library in ["/lib", "/lib64"] {
+        if PathBuf::from(library).exists() {
+            builder = builder.fs_read(library);
+        }
+    }
+    let result = builder
+        .build()
+        .unwrap()
+        .run(&["/bin/bash", "-c", &command])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "uutils env must not inherit the shell executable identity, stdout={}, stderr={}",
+        result.stdout_str().unwrap_or_default(),
+        result.stderr_str().unwrap_or_default(),
+    );
+
+    let _ = fs::remove_dir_all(&script_dir);
+}
+
 /// List / inside chroot shows rootfs contents (should see "usr", "tmp", "bin", "etc")
 #[tokio::test]
 async fn test_chroot_ls_root() {
