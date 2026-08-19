@@ -115,6 +115,13 @@ impl ChrootCtx<'_> {
         if self.is_mounted(virtual_path) {
             return true;
         }
+        if self
+            .mounts
+            .iter()
+            .any(|(mount_path, _)| mount_path.starts_with(virtual_path))
+        {
+            return true;
+        }
         self.readable.is_empty()
             || self.readable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
             || self.writable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
@@ -2811,6 +2818,30 @@ mod mount_ro_tests {
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
+    }
+
+    #[test]
+    fn mount_ancestors_allow_metadata_traversal_without_exposing_siblings() {
+        let mounts = vec![(
+            PathBuf::from("/Users/example/project"),
+            PathBuf::from("/snapshot/tree"),
+        )];
+        let readable = vec![PathBuf::from("/usr")];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ChrootCtx {
+            root: Path::new("/"),
+            readable: &readable,
+            writable: &[],
+            denied: &[],
+            mounts: &mounts,
+            mount_ro: &[],
+            processes: &processes,
+        };
+
+        assert!(c.can_read(Path::new("/Users")));
+        assert!(c.can_read(Path::new("/Users/example")));
+        assert!(c.can_read(Path::new("/Users/example/project")));
+        assert!(!c.can_read(Path::new("/Users/other")));
     }
 
     #[test]

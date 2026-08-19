@@ -1490,6 +1490,47 @@ async fn test_fs_mount_read_write() {
     let _ = fs::remove_dir_all(&work_dir);
 }
 
+/// Programs such as Node resolve an entry point one ancestor at a time. A
+/// nested virtual mount therefore grants metadata traversal on its ancestors,
+/// while unrelated siblings remain outside the readable policy.
+#[tokio::test]
+async fn test_fs_mount_allows_lstat_of_virtual_ancestors() {
+    let rootfs = build_test_rootfs("fs-mount-ancestor-lstat");
+    fs::create_dir_all(rootfs.join("Users/example/project")).unwrap();
+    fs::create_dir_all(rootfs.join("Users/other")).unwrap();
+    let work_dir = temp_dir("fs-mount-ancestor-work");
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/Users/example/project", &work_dir)
+        .build()
+        .unwrap();
+
+    for ancestor in ["/Users", "/Users/example", "/Users/example/project"] {
+        let result = policy
+            .clone()
+            .run(&["rootfs-helper", "legacy-lstat", ancestor])
+            .await
+            .unwrap();
+        assert!(
+            result.success(),
+            "lstat({ancestor}) must permit mount traversal, stderr={}",
+            result.stderr_str().unwrap_or_default(),
+        );
+    }
+    let sibling = policy
+        .clone()
+        .run(&["rootfs-helper", "legacy-lstat", "/Users/other"])
+        .await
+        .unwrap();
+    assert!(
+        !sibling.success(),
+        "mount traversal must not grant metadata access to siblings"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&work_dir);
+}
+
 /// When the chroot image ships its own `/etc/hosts`, the synthetic file
 /// the sandbox sees should be seeded from the image's content (so any
 /// private-registry / internal-service entries the image baked in
