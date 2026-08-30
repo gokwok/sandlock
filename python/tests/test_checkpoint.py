@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -42,10 +43,23 @@ def running_sandbox():
     )
     assert sb._handle, "create failed"
     assert _lib.sandlock_start(sb._handle) == 0, "start failed"
-    yield sb
-    if sb._handle:
-        _lib.sandlock_handle_free(sb._handle)
-        sb._handle = None
+    try:
+        # The two-phase C ABI start only releases the exec gate. Checkpoint
+        # tests need the requested workload, not its still-pre-exec launcher.
+        # Match the executable inode (also works for multicall hardlinks)
+        # instead of depending on scheduler timing or a fixed startup sleep.
+        sleep_path = shutil.which("sleep")
+        assert sleep_path is not None
+        executable = Path(f"/proc/{sb.pid}/exe")
+        deadline = time.monotonic() + 5
+        while not executable.samefile(sleep_path):
+            assert time.monotonic() < deadline, "sleep did not complete exec"
+            time.sleep(0.005)
+        yield sb
+    finally:
+        if sb._handle:
+            _lib.sandlock_handle_free(sb._handle)
+            sb._handle = None
 
 
 class TestCheckpointCapture:
