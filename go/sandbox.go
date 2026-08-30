@@ -175,14 +175,20 @@ const (
 // and shared across goroutines. Use Spawn for explicit process lifecycle
 // control, which returns an independent *Process handle.
 type Sandbox struct {
-	// Filesystem (Landlock).
+	// Static filesystem provider. Empty defaults to Landlock.
+	FilesystemBackend       FilesystemBackend
+	BubblewrapPath          string
+	BubblewrapBootstrapPath string
+
+	// Filesystem policy.
 	FSReadable []string // paths the sandbox may read (and execute)
 	FSWritable []string // paths the sandbox may write
 	FSDenied   []string // paths explicitly denied
 
-	Workdir string // copy-on-write root; enables COW protection of this tree
-	Cwd     string // child working directory (chdir target)
-	Chroot  string // path to chroot into before applying confinement
+	Workdir        string // copy-on-write root; enables COW protection of this tree
+	WorkdirVirtual string // guest-visible path corresponding to Workdir's host lower
+	Cwd            string // child working directory (chdir target)
+	Chroot         string // path to chroot into before applying confinement
 
 	// FSMount maps virtual paths inside the chroot to host directories,
 	// like a bind mount without kernel mounts or root.
@@ -278,6 +284,15 @@ type Sandbox struct {
 	// decision or modify live policy through the supplied context.
 	PolicyFn PolicyFunc
 }
+
+// FilesystemBackend selects the static filesystem isolation provider.
+type FilesystemBackend string
+
+const (
+	FilesystemBackendLandlock   FilesystemBackend = "landlock"
+	FilesystemBackendBubblewrap FilesystemBackend = "bubblewrap"
+	FilesystemBackendAuto       FilesystemBackend = "auto"
+)
 
 // ExitReason is why a sandboxed process terminated. It mirrors the C
 // sandlock_exit_reason enum. Linux bottoms both a timeout and an OOM kill out in

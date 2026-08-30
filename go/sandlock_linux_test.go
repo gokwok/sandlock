@@ -50,6 +50,13 @@ func TestLandlockABI(t *testing.T) {
 	}
 }
 
+func TestInvalidFilesystemBackend(t *testing.T) {
+	sb := &sandlock.Sandbox{FilesystemBackend: sandlock.FilesystemBackend("unknown")}
+	if _, err := sb.Run(context.Background(), "true"); err == nil || !strings.Contains(err.Error(), "invalid filesystem backend") {
+		t.Fatalf("Run error = %v, want invalid filesystem backend", err)
+	}
+}
+
 func TestRunEcho(t *testing.T) {
 	requireLandlock(t)
 	sb := &sandlock.Sandbox{FSReadable: rootfs}

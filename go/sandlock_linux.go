@@ -132,8 +132,13 @@ func (s *Sandbox) validateStrings() error {
 		s.NetAllow, s.NetDeny, s.NetAllowBind, s.NetDenyBind,
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
-		{s.Workdir, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
+		{s.Workdir, s.WorkdirVirtual, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
+			s.BubblewrapPath, s.BubblewrapBootstrapPath, string(s.FilesystemBackend),
 			s.TimeStart, s.HTTPCAFile, s.HTTPKeyFile, s.Name},
+	}
+	if s.FilesystemBackend != "" && s.FilesystemBackend != FilesystemBackendLandlock &&
+		s.FilesystemBackend != FilesystemBackendBubblewrap && s.FilesystemBackend != FilesystemBackendAuto {
+		return fmt.Errorf("sandlock: invalid filesystem backend %q", s.FilesystemBackend)
 	}
 	for _, g := range groups {
 		for _, v := range g {
@@ -163,6 +168,14 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	}
 
 	b := C.sandlock_sandbox_builder_new()
+	backend := C.uint(0)
+	switch s.FilesystemBackend {
+	case FilesystemBackendBubblewrap:
+		backend = 1
+	case FilesystemBackendAuto:
+		backend = 2
+	}
+	b = C.sandlock_sandbox_builder_filesystem_backend(b, backend)
 
 	// str calls a one-string builder setter, freeing the C string afterward.
 	str := func(fn func(*C.sandlock_builder_t, *C.char) *C.sandlock_builder_t, val string) {
@@ -190,6 +203,21 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
 			return C.sandlock_sandbox_builder_workdir(b, c)
 		}, s.Workdir)
+	}
+	if s.WorkdirVirtual != "" {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_workdir_virtual(b, c)
+		}, s.WorkdirVirtual)
+	}
+	if s.BubblewrapPath != "" {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_bubblewrap_path(b, c)
+		}, s.BubblewrapPath)
+	}
+	if s.BubblewrapBootstrapPath != "" {
+		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {
+			return C.sandlock_sandbox_builder_bubblewrap_bootstrap_path(b, c)
+		}, s.BubblewrapBootstrapPath)
 	}
 	if s.Cwd != "" {
 		str(func(b *C.sandlock_builder_t, c *C.char) *C.sandlock_builder_t {

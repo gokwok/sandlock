@@ -2,12 +2,20 @@
 
 Go bindings for [sandlock](https://github.com/multikernel/sandlock), a
 lightweight Linux process sandbox built on Landlock, seccomp-bpf, and seccomp
-user notification. No root, no Docker, no namespaces.
+user notification. No root or Docker required; namespaces are optional with
+the Landlock backend and required with the Bubblewrap backend.
 
 The bindings bind the sandlock C ABI (`libsandlock_ffi`) via cgo, mirroring the
 Python SDK's `Sandbox` surface. **Linux only**; by default the runtime requires
 Linux 6.12+ (Landlock ABI v6), but the `AllowDegraded` / `Disable` fields let a
 sandbox run on older kernels by degrading or disabling the v6-only protections.
+
+`FilesystemBackendBubblewrap` explicitly selects filesystem isolation without
+Landlock; `FilesystemBackendAuto` prefers Landlock when all strict protections
+are available. Neither selection implicitly relaxes protections. Configure
+`BubblewrapBootstrapPath` to a deployed `sandlock-bootstrap`, and optionally
+`BubblewrapPath` to a trusted `bwrap`. These are deployment paths, not policy
+profile fields. See [requirements and limitations](../README.md#optional-bubblewrap-filesystem-backend).
 
 ```go
 import sandlock "github.com/multikernel/sandlock/go"
@@ -90,7 +98,7 @@ fresh native policy on each call.
 
 | Group | Fields |
 |---|---|
-| Filesystem | `FSReadable`, `FSWritable`, `FSDenied`, `Workdir`, `Cwd`, `Chroot`, `FSMount` |
+| Filesystem | `FilesystemBackend`, `BubblewrapPath`, `BubblewrapBootstrapPath`, `FSReadable`, `FSWritable`, `FSDenied`, `Workdir`, `WorkdirVirtual`, `Cwd`, `Chroot`, `FSMount` |
 | Network | `NetAllow`, `NetDeny`, `NetAllowBind`, `NetDenyBind`, `PortRemap` |
 | HTTP ACL | `HTTPAllow`, `HTTPDeny`, `HTTPPorts`, `HTTPCAFile`, `HTTPKeyFile` |
 | Resources | `MaxMemory`, `MaxDisk`, `MaxProcesses`, `MaxCPU`, `MaxOpenFiles`, `CPUCores`, `NumCPUs`, `GPUDevices` |
