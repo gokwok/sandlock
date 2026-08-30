@@ -1,46 +1,48 @@
-pub mod error;
-pub mod http;
-pub(crate) mod credential;
-pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
-pub mod profile;
-pub mod result;
 pub(crate) mod arch;
-pub(crate) mod sys;
-pub mod landlock;
-pub mod protection;
-pub mod seccomp;
-pub mod snapshot;
-pub(crate) mod resource;
-pub(crate) mod network;
-pub mod context;
-pub(crate) mod resolved;
-pub(crate) mod seccomp_plan;
-pub(crate) mod vdso;
-pub(crate) mod random;
-pub(crate) mod time;
-pub(crate) mod cow;
-pub mod recovery;
-pub(crate) mod checkpoint;
-pub(crate) mod freeze;
-pub mod netlink;
-pub(crate) mod procfs;
-pub(crate) mod port_remap;
-pub mod pipeline;
-pub mod transaction;
-pub mod policy_fn;
-pub mod image;
-pub mod fork;
 pub mod branch;
 pub(crate) mod ca_inject;
+pub(crate) mod checkpoint;
 pub(crate) mod chroot;
-pub mod dry_run;
+pub mod context;
 pub mod control;
+pub(crate) mod cow;
+pub(crate) mod credential;
+pub mod dry_run;
+pub mod error;
+pub mod fork;
+pub(crate) mod freeze;
+pub mod http;
+pub mod image;
+pub mod landlock;
+pub mod netlink;
+pub(crate) mod network;
+pub mod pipeline;
+pub mod policy_fn;
+pub(crate) mod port_remap;
+pub(crate) mod procfs;
+pub mod profile;
+pub mod protection;
+pub(crate) mod random;
+pub mod recovery;
+pub(crate) mod resolved;
+pub(crate) mod resource;
+pub mod result;
+pub mod sandbox; // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
+pub mod seccomp;
+pub(crate) mod seccomp_plan;
+pub mod snapshot;
+pub(crate) mod sys;
+pub(crate) mod time;
+pub mod transaction;
 mod transparent_proxy;
+pub(crate) mod vdso;
 
-pub use error::{BranchError, SandboxRuntimeError, SandlockError, SnapshotError};
-pub use sys::structs::{SeccompData, SeccompNotif};
+pub use branch::{BranchInspection, BranchState, FsBranch, PendingBranch, PendingRunResult};
 pub use checkpoint::{Checkpoint, SkippedFd};
-pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
+pub use error::{BranchError, SandboxRuntimeError, SandlockError, SnapshotError};
+pub use pipeline::{Gather, Pipeline, Stage};
+pub use protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
+pub use result::{ExitStatus, RunResult};
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, PauseGuard, Process, Sandbox, SandboxBuilder,
     StdioMode,
@@ -49,24 +51,21 @@ pub use snapshot::{
     FsSnapshot, FsSnapshotDescriptor, SnapshotChange, SnapshotChangeKind, SnapshotCompareLimits,
     SnapshotCompareScope, SnapshotComparison, SnapshotDelta, SnapshotDeltaApplyMode,
     SnapshotDeltaLimits, SnapshotDeltaPolicy, SnapshotDeltaSummary, SnapshotDiff, SnapshotEntry,
-    SnapshotEntryKind, SnapshotList, SnapshotMutation, SnapshotMutationLimits,
-    SnapshotRequirement,
+    SnapshotEntryKind, SnapshotList, SnapshotMutation, SnapshotMutationLimits, SnapshotRequirement,
 };
-pub use result::{RunResult, ExitStatus};
-pub use branch::{BranchInspection, BranchState, FsBranch, PendingBranch, PendingRunResult};
-pub use pipeline::{Stage, Pipeline, Gather};
+pub use sys::structs::{SeccompData, SeccompNotif};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
 // rest of `cow` is internal; the `recovery` module is the backend-neutral path
 // these belong to, and the flat aliases here are kept for convenience.
-pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
+pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).
 // format_net_rule renders a NetRule back into the --net-allow/--net-deny
 // grammar (the CLI round-trips profiles through it); the other reverse
 // serializers live unre-exported in `profile`.
-pub use crate::profile::{ProfileInput, ProgramSpec, format_net_rule};
+pub use crate::profile::{format_net_rule, ProfileInput, ProgramSpec};
 
 // Public extension API — see docs/extension-handlers.md.
 pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};
@@ -91,12 +90,10 @@ pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
     // Set NO_NEW_PRIVS (required for Landlock)
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(SandlockError::Runtime(
-            error::SandboxRuntimeError::Confinement(
-                error::ConfinementError::Landlock(format!(
-                    "prctl(PR_SET_NO_NEW_PRIVS): {}",
-                    std::io::Error::last_os_error()
-                ))
-            )
+            error::SandboxRuntimeError::Confinement(error::ConfinementError::Landlock(format!(
+                "prctl(PR_SET_NO_NEW_PRIVS): {}",
+                std::io::Error::last_os_error()
+            ))),
         ));
     }
 

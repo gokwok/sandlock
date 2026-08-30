@@ -707,7 +707,9 @@ pub struct SeccompCowBranch {
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 enum BaseStamp {
-    Absent { parent: Option<(u64, u64)> },
+    Absent {
+        parent: Option<(u64, u64)>,
+    },
     Present {
         device: u64,
         inode: u64,
@@ -770,13 +772,18 @@ impl SeccompCowBranch {
     /// (reaped by logind on last-session-exit, size-limited tmpfs), so a daemon or
     /// cross-session recovery MUST set an explicit durable `fs_storage`. See
     /// [`crate::recovery`].
-    pub fn create(workdir: &Path, storage: Option<&Path>, max_disk_bytes: u64) -> Result<Self, BranchError> {
+    pub fn create(
+        workdir: &Path,
+        storage: Option<&Path>,
+        max_disk_bytes: u64,
+    ) -> Result<Self, BranchError> {
         let storage_base = match storage {
             Some(p) => {
                 fs::create_dir_all(p)
                     .map_err(|e| BranchError::Operation(format!("create branch storage: {e}")))?;
-                p.canonicalize()
-                    .map_err(|e| BranchError::Operation(format!("canonicalize branch storage: {e}")))?
+                p.canonicalize().map_err(|e| {
+                    BranchError::Operation(format!("canonicalize branch storage: {e}"))
+                })?
             }
             None => resolve_default_storage_base(
                 std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
@@ -792,7 +799,8 @@ impl SeccompCowBranch {
         // Canonicalize the workdir BEFORE creating the branch dir, so a failure
         // here (e.g. the workdir was removed between validation and now) can't
         // orphan an empty branch/upper dir on disk.
-        let workdir = workdir.canonicalize()
+        let workdir = workdir
+            .canonicalize()
             .map_err(|e| BranchError::Operation(format!("canonicalize workdir: {}", e)))?;
 
         fs::create_dir_all(&upper)
@@ -844,7 +852,10 @@ impl SeccompCowBranch {
             base: self.base.clone().unwrap_or_default(),
             directory_modes: self.directory_modes.clone(),
             lower_directory_modes: self.lower_directory_modes.clone(),
-            snapshot_lease: self.snapshot_lease.as_ref().map(|lease| lease.record().clone()),
+            snapshot_lease: self
+                .snapshot_lease
+                .as_ref()
+                .map(|lease| lease.record().clone()),
         };
         self.sync_upper_tree()?;
         self.write_reopen_metadata(&metadata)?;
@@ -982,7 +993,9 @@ impl SeccompCowBranch {
                 "persisted branch marker changed before reopen".to_string(),
             ));
         }
-        let branch_dir = recorded.branch_dir.canonicalize()
+        let branch_dir = recorded
+            .branch_dir
+            .canonicalize()
             .map_err(|e| BranchError::Operation(format!("canonicalize branch storage: {e}")))?;
         if branch_dir != recorded.branch_dir {
             return Err(BranchError::Operation(
@@ -1011,7 +1024,10 @@ impl SeccompCowBranch {
             .map_err(|e| BranchError::Operation(format!("read reopen metadata: {e}")))?;
         let metadata: ReopenMetadata = serde_json::from_slice(&bytes)
             .map_err(|e| BranchError::Operation(format!("parse reopen metadata: {e}")))?;
-        if !matches!(metadata.schema_version, REOPEN_SCHEMA_LEGACY | REOPEN_SCHEMA_SNAPSHOT) {
+        if !matches!(
+            metadata.schema_version,
+            REOPEN_SCHEMA_LEGACY | REOPEN_SCHEMA_SNAPSHOT
+        ) {
             return Err(BranchError::Operation(format!(
                 "unsupported reopen metadata schema {}",
                 metadata.schema_version
@@ -1047,7 +1063,9 @@ impl SeccompCowBranch {
                 .map(|mut entries| entries.next().is_some())
                 .unwrap_or(false);
         let disk_used = dir_size(&recorded.upper);
-        let snapshot_lease = metadata.snapshot_lease.clone()
+        let snapshot_lease = metadata
+            .snapshot_lease
+            .clone()
             .map(crate::snapshot::SnapshotLease::from_record)
             .transpose()
             .map_err(BranchError::Snapshot)?;
@@ -1306,11 +1324,7 @@ impl SeccompCowBranch {
         for (path, mode) in &elevated {
             if let Err(errno) = crate::sys::fs::chmod_in_root(&self.upper, path, *mode | 0o700) {
                 for (restore_path, restore_mode) in elevated[..elevated_count].iter().rev() {
-                    let _ = crate::sys::fs::chmod_in_root(
-                        &self.upper,
-                        restore_path,
-                        *restore_mode,
-                    );
+                    let _ = crate::sys::fs::chmod_in_root(&self.upper, restore_path, *restore_mode);
                 }
                 return Err(BranchError::Operation(format!(
                     "temporarily open upper directory {path}: {}",
@@ -1322,10 +1336,7 @@ impl SeccompCowBranch {
         Ok(elevated)
     }
 
-    fn restore_upper_directories(
-        &self,
-        elevated: Vec<(String, u32)>,
-    ) -> Option<BranchError> {
+    fn restore_upper_directories(&self, elevated: Vec<(String, u32)>) -> Option<BranchError> {
         let mut restore_error = None;
         for (path, mode) in elevated.into_iter().rev() {
             if let Err(errno) = crate::sys::fs::chmod_in_root(&self.upper, &path, mode) {
@@ -1438,129 +1449,129 @@ impl SeccompCowBranch {
         self.check_quota(additional)?;
 
         let result = (|| {
+            let mut removals = delta
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.before.is_some()
+                        && entry.after.as_ref().is_none_or(|after| {
+                            entry
+                                .before
+                                .as_ref()
+                                .is_some_and(|before| before.kind != after.kind)
+                        })
+                })
+                .collect::<Vec<_>>();
+            removals.sort_by(|left, right| {
+                right
+                    .change
+                    .path
+                    .components()
+                    .count()
+                    .cmp(&left.change.path.components().count())
+            });
+            for entry in removals {
+                let before = entry.before.as_ref().expect("removal has a base entry");
+                let path = self.workdir.join(&entry.change.path);
+                let path = path.to_str().ok_or_else(|| {
+                    BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                        entry.change.path.display().to_string(),
+                    ))
+                })?;
+                let removed = self
+                    .handle_unlink(
+                        path,
+                        before.kind == crate::snapshot::SnapshotEntryKind::Directory,
+                    )
+                    .map_err(|errno| {
+                        BranchError::Operation(format!(
+                            "apply snapshot delta removal {}: {}",
+                            entry.change.path.display(),
+                            std::io::Error::from_raw_os_error(errno)
+                        ))
+                    })?;
+                if !removed {
+                    return Err(BranchError::Operation(format!(
+                        "snapshot delta removal escaped branch: {}",
+                        entry.change.path.display()
+                    )));
+                }
+            }
 
-        let mut removals = delta
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.before.is_some()
-                    && entry.after.as_ref().is_none_or(|after| {
-                        entry
-                            .before
-                            .as_ref()
-                            .is_some_and(|before| before.kind != after.kind)
+            let mut directories = delta
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.after.as_ref().is_some_and(|after| {
+                        after.kind == crate::snapshot::SnapshotEntryKind::Directory
+                    }) && entry.before.as_ref().is_none_or(|before| {
+                        before.kind != crate::snapshot::SnapshotEntryKind::Directory
                     })
-            })
-            .collect::<Vec<_>>();
-        removals.sort_by(|left, right| {
-            right
-                .change
-                .path
-                .components()
-                .count()
-                .cmp(&left.change.path.components().count())
-        });
-        for entry in removals {
-            let before = entry.before.as_ref().expect("removal has a base entry");
-            let path = self.workdir.join(&entry.change.path);
-            let path = path.to_str().ok_or_else(|| {
-                BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
-                    entry.change.path.display().to_string(),
-                ))
-            })?;
-            let removed = self
-                .handle_unlink(
-                    path,
-                    before.kind == crate::snapshot::SnapshotEntryKind::Directory,
-                )
-                .map_err(|errno| {
+                })
+                .collect::<Vec<_>>();
+            directories.sort_by_key(|entry| entry.change.path.components().count());
+            for entry in directories {
+                let after = entry.after.as_ref().expect("directory has a target entry");
+                let path = self.workdir.join(&entry.change.path);
+                let path = path.to_str().ok_or_else(|| {
+                    BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                        entry.change.path.display().to_string(),
+                    ))
+                })?;
+                if !self.handle_mkdir(path, after.mode)? {
+                    return Err(BranchError::Operation(format!(
+                        "apply snapshot delta directory {}",
+                        entry.change.path.display()
+                    )));
+                }
+            }
+
+            for entry in delta.entries.iter().filter(|entry| {
+                entry.after.as_ref().is_some_and(|after| {
+                    after.kind != crate::snapshot::SnapshotEntryKind::Directory
+                }) && entry.change.kind != crate::snapshot::SnapshotChangeKind::Deleted
+            }) {
+                let after = entry.after.as_ref().expect("put has a target entry");
+                self.put_snapshot_delta_entry(delta.target, after)?;
+            }
+
+            let mut directory_modes = delta
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .after
+                        .as_ref()
+                        .filter(|after| after.kind == crate::snapshot::SnapshotEntryKind::Directory)
+                })
+                .collect::<Vec<_>>();
+            directory_modes.sort_by(|left, right| {
+                right
+                    .path
+                    .components()
+                    .count()
+                    .cmp(&left.path.components().count())
+            });
+            for after in directory_modes {
+                let rel = after.path.to_str().ok_or_else(|| {
+                    BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
+                        after.path.display().to_string(),
+                    ))
+                })?;
+                let upper = self.ensure_cow_copy(rel)?;
+                crate::sys::fs::chmod_in_root(&self.upper, rel, after.mode).map_err(|errno| {
                     BranchError::Operation(format!(
-                        "apply snapshot delta removal {}: {}",
-                        entry.change.path.display(),
+                        "set snapshot delta directory mode {}: {}",
+                        after.path.display(),
                         std::io::Error::from_raw_os_error(errno)
                     ))
                 })?;
-            if !removed {
-                return Err(BranchError::Operation(format!(
-                    "snapshot delta removal escaped branch: {}",
-                    entry.change.path.display()
-                )));
+                debug_assert!(upper.starts_with(&self.upper));
+                self.directory_modes.insert(rel.to_string(), after.mode);
             }
-        }
-
-        let mut directories = delta
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.after.as_ref().is_some_and(|after| {
-                    after.kind == crate::snapshot::SnapshotEntryKind::Directory
-                }) && entry.before.as_ref().is_none_or(|before| {
-                    before.kind != crate::snapshot::SnapshotEntryKind::Directory
-                })
-            })
-            .collect::<Vec<_>>();
-        directories.sort_by_key(|entry| entry.change.path.components().count());
-        for entry in directories {
-            let after = entry.after.as_ref().expect("directory has a target entry");
-            let path = self.workdir.join(&entry.change.path);
-            let path = path.to_str().ok_or_else(|| {
-                BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
-                    entry.change.path.display().to_string(),
-                ))
-            })?;
-            if !self.handle_mkdir(path, after.mode)? {
-                return Err(BranchError::Operation(format!(
-                    "apply snapshot delta directory {}",
-                    entry.change.path.display()
-                )));
-            }
-        }
-
-        for entry in delta.entries.iter().filter(|entry| {
-            entry.after.as_ref().is_some_and(|after| {
-                after.kind != crate::snapshot::SnapshotEntryKind::Directory
-            }) && entry.change.kind != crate::snapshot::SnapshotChangeKind::Deleted
-        }) {
-            let after = entry.after.as_ref().expect("put has a target entry");
-            self.put_snapshot_delta_entry(delta.target, after)?;
-        }
-
-        let mut directory_modes = delta
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                entry.after.as_ref().filter(|after| {
-                    after.kind == crate::snapshot::SnapshotEntryKind::Directory
-                })
-            })
-            .collect::<Vec<_>>();
-        directory_modes.sort_by(|left, right| {
-            right
-                .path
-                .components()
-                .count()
-                .cmp(&left.path.components().count())
-        });
-        for after in directory_modes {
-            let rel = after.path.to_str().ok_or_else(|| {
-                BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
-                    after.path.display().to_string(),
-                ))
-            })?;
-            let upper = self.ensure_cow_copy(rel)?;
-            crate::sys::fs::chmod_in_root(&self.upper, rel, after.mode).map_err(|errno| {
-                BranchError::Operation(format!(
-                    "set snapshot delta directory mode {}: {}",
-                    after.path.display(),
-                    std::io::Error::from_raw_os_error(errno)
-                ))
-            })?;
-            debug_assert!(upper.starts_with(&self.upper));
-            self.directory_modes.insert(rel.to_string(), after.mode);
-        }
-        self.recalc_disk_used();
-        self.sync_upper_tree()?;
-        Ok(delta.summary())
+            self.recalc_disk_used();
+            self.sync_upper_tree()?;
+            Ok(delta.summary())
         })();
         result.map_err(|error: BranchError| {
             BranchError::Snapshot(crate::error::SnapshotError::DeltaApplyIncomplete {
@@ -1628,17 +1639,13 @@ impl SeccompCowBranch {
                 let target = entry.symlink_target.as_ref().ok_or_else(|| {
                     BranchError::Operation("snapshot delta symlink target is missing".to_string())
                 })?;
-                crate::sys::fs::symlinkat_in_root(
-                    &self.upper,
-                    rel,
-                    &target.to_string_lossy(),
-                )
-                .map_err(|errno| {
-                    BranchError::Operation(format!(
-                        "create snapshot delta symlink: {}",
-                        std::io::Error::from_raw_os_error(errno)
-                    ))
-                })?;
+                crate::sys::fs::symlinkat_in_root(&self.upper, rel, &target.to_string_lossy())
+                    .map_err(|errno| {
+                        BranchError::Operation(format!(
+                            "create snapshot delta symlink: {}",
+                            std::io::Error::from_raw_os_error(errno)
+                        ))
+                    })?;
             }
             crate::snapshot::SnapshotEntryKind::Directory => {
                 return Err(BranchError::Operation(
@@ -1676,9 +1683,7 @@ impl SeccompCowBranch {
             let resolved = self.resolve_merged_rel(&rel, true);
             match resolved {
                 Some(resolved) => {
-                    resolved != rel
-                        || self.deleted.covers(&resolved)
-                        || self.upper_has(&resolved)
+                    resolved != rel || self.deleted.covers(&resolved) || self.upper_has(&resolved)
                 }
                 None => true,
             }
@@ -1726,11 +1731,17 @@ impl SeccompCowBranch {
     /// `d/new.txt` publish into a directory that no longer holds the stale
     /// contents (`deletions_are_applied_before_additions_at_the_same_path`).
     fn outstanding_deletions(&self) -> impl Iterator<Item = &str> {
-        self.deleted.iter().filter(|r| !self.applied_deletions.contains(*r))
+        self.deleted
+            .iter()
+            .filter(|r| !self.applied_deletions.contains(*r))
     }
 
     fn record_base(&mut self, rel_path: &str) {
-        if self.base.as_ref().is_some_and(|base| !base.contains_key(rel_path)) {
+        if self
+            .base
+            .as_ref()
+            .is_some_and(|base| !base.contains_key(rel_path))
+        {
             let stamp = self.lower_stamp(rel_path);
             self.base
                 .as_mut()
@@ -1792,11 +1803,9 @@ impl SeccompCowBranch {
                 let meta = fs::symlink_metadata(&self.workdir).ok()?;
                 return Some((meta.dev(), meta.ino()));
             }
-            if let Ok(st) = crate::sys::fs::statat_in_root(
-                &self.workdir,
-                &path.to_string_lossy(),
-                false,
-            ) {
+            if let Ok(st) =
+                crate::sys::fs::statat_in_root(&self.workdir, &path.to_string_lossy(), false)
+            {
                 return Some((st.st_dev as u64, st.st_ino as u64));
             }
             parent = path.parent();
@@ -1897,7 +1906,11 @@ impl SeccompCowBranch {
             // an empty upper file rather than falling through to a real
             // permission error the virtualized child was promised not to hit.
             Err(libc::ENOENT) | Err(libc::EACCES) => {
-                if self.base.as_ref().is_some_and(|base| !base.contains_key(rel_path)) {
+                if self
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| !base.contains_key(rel_path))
+                {
                     let stamp = BaseStamp::Absent {
                         parent: self.lower_parent_identity(rel_path),
                     };
@@ -2044,15 +2057,17 @@ impl SeccompCowBranch {
     pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
         match self.prepare_copy(rel_path)? {
             CowCopyPlan::Ready(upper) => Ok(upper),
-            CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size } => {
-                match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
-                    Ok(()) => Ok(upper),
-                    Err(e) => {
-                        self.rollback_copy(file_size);
-                        Err(BranchError::Operation(format!("copy: {}", e)))
-                    }
+            CowCopyPlan::NeedsCopy {
+                upper,
+                lower: _lower,
+                file_size,
+            } => match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
+                Ok(()) => Ok(upper),
+                Err(e) => {
+                    self.rollback_copy(file_size);
+                    Err(BranchError::Operation(format!("copy: {}", e)))
                 }
-            }
+            },
         }
     }
 
@@ -2152,9 +2167,7 @@ impl SeccompCowBranch {
                     std::path::Component::RootDir => out.push("/".to_string()),
                     std::path::Component::CurDir => {}
                     std::path::Component::ParentDir => out.push("..".to_string()),
-                    std::path::Component::Normal(value) => {
-                        out.push(value.to_str()?.to_string())
-                    }
+                    std::path::Component::Normal(value) => out.push(value.to_str()?.to_string()),
                     std::path::Component::Prefix(_) => return None,
                 }
             }
@@ -2191,9 +2204,7 @@ impl SeccompCowBranch {
                     Some(&self.upper)
                 } else if self.deleted.covers(&candidate) {
                     return None;
-                } else if crate::sys::fs::statat_in_root(&self.workdir, &candidate, false)
-                    .is_ok()
-                {
+                } else if crate::sys::fs::statat_in_root(&self.workdir, &candidate, false).is_ok() {
                     Some(&self.workdir)
                 } else {
                     None
@@ -2233,11 +2244,7 @@ impl SeccompCowBranch {
             .is_some_and(|(_, used_symlink, _)| used_symlink)
     }
 
-    pub(crate) fn merged_path_uses_absolute_symlink(
-        &self,
-        path: &str,
-        follow_final: bool,
-    ) -> bool {
+    pub(crate) fn merged_path_uses_absolute_symlink(&self, path: &str, follow_final: bool) -> bool {
         self.safe_rel(path)
             .and_then(|rel| self.resolve_merged_rel_with_symlink(&rel, follow_final))
             .is_some_and(|(_, _, used_absolute)| used_absolute)
@@ -2253,12 +2260,10 @@ impl SeccompCowBranch {
         follow_final: bool,
     ) -> Result<String, i32> {
         let rel = self.safe_rel(path).ok_or(libc::EACCES)?;
-        let resolved = self.resolve_merged_rel(&rel, follow_final).ok_or(libc::ENOENT)?;
-        Ok(self
-            .workdir
-            .join(resolved)
-            .to_string_lossy()
-            .into_owned())
+        let resolved = self
+            .resolve_merged_rel(&rel, follow_final)
+            .ok_or(libc::ENOENT)?;
+        Ok(self.workdir.join(resolved).to_string_lossy().into_owned())
     }
 
     /// Resolve below an openat2 caller-selected dirfd root. Absolute symlink
@@ -2313,7 +2318,9 @@ impl SeccompCowBranch {
                 format!("{}/{}", resolved.join("/"), component)
             };
             if follow_final || !pending.is_empty() {
-                let layer = if crate::sys::fs::statat_in_root(&self.upper, &candidate, false).is_ok() {
+                let layer = if crate::sys::fs::statat_in_root(&self.upper, &candidate, false)
+                    .is_ok()
+                {
                     Some(&self.upper)
                 } else if self.deleted.covers(&candidate) {
                     return Err(libc::ENOENT);
@@ -2337,7 +2344,11 @@ impl SeccompCowBranch {
                             if beneath {
                                 return Err(libc::EXDEV);
                             }
-                            resolved = if in_root { boundary.clone() } else { Vec::new() };
+                            resolved = if in_root {
+                                boundary.clone()
+                            } else {
+                                Vec::new()
+                            };
                         }
                         for part in parts(&target)?.into_iter().rev() {
                             pending.push_front(part);
@@ -2348,7 +2359,11 @@ impl SeccompCowBranch {
             }
             resolved.push(component);
         }
-        Ok(self.workdir.join(resolved.join("/")).to_string_lossy().into_owned())
+        Ok(self
+            .workdir
+            .join(resolved.join("/"))
+            .to_string_lossy()
+            .into_owned())
     }
 
     fn resolve_read_with_follow(&self, rel_path: &str, follow_final: bool) -> Option<PathBuf> {
@@ -2519,13 +2534,11 @@ impl SeccompCowBranch {
         if is_write {
             self.prepare_cow_copy(&rel)
         } else {
-            let resolved = match self.resolve_read_with_follow(
-                &lexical_rel,
-                flags & O_NOFOLLOW == 0,
-            ) {
-                Some(path) => path,
-                None => return Ok(CowOpenPlan::Deleted),
-            };
+            let resolved =
+                match self.resolve_read_with_follow(&lexical_rel, flags & O_NOFOLLOW == 0) {
+                    Some(path) => path,
+                    None => return Ok(CowOpenPlan::Deleted),
+                };
             if resolved.exists() || resolved.is_symlink() {
                 Ok(CowOpenPlan::Resolved(resolved))
             } else {
@@ -2542,14 +2555,16 @@ impl SeccompCowBranch {
                     .is_err(),
                 upper,
             }),
-            CowCopyPlan::NeedsCopy { upper, lower, file_size } => {
-                Ok(CowOpenPlan::NeedsCopy {
-                    upper,
-                    lower,
-                    file_size,
-                    rel_path: rel_path.to_string(),
-                })
-            }
+            CowCopyPlan::NeedsCopy {
+                upper,
+                lower,
+                file_size,
+            } => Ok(CowOpenPlan::NeedsCopy {
+                upper,
+                lower,
+                file_size,
+                rel_path: rel_path.to_string(),
+            }),
         }
     }
 
@@ -2675,7 +2690,7 @@ impl SeccompCowBranch {
         // Only S_IFIFO, S_IFSOCK, S_IFREG, and 0 are permitted.
         // S_IFBLK/S_IFCHR are rejected: the supervisor creates nodes under its
         // own credentials, making device nodes a sandbox escape on root runs.
-        let file_type = mode & libc::S_IFMT as u32; // strips the permission bits 
+        let file_type = mode & libc::S_IFMT as u32; // strips the permission bits
         let allowed = file_type == 0
             || file_type == libc::S_IFREG as u32
             || file_type == libc::S_IFIFO as u32
@@ -2732,9 +2747,7 @@ impl SeccompCowBranch {
         let Some(parent) = parent_rel(&rel).filter(|parent| !parent.is_empty()) else {
             return Ok(());
         };
-        let resolved = self
-            .resolve_merged_rel(parent, true)
-            .ok_or(libc::ENOENT)?;
+        let resolved = self.resolve_merged_rel(parent, true).ok_or(libc::ENOENT)?;
         match self.merged_entry_is_dir(&resolved) {
             Some(true) => Ok(()),
             Some(false) => Err(libc::ENOTDIR),
@@ -2976,8 +2989,10 @@ impl SeccompCowBranch {
             self.check_quota(new_len - old_len)?;
         }
         let fd = match crate::sys::fs::openat2_in_root(
-            &self.upper, &rel,
-            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0,
+            &self.upper,
+            &rel,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
         ) {
             Ok(fd) => fd,
             Err(_) => return Ok(false),
@@ -3037,15 +3052,7 @@ impl SeccompCowBranch {
     pub(crate) fn inspect(
         &self,
         max_paths: usize,
-    ) -> Result<
-        (
-            Vec<crate::dry_run::Change>,
-            usize,
-            Vec<PathBuf>,
-            usize,
-        ),
-        BranchError,
-    > {
+    ) -> Result<(Vec<crate::dry_run::Change>, usize, Vec<PathBuf>, usize), BranchError> {
         let (changes, changed_paths) = self.bounded_changes(max_paths)?;
         let (conflicts, conflicting_paths) = self.bounded_conflicts(max_paths);
         Ok((changes, changed_paths, conflicts, conflicting_paths))
@@ -3079,7 +3086,10 @@ impl SeccompCowBranch {
             };
             total += 1;
             if result.len() < max_paths {
-                result.push(Change { kind, path: rel.to_path_buf() });
+                result.push(Change {
+                    kind,
+                    path: rel.to_path_buf(),
+                });
             }
         }
 
@@ -3266,10 +3276,11 @@ impl SeccompCowBranch {
                      upper preserved for recovery",
                     self.workdir_str, waited
                 );
-                if matches!(self.state, BranchState::Preserved(PreserveReason::CommitDeferred)) {
-                    Err(BranchError::CommitDeferred(
-                        "workdir lock contended".into(),
-                    ))
+                if matches!(
+                    self.state,
+                    BranchState::Preserved(PreserveReason::CommitDeferred)
+                ) {
+                    Err(BranchError::CommitDeferred("workdir lock contended".into()))
                 } else {
                     Err(BranchError::Operation(
                         "commit deferred after an interrupted merge".into(),
@@ -3282,7 +3293,10 @@ impl SeccompCowBranch {
                      upper preserved for recovery",
                     self.workdir_str, e
                 );
-                if matches!(self.state, BranchState::Preserved(PreserveReason::CommitDeferred)) {
+                if matches!(
+                    self.state,
+                    BranchState::Preserved(PreserveReason::CommitDeferred)
+                ) {
                     Err(BranchError::CommitDeferred(format!(
                         "workdir lock error: {e}"
                     )))
@@ -3354,7 +3368,6 @@ impl SeccompCowBranch {
         self.commit_merge().map_err(CommitError::Merge)
     }
 
-
     /// The destructive merge of the upper into the workdir. The caller holds the
     /// workdir lock; this marks the branch `MergeInterrupted` before its first
     /// destructive step so a crash mid-merge still leaves a sweep something to
@@ -3377,7 +3390,9 @@ impl SeccompCowBranch {
         // so a branch that did record changes pays nothing for the check.
         if !self.has_changes()
             && self.outstanding_deletions().next().is_none()
-            && fs::read_dir(&self.upper).map(|mut d| d.next().is_none()).unwrap_or(false)
+            && fs::read_dir(&self.upper)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false)
         {
             self.cleanup();
             self.state = BranchState::Finished;
@@ -3401,13 +3416,14 @@ impl SeccompCowBranch {
         // moment the marker exists for, so a workdir that cannot be described
         // is a workdir that is not touched. Failing here loses nothing — the
         // upper still holds the whole change set and the commit is retryable.
-        self.preserve_durable(PreserveReason::MergeInterrupted).map_err(|e| {
-            BranchError::Operation(format!(
-                "preserve marker: {e}; the workdir was not touched, but the change set at {} \
+        self.preserve_durable(PreserveReason::MergeInterrupted)
+            .map_err(|e| {
+                BranchError::Operation(format!(
+                    "preserve marker: {e}; the workdir was not touched, but the change set at {} \
                  has no marker and a sweep will not find it",
-                self.storage_dir.display()
-            ))
-        })?;
+                    self.storage_dir.display()
+                ))
+            })?;
 
         // Apply deletions, recording each one that is no longer outstanding so
         // a retry sees only what is left to do. Whether the removal call
@@ -3417,7 +3433,8 @@ impl SeccompCowBranch {
         // The whiteout set itself is append-only and cannot carry this: a
         // landed deletion has to stay in it or the path would reappear in the
         // merged view. `applied_deletions` is the second question.
-        let pending_deletions: Vec<String> = self.outstanding_deletions().map(str::to_string).collect();
+        let pending_deletions: Vec<String> =
+            self.outstanding_deletions().map(str::to_string).collect();
         let mut deletion_failure: Option<String> = None;
         let mut applied_any = false;
         // Whether the OUTSTANDING SET shrank, which is the question the marker
@@ -3644,7 +3661,11 @@ impl SeccompCowBranch {
                 let dst_fd = crate::sys::fs::openat2_in_root(
                     &self.workdir,
                     rel_str,
-                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_TRUNC
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
                     0o644,
                 )
                 .map_err(|e| BranchError::Operation(format!("copy: {}", e)))?;
@@ -3704,7 +3725,9 @@ impl SeccompCowBranch {
     /// After a failed `commit()` this is a deliberate request to throw the
     /// unmerged remainder away; the workdir stays as the partial merge left it.
     pub fn abort(&mut self) -> Result<(), BranchError> {
-        if self.is_disposed() { return Ok(()); }
+        if self.is_disposed() {
+            return Ok(());
+        }
         self.cleanup_explicit()?;
         self.state = BranchState::Finished;
         Ok(())
@@ -3789,7 +3812,10 @@ impl SeccompCowBranch {
     /// untouched one — that would tell a recovery sweep to re-apply a change set
     /// that has already partly landed.
     pub(crate) fn preserve_deferred_unless_interrupted(&mut self) {
-        if !matches!(self.state, BranchState::Preserved(PreserveReason::MergeInterrupted)) {
+        if !matches!(
+            self.state,
+            BranchState::Preserved(PreserveReason::MergeInterrupted)
+        ) {
             self.preserve(PreserveReason::CommitDeferred);
         }
     }
@@ -3900,10 +3926,15 @@ impl SeccompCowBranch {
 
     fn cleanup_explicit(&self) -> Result<(), BranchError> {
         match fs::remove_file(self.storage_dir.join(PRESERVED_MARKER)) {
-            Ok(()) => sync_dir(&self.storage_dir)
-                .map_err(|error| BranchError::Operation(format!("retire branch marker: {error}")))?,
+            Ok(()) => sync_dir(&self.storage_dir).map_err(|error| {
+                BranchError::Operation(format!("retire branch marker: {error}"))
+            })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(BranchError::Operation(format!("retire branch marker: {error}"))),
+            Err(error) => {
+                return Err(BranchError::Operation(format!(
+                    "retire branch marker: {error}"
+                )))
+            }
         }
         crate::snapshot::make_tree_removable(&self.storage_dir).map_err(|error| {
             BranchError::Operation(format!("prepare branch storage removal: {error}"))
@@ -3911,7 +3942,11 @@ impl SeccompCowBranch {
         match fs::remove_dir_all(&self.storage_dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(BranchError::Operation(format!("destroy branch storage: {error}"))),
+            Err(error) => {
+                return Err(BranchError::Operation(format!(
+                    "destroy branch storage: {error}"
+                )))
+            }
         }
         if let Some(base) = self.storage_dir.parent() {
             sync_dir(base)
@@ -4005,7 +4040,10 @@ mod tests {
             assert!(dir.exists());
             dir
         };
-        assert!(!leaked.exists(), "an undisposed branch must clean its storage on drop");
+        assert!(
+            !leaked.exists(),
+            "an undisposed branch must clean its storage on drop"
+        );
 
         // keep() marks the branch finished, so Drop preserves the upper.
         let kept = {
@@ -4045,7 +4083,9 @@ mod tests {
         // obstruction, so this holds under root with no conditional assertion.
         fs::create_dir(storage_dir.join(PRESERVED_TMP)).unwrap();
 
-        let err = branch.commit().expect_err("an unwritable marker must fail the commit");
+        let err = branch
+            .commit()
+            .expect_err("an unwritable marker must fail the commit");
         let msg = match err {
             BranchError::Operation(m) => m,
             other => panic!("expected an Operation error, got: {other:?}"),
@@ -4054,7 +4094,10 @@ mod tests {
             workdir.path().join("victim.txt").exists(),
             "a commit that could not record itself must not have started deleting; got {msg:?}",
         );
-        assert!(msg.starts_with("preserve marker"), "expected a marker error, got: {msg:?}");
+        assert!(
+            msg.starts_with("preserve marker"),
+            "expected a marker error, got: {msg:?}"
+        );
         assert!(
             msg.contains(&storage_dir.display().to_string()),
             "the operator has to be told WHERE the unfindable change set is, got: {msg:?}",
@@ -4093,7 +4136,9 @@ mod tests {
         }
         branch.mark_deleted("link/x.txt");
 
-        let err = branch.commit().expect_err("the unappliable deletion must fail the merge");
+        let err = branch
+            .commit()
+            .expect_err("the unappliable deletion must fail the merge");
         assert!(
             matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
             "expected the deletion step to fail, got: {err:?}"
@@ -4127,7 +4172,11 @@ mod tests {
         branch.preserve(PreserveReason::MergeInterrupted); // the REWRITE path
 
         let p = read_preserved(&storage_dir).expect("the rewritten marker must parse");
-        assert_eq!(p.reason, PreserveReason::MergeInterrupted, "the rewrite must have taken");
+        assert_eq!(
+            p.reason,
+            PreserveReason::MergeInterrupted,
+            "the rewrite must have taken"
+        );
 
         let mut names: Vec<String> = fs::read_dir(&storage_dir)
             .unwrap()
@@ -4406,7 +4455,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let fifo = root.path().join("d");
         let c = CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo failed");
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
         // A symlink pointing at a real directory, to prove O_NOFOLLOW.
         let real = root.path().join("real");
         fs::create_dir(&real).unwrap();
@@ -4428,8 +4481,16 @@ mod tests {
             .expect("syncing a dir BLOCKED on a FIFO; with the commit lock held this wedges");
         worker.join().unwrap();
 
-        assert_eq!(confined, Err(libc::ENOTDIR), "a FIFO must be refused, not opened");
-        assert_eq!(plain, Err(libc::ENOTDIR), "the plain form must refuse it too");
+        assert_eq!(
+            confined,
+            Err(libc::ENOTDIR),
+            "a FIFO must be refused, not opened"
+        );
+        assert_eq!(
+            plain,
+            Err(libc::ENOTDIR),
+            "the plain form must refuse it too"
+        );
         // Refused, not followed. Which errno depends on the order the kernel
         // applies the two flags — `ENOTDIR` for `O_DIRECTORY` against the
         // symlink itself, `ELOOP` for `O_NOFOLLOW` — and both are in the
@@ -4442,7 +4503,11 @@ mod tests {
         );
         // `..` is clamped to the root by RESOLVE_IN_ROOT, so this syncs the
         // root itself rather than escaping to its parent.
-        assert_eq!(escaped, Ok(()), "a `..` escape must be clamped, not refused or followed out");
+        assert_eq!(
+            escaped,
+            Ok(()),
+            "a `..` escape must be clamped, not refused or followed out"
+        );
         assert_eq!(ok, Ok(()), "a real directory must still be syncable");
     }
 
@@ -4521,7 +4586,10 @@ mod tests {
         let storage_dir = branch.storage_dir.clone();
         fs::create_dir(storage_dir.join(PRESERVED_TMP)).unwrap();
 
-        assert!(!branch.has_changes(), "the branch must start with nothing recorded");
+        assert!(
+            !branch.has_changes(),
+            "the branch must start with nothing recorded"
+        );
         branch
             .commit()
             .expect("a commit with nothing to publish must not fail on its crash record");
@@ -4608,7 +4676,10 @@ mod tests {
             "payload",
             "the retried commit must actually merge the remainder"
         );
-        assert!(!storage_dir.exists(), "a completed commit reclaims its storage");
+        assert!(
+            !storage_dir.exists(),
+            "a completed commit reclaims its storage"
+        );
     }
 
     /// After a partial merge the upper must hold the REMAINDER, not the whole
@@ -4640,7 +4711,10 @@ mod tests {
             "a.txt",
             "a.txt was merged before the failure",
         );
-        assert!(!branch.upper.join("a.txt").exists(), "a merged change must leave the upper");
+        assert!(
+            !branch.upper.join("a.txt").exists(),
+            "a merged change must leave the upper"
+        );
         assert!(
             !workdir.path().join("gone.txt").exists(),
             "the deletion was applied before the failure",
@@ -4667,8 +4741,14 @@ mod tests {
         // And the retry finishes exactly that remainder.
         fs::remove_file(workdir.path().join("b.txt")).unwrap();
         branch.commit().expect("the retry must complete the merge");
-        assert_eq!(fs::read_to_string(workdir.path().join("b.txt")).unwrap(), "b.txt");
-        assert_eq!(fs::read_to_string(workdir.path().join("c.txt")).unwrap(), "c.txt");
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("b.txt")).unwrap(),
+            "b.txt"
+        );
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("c.txt")).unwrap(),
+            "c.txt"
+        );
     }
 
     /// Preserving is only half a guarantee if it lives in RAM: once the process
@@ -4695,7 +4775,11 @@ mod tests {
         }
 
         let found = list_preserved(storage.path());
-        assert_eq!(found.len(), 1, "the sweep must find the preserved branch, got {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "the sweep must find the preserved branch, got {found:?}"
+        );
         let b = &found[0];
         assert_eq!(
             b.reason,
@@ -4793,14 +4877,21 @@ mod tests {
         }
 
         let found = list_preserved(storage.path());
-        assert_eq!(found.len(), 1, "the sweep must find the preserved branch, got {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "the sweep must find the preserved branch, got {found:?}"
+        );
         assert!(
             found[0].upper.join("added.txt").exists(),
             "the additions are the half that lives in the upper",
         );
         assert_eq!(
             found[0].deleted,
-            vec![PathBuf::from("keep.txt"), PathBuf::from("sub/also gone.txt")],
+            vec![
+                PathBuf::from("keep.txt"),
+                PathBuf::from("sub/also gone.txt")
+            ],
             "recovering the preserved branch must not resurrect what the run deleted",
         );
     }
@@ -4829,7 +4920,9 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("added.txt"), "payload").unwrap();
         branch.mark_deleted("link/we\nird\\name.txt");
-        let err = branch.commit().expect_err("the unapplicable deletion must fail the merge");
+        let err = branch
+            .commit()
+            .expect_err("the unapplicable deletion must fail the merge");
         // `delete:` is what the outstanding-deletion guard reports, so this is
         // the proof that the path below reaches the marker as a REMAINDER
         // rather than through a refresh the merge happened to skip.
@@ -5015,7 +5108,11 @@ mod tests {
         }
 
         let found = list_preserved(storage.path());
-        assert_eq!(found.len(), 1, "the kept branch must be findable, got {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "the kept branch must be findable, got {found:?}"
+        );
         assert_eq!(
             found[0].reason,
             PreserveReason::Kept,
@@ -5171,7 +5268,10 @@ mod tests {
         let upper = branch.ensure_cow_copy("new.txt").unwrap();
         fs::write(&upper, "new content").unwrap();
         branch.commit().unwrap();
-        assert_eq!(fs::read_to_string(workdir.path().join("new.txt")).unwrap(), "new content");
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("new.txt")).unwrap(),
+            "new content"
+        );
     }
 
     #[test]
@@ -5254,7 +5354,10 @@ mod tests {
         assert_eq!(changes[1].kind, crate::dry_run::ChangeKind::Added);
         assert_eq!(changes[1].path, std::path::PathBuf::from("new.txt"));
         assert_eq!(changes[2].kind, crate::dry_run::ChangeKind::Deleted);
-        assert_eq!(changes[2].path, std::path::PathBuf::from("subdir/nested.txt"));
+        assert_eq!(
+            changes[2].path,
+            std::path::PathBuf::from("subdir/nested.txt")
+        );
     }
 
     // ---- Disk quota tests ----
@@ -5277,7 +5380,8 @@ mod tests {
     fn test_quota_allows_within_limit() {
         let (workdir, storage) = setup_workdir();
         // 5 bytes fits in 100-byte quota.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         assert!(branch.ensure_cow_copy("existing.txt").is_ok());
     }
 
@@ -5293,7 +5397,8 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         // "existing.txt" = 5 bytes, "subdir/nested.txt" = 6 bytes. Quota = 10.
         // First copy fits (5 <= 10), second doesn't (5 + 6 > 10).
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
         assert!(branch.ensure_cow_copy("existing.txt").is_ok());
         let err = branch.ensure_cow_copy("subdir/nested.txt").unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
@@ -5341,7 +5446,8 @@ mod tests {
     fn test_quota_handle_mkdir_denied() {
         let (workdir, storage) = setup_workdir();
         // mkdir adds 4096 bytes of metadata accounting.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         let path = abs(&branch, "newdir");
         let err = branch.handle_mkdir(&path, 0o755).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
@@ -5350,7 +5456,8 @@ mod tests {
     #[test]
     fn test_quota_handle_mkdir_allowed() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5000).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 5000).unwrap();
         let path = abs(&branch, "newdir");
         assert!(matches!(branch.handle_mkdir(&path, 0o755), Ok(true)));
     }
@@ -5359,18 +5466,25 @@ mod tests {
     fn test_quota_handle_symlink_denied() {
         let (workdir, storage) = setup_workdir();
         // symlink adds 256 bytes of accounting.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         let linkpath = abs(&branch, "mylink");
-        let err = branch.handle_symlink("existing.txt", &linkpath).unwrap_err();
+        let err = branch
+            .handle_symlink("existing.txt", &linkpath)
+            .unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
 
     #[test]
     fn test_quota_handle_symlink_allowed() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 500).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 500).unwrap();
         let linkpath = abs(&branch, "mylink");
-        assert!(matches!(branch.handle_symlink("existing.txt", &linkpath), Ok(true)));
+        assert!(matches!(
+            branch.handle_symlink("existing.txt", &linkpath),
+            Ok(true)
+        ));
     }
 
     #[test]
@@ -5417,7 +5531,8 @@ mod tests {
     fn test_quota_handle_truncate_grow_denied() {
         let (workdir, storage) = setup_workdir();
         // First, allow the cow copy (5 bytes), then truncate to grow beyond quota.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
         let path = abs(&branch, "existing.txt");
         // cow copy uses 5 bytes (5 of 10 used).
         // Truncating to 20 bytes needs 15 more — exceeds remaining 5.
@@ -5428,7 +5543,8 @@ mod tests {
     #[test]
     fn test_quota_handle_truncate_shrink_allowed() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
         let path = abs(&branch, "existing.txt");
         // Truncate to 2 bytes — cow copy (5) + shrink is fine.
         assert!(matches!(branch.handle_truncate(&path, 2), Ok(true)));
@@ -5440,7 +5556,8 @@ mod tests {
     fn test_quota_freed_after_unlink() {
         let (workdir, storage) = setup_workdir();
         // Quota = 11 bytes. existing.txt=5, nested.txt=6. Both fit individually.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 11).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 11).unwrap();
         assert!(branch.ensure_cow_copy("existing.txt").is_ok());
         // 5 used — nested.txt (6 bytes) fits exactly.
         assert!(branch.ensure_cow_copy("subdir/nested.txt").is_ok());
@@ -5468,7 +5585,8 @@ mod tests {
     #[test]
     fn test_quota_disk_used_tracking() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 1000).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 1000).unwrap();
         assert_eq!(branch.disk_used, 0);
         branch.ensure_cow_copy("existing.txt").unwrap(); // 5 bytes
         assert_eq!(branch.disk_used, 5);
@@ -5492,7 +5610,8 @@ mod tests {
     fn test_quota_new_file_allowed_when_space_remains() {
         let (workdir, storage) = setup_workdir();
         // Quota = 100 bytes, 0 used — new file creation should succeed.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         assert!(branch.ensure_cow_copy("brand_new.txt").is_ok());
     }
 
@@ -5500,7 +5619,8 @@ mod tests {
     fn test_quota_resync_on_write_open() {
         let (workdir, storage) = setup_workdir();
         // Quota = 50 bytes. COW-copy existing.txt (5 bytes tracked).
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 50).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 50).unwrap();
         let path = abs(&branch, "existing.txt");
         let upper = branch.handle_open(&path, O_WRONLY).unwrap().unwrap();
 
@@ -5524,7 +5644,8 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         // Quota = 10 bytes. COW-copy existing.txt (5 bytes), then grow
         // it behind our back. A read-only open should NOT resync or fail.
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 10).unwrap();
         let write_path = abs(&branch, "existing.txt");
         let upper = branch.handle_open(&write_path, O_WRONLY).unwrap().unwrap();
         fs::write(&upper, vec![0u8; 50]).unwrap(); // way over quota
@@ -5669,7 +5790,8 @@ mod tests {
     #[test]
     fn test_prepare_open_quota_reserves_before_copy() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         let path = abs(&branch, "existing.txt");
         let plan = branch.prepare_open(&path, 0o1).unwrap();
         assert!(matches!(plan, CowOpenPlan::NeedsCopy { file_size: 5, .. }));
@@ -5679,7 +5801,8 @@ mod tests {
     #[test]
     fn test_rollback_copy() {
         let (workdir, storage) = setup_workdir();
-        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 100).unwrap();
         branch.disk_used = 50;
         branch.rollback_copy(30);
         assert_eq!(branch.disk_used, 20);
@@ -5711,8 +5834,13 @@ mod tests {
         let entries = branch.list_merged_dir(&rel);
         // Should contain actual files from /etc/apt/sources.list.d/,
         // not top-level dirs like "bin", "usr", "var".
-        assert!(!entries.iter().any(|e| e == "bin" || e == "usr" || e == "var"),
-            "list_merged_dir returned root entries instead of target dir: {:?}", entries);
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e == "bin" || e == "usr" || e == "var"),
+            "list_merged_dir returned root entries instead of target dir: {:?}",
+            entries
+        );
     }
 
     #[test]
@@ -5787,8 +5915,7 @@ mod tests {
         // workdir/evil -> /etc ; writing evil/group must not copy /etc/group.
         let (workdir, storage) = setup_workdir();
         std::os::unix::fs::symlink("/etc", workdir.path().join("evil")).unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
 
         // ensure_cow_copy on a path reached through the symlinked parent.
         let upper = branch.ensure_cow_copy("evil/group").unwrap();
@@ -5805,8 +5932,7 @@ mod tests {
     #[test]
     fn copy_up_copies_legitimate_in_tree_file() {
         let (workdir, storage) = setup_workdir();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("existing.txt").unwrap();
         assert_eq!(std::fs::read_to_string(&upper).unwrap(), "hello");
     }
@@ -5818,11 +5944,13 @@ mod tests {
         // symlink, never read the target's content (issue #112, commit path).
         let (workdir, storage) = setup_workdir();
         std::os::unix::fs::symlink("/etc/group", workdir.path().join("secret")).unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         // Trigger copy-up of the symlink into upper.
         let upper = branch.ensure_cow_copy("secret").unwrap();
-        assert!(upper.is_symlink(), "precondition: upper holds a verbatim symlink");
+        assert!(
+            upper.is_symlink(),
+            "precondition: upper holds a verbatim symlink"
+        );
 
         branch.commit().unwrap();
 
@@ -5831,7 +5959,10 @@ mod tests {
             committed.is_symlink(),
             "commit dereferenced the symlink instead of recreating it"
         );
-        assert_eq!(std::fs::read_link(&committed).unwrap(), std::path::Path::new("/etc/group"));
+        assert_eq!(
+            std::fs::read_link(&committed).unwrap(),
+            std::path::Path::new("/etc/group")
+        );
         // The workdir entry must not have become a regular file holding the host content.
         let meta = std::fs::symlink_metadata(&committed).unwrap();
         assert!(meta.file_type().is_symlink());
@@ -5843,8 +5974,7 @@ mod tests {
         // in-tree symlink as a symlink and copy it verbatim into upper.
         let (workdir, storage) = setup_workdir();
         std::os::unix::fs::symlink("existing.txt", workdir.path().join("link")).unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let upper = branch.ensure_cow_copy("link").unwrap();
         assert!(upper.is_symlink(), "in-tree symlink was not preserved");
         assert_eq!(
@@ -5860,8 +5990,7 @@ mod tests {
         // confined, so it cannot become a host-file oracle (issue #112).
         let (workdir, storage) = setup_workdir();
         std::os::unix::fs::symlink("/etc", workdir.path().join("evil")).unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = workdir.path().canonicalize().unwrap();
         let path = format!("{}/evil/group", wd.display());
         let flags = (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as u64;
@@ -5882,8 +6011,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), workdir.path().join("evil")).unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
 
         branch.ensure_cow_copy("evil").unwrap();
         assert!(
@@ -6033,9 +6161,7 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         branch.mark_deleted("d");
         let wd = branch.workdir_str().to_string();
-        assert!(branch
-            .handle_mkdir(&format!("{}/d", wd), 0o755)
-            .unwrap());
+        assert!(branch.handle_mkdir(&format!("{}/d", wd), 0o755).unwrap());
 
         assert!(!branch.is_deleted("d"));
         assert!(branch.is_deleted("d/old.txt"));
@@ -6141,7 +6267,10 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert!(branch
-            .handle_rename(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+            .handle_rename(
+                &format!("{}/d", wd.display()),
+                &format!("{}/d2", wd.display())
+            )
             .unwrap());
 
         // Merged view before commit: d hidden, d2 holds the tree.
@@ -6153,8 +6282,14 @@ mod tests {
 
         branch.commit().unwrap();
         assert!(!wd.join("d").exists());
-        assert_eq!(fs::read_to_string(wd.join("d2/inner.txt")).unwrap(), "PRECIOUS");
-        assert_eq!(fs::read_to_string(wd.join("d2/sub/deep.txt")).unwrap(), "DEEP");
+        assert_eq!(
+            fs::read_to_string(wd.join("d2/inner.txt")).unwrap(),
+            "PRECIOUS"
+        );
+        assert_eq!(
+            fs::read_to_string(wd.join("d2/sub/deep.txt")).unwrap(),
+            "DEEP"
+        );
     }
 
     #[test]
@@ -6172,7 +6307,10 @@ mod tests {
             Ok(true)
         );
         assert!(branch
-            .handle_rename(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+            .handle_rename(
+                &format!("{}/d", wd.display()),
+                &format!("{}/d2", wd.display())
+            )
             .unwrap());
         branch.commit().unwrap();
         assert!(wd.join("d2/keep.txt").exists());
@@ -6207,7 +6345,10 @@ mod tests {
         fs::write(wd.join("b/b1"), "B").unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(&format!("{}/a", wd.display()), &format!("{}/b", wd.display())),
+            branch.handle_rename(
+                &format!("{}/a", wd.display()),
+                &format!("{}/b", wd.display())
+            ),
             Err(libc::ENOTEMPTY)
         );
         // The refusal must leave no trace: nothing staged, nothing whiteouted.
@@ -6228,7 +6369,10 @@ mod tests {
         fs::create_dir(wd.join("b")).unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(&format!("{}/a", wd.display()), &format!("{}/b", wd.display())),
+            branch.handle_rename(
+                &format!("{}/a", wd.display()),
+                &format!("{}/b", wd.display())
+            ),
             Ok(true)
         );
         assert!(branch.is_deleted("a"));
@@ -6325,8 +6469,14 @@ mod tests {
         fs::create_dir(wd.join("b")).unwrap();
         fs::write(wd.join("b/b1"), "B").unwrap();
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
-        assert_eq!(branch.handle_unlink(&format!("{}/b/b1", wd.display()), false), Ok(true));
-        assert_eq!(branch.handle_unlink(&format!("{}/b", wd.display()), true), Ok(true));
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/b/b1", wd.display()), false),
+            Ok(true)
+        );
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/b", wd.display()), true),
+            Ok(true)
+        );
         assert_eq!(
             branch.handle_rename(
                 &format!("{}/existing.txt", wd.display()),
@@ -6378,13 +6528,22 @@ mod tests {
         fs::set_permissions(wd.join("d/inner"), fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(result, Err(libc::EACCES));
-        assert!(!branch.is_deleted("d"), "failed rename must not whiteout the source");
-        assert!(!branch.upper_dir().join("d").exists(), "partial staging left behind");
+        assert!(
+            !branch.is_deleted("d"),
+            "failed rename must not whiteout the source"
+        );
+        assert!(
+            !branch.upper_dir().join("d").exists(),
+            "partial staging left behind"
+        );
         let merged = branch.list_merged_dir("d");
         assert!(merged.contains(&"inner".to_string()));
         assert!(merged.contains(&"top.txt".to_string()));
         branch.commit().unwrap();
-        assert_eq!(fs::read_to_string(wd.join("d/inner/deep.txt")).unwrap(), "deep");
+        assert_eq!(
+            fs::read_to_string(wd.join("d/inner/deep.txt")).unwrap(),
+            "deep"
+        );
     }
 
     #[test]
@@ -6396,11 +6555,17 @@ mod tests {
         // Quota fits the staged directory (4096) but not the file after it.
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 4100).unwrap();
         assert_eq!(
-            branch.handle_rename(&format!("{}/d", wd.display()), &format!("{}/m", wd.display())),
+            branch.handle_rename(
+                &format!("{}/d", wd.display()),
+                &format!("{}/m", wd.display())
+            ),
             Err(libc::ENOSPC)
         );
         assert!(!branch.is_deleted("d"));
-        assert!(!branch.upper_dir().join("d").exists(), "partial staging left behind");
+        assert!(
+            !branch.upper_dir().join("d").exists(),
+            "partial staging left behind"
+        );
         // The rollback must also return the reserved quota: a small write
         // elsewhere still fits.
         assert!(branch.ensure_cow_copy("existing.txt").is_ok());
@@ -6422,12 +6587,18 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
-            branch.handle_rename(&format!("{}/d", wd.display()), &format!("{}/m", wd.display())),
+            branch.handle_rename(
+                &format!("{}/d", wd.display()),
+                &format!("{}/m", wd.display())
+            ),
             Ok(true)
         );
         branch.commit().unwrap();
         let deep = format!("m{}", &rel[1..]);
-        assert_eq!(fs::read_to_string(wd.join(format!("{}/leaf.txt", deep))).unwrap(), "LEAF");
+        assert_eq!(
+            fs::read_to_string(wd.join(format!("{}/leaf.txt", deep))).unwrap(),
+            "LEAF"
+        );
         assert!(!wd.join("d").exists());
     }
 
@@ -6457,7 +6628,10 @@ mod tests {
         let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
         assert_eq!(
             branch
-                .handle_link(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+                .handle_link(
+                    &format!("{}/d", wd.display()),
+                    &format!("{}/d2", wd.display())
+                )
                 .unwrap(),
             false
         );
@@ -6480,7 +6654,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
-            let _ = tx.send(b.ensure_cow_copy("pipe").map(|p| fs::read(p).map(|b| b.len())));
+            let _ = tx.send(
+                b.ensure_cow_copy("pipe")
+                    .map(|p| fs::read(p).map(|b| b.len())),
+            );
         });
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             // The FIFO is virtualized as an empty regular stub in the upper,
@@ -6506,7 +6683,10 @@ mod tests {
         let resolved = branch.handle_open(&format!("{}/pipe", wd), flags).unwrap();
         assert_eq!(resolved, Some(branch.upper_dir().join("pipe")));
         let meta = fs::metadata(branch.upper_dir().join("pipe")).unwrap();
-        assert!(meta.file_type().is_file(), "upper stub must be a regular file");
+        assert!(
+            meta.file_type().is_file(),
+            "upper stub must be a regular file"
+        );
         assert_eq!(meta.len(), 0);
     }
 
@@ -6542,8 +6722,14 @@ mod tests {
             Err(_) => panic!("commit hung on the lower FIFO (issue #158)"),
         }
         let meta = fs::symlink_metadata(workdir.path().join("pipe")).unwrap();
-        assert!(meta.file_type().is_file(), "lower FIFO must be replaced by the stub");
-        assert_eq!(fs::read_to_string(workdir.path().join("pipe")).unwrap(), "published");
+        assert!(
+            meta.file_type().is_file(),
+            "lower FIFO must be replaced by the stub"
+        );
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("pipe")).unwrap(),
+            "published"
+        );
     }
 
     #[test]
@@ -6554,10 +6740,16 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = branch.workdir_str().to_string();
-        assert_eq!(branch.handle_chmod(&format!("{}/pipe", wd), 0o600).unwrap(), true);
+        assert_eq!(
+            branch.handle_chmod(&format!("{}/pipe", wd), 0o600).unwrap(),
+            true
+        );
         // The chmod landed on the upper stub, not the real FIFO.
         let lower_mode = fs::metadata(&fifo).unwrap().permissions();
-        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&lower_mode) & 0o777, 0o644);
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&lower_mode) & 0o777,
+            0o644
+        );
     }
 
     #[test]
@@ -6584,7 +6776,11 @@ mod tests {
         out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
     ) {
         for name in branch.list_merged_dir(rel) {
-            let child = if rel == "." { name.clone() } else { format!("{}/{}", rel, name) };
+            let child = if rel == "." {
+                name.clone()
+            } else {
+                format!("{}/{}", rel, name)
+            };
             let resolved = branch.resolve_read(&child);
             if resolved.is_dir() {
                 out.insert(child.clone(), None);
@@ -6601,10 +6797,18 @@ mod tests {
         rel: &str,
         out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
     ) {
-        let dir = if rel == "." { root.to_path_buf() } else { root.join(rel) };
+        let dir = if rel == "." {
+            root.to_path_buf()
+        } else {
+            root.join(rel)
+        };
         for e in fs::read_dir(dir).unwrap().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let child = if rel == "." { name } else { format!("{}/{}", rel, name) };
+            let child = if rel == "." {
+                name
+            } else {
+                format!("{}/{}", rel, name)
+            };
             let p = e.path();
             if p.is_dir() {
                 out.insert(child.clone(), None);
@@ -6643,7 +6847,10 @@ mod tests {
         fs::write(&up, "MODIFIED").unwrap();
         assert_eq!(branch.handle_unlink(&w("d/a.txt"), false), Ok(true));
         assert!(branch.handle_rename(&w("d"), &w("moved")).unwrap());
-        assert_eq!(branch.handle_unlink(&w("subdir/nested.txt"), false), Ok(true));
+        assert_eq!(
+            branch.handle_unlink(&w("subdir/nested.txt"), false),
+            Ok(true)
+        );
         assert_eq!(branch.handle_unlink(&w("subdir"), true), Ok(true));
 
         let mut merged = std::collections::BTreeMap::new();
@@ -6718,8 +6925,14 @@ mod tests {
         branch.mark_deleted("dangling");
         branch.commit().expect("both symlink deletions must apply");
 
-        assert!(!workdir.path().join("to_file").is_symlink(), "the link to a file must be gone");
-        assert!(!workdir.path().join("dangling").is_symlink(), "the dangling link must be gone");
+        assert!(
+            !workdir.path().join("to_file").is_symlink(),
+            "the link to a file must be gone"
+        );
+        assert!(
+            !workdir.path().join("dangling").is_symlink(),
+            "the dangling link must be gone"
+        );
         assert_eq!(
             fs::read_to_string(workdir.path().join("target.txt")).unwrap(),
             "must survive",
@@ -6743,8 +6956,14 @@ mod tests {
         branch.mark_deleted("sub/dir/file.txt");
         branch.commit().expect("a nested deletion must apply");
 
-        assert!(!workdir.path().join("sub/dir/file.txt").exists(), "the entry must be gone");
-        assert!(workdir.path().join("sub/dir").is_dir(), "its parent must stay");
+        assert!(
+            !workdir.path().join("sub/dir/file.txt").exists(),
+            "the entry must be gone"
+        );
+        assert!(
+            workdir.path().join("sub/dir").is_dir(),
+            "its parent must stay"
+        );
         assert!(
             workdir.path().join("sub/sibling.txt").exists(),
             "a sibling under the same parent must be untouched",
@@ -6801,7 +7020,10 @@ mod tests {
         branch
             .commit()
             .expect("overlapping deletions must all apply");
-        assert!(!workdir.path().join("d").exists(), "the whole subtree must be gone");
+        assert!(
+            !workdir.path().join("d").exists(),
+            "the whole subtree must be gone"
+        );
         assert_eq!(
             branch.outstanding_deletions().count(),
             0,
@@ -6878,9 +7100,14 @@ mod tests {
             "the upper mkdir must succeed"
         );
         fs::write(branch.upper.join("link/d/new.txt"), "fresh").unwrap();
-        assert!(branch.upper_has("link/d"), "the upper must hold the re-created path");
+        assert!(
+            branch.upper_has("link/d"),
+            "the upper must hold the re-created path"
+        );
 
-        let err = branch.commit().expect_err("the obstructed deletion must fail the merge");
+        let err = branch
+            .commit()
+            .expect_err("the obstructed deletion must fail the merge");
         assert!(
             matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
             "expected the deletion step to fail, got: {err:?}"
@@ -6905,9 +7132,15 @@ mod tests {
         // directory holding the same stale contents.
         fs::remove_file(workdir.path().join("link")).unwrap();
         fs::create_dir_all(workdir.path().join("link/d")).unwrap();
-        fs::write(workdir.path().join("link/d/stale.txt"), "from a previous run").unwrap();
+        fs::write(
+            workdir.path().join("link/d/stale.txt"),
+            "from a previous run",
+        )
+        .unwrap();
 
-        branch.commit().expect("the retry must finish the remainder");
+        branch
+            .commit()
+            .expect("the retry must finish the remainder");
         assert!(
             !workdir.path().join("link/d/stale.txt").exists(),
             "the deletion had to run again even though the upper held the path",
@@ -6946,7 +7179,9 @@ mod tests {
         fs::write(branch.upper.join("f.txt"), "new").unwrap();
         fs::create_dir(branch.upper.join("z")).unwrap();
 
-        let err = branch.commit().expect_err("the type clash at z must fail the merge");
+        let err = branch
+            .commit()
+            .expect_err("the type clash at z must fail the merge");
         assert!(
             matches!(err, BranchError::Operation(ref m) if m.starts_with("mkdir:")),
             "expected the copy phase to fail at z, got: {err:?}"
@@ -7000,7 +7235,9 @@ mod tests {
         }
         branch.mark_deleted("link/x.txt");
 
-        let err = branch.commit().expect_err("the unappliable deletion must fail the merge");
+        let err = branch
+            .commit()
+            .expect_err("the unappliable deletion must fail the merge");
         assert!(
             matches!(err, BranchError::Operation(ref m) if m.starts_with("delete:")),
             "expected the deletion step to fail, got: {err:?}"
@@ -7048,13 +7285,17 @@ mod tests {
         let storage_dir = branch.storage_dir.clone();
         fs::write(branch.upper.join("added.txt"), "payload").unwrap();
         branch.mark_deleted("link/x.txt");
-        branch.commit().expect_err("the unappliable deletion must fail the merge");
+        branch
+            .commit()
+            .expect_err("the unappliable deletion must fail the merge");
 
         // Clear it the way an operator would: the deletion's target is gone, so
         // it is now already applied.
         fs::remove_file(outside.path().join("x.txt")).unwrap();
 
-        branch.commit().expect("the retry must get past the deletion guard");
+        branch
+            .commit()
+            .expect("the retry must get past the deletion guard");
         assert_eq!(
             fs::read_to_string(workdir.path().join("added.txt")).unwrap(),
             "payload",
@@ -7099,7 +7340,9 @@ mod tests {
         assert!(!branch.is_deleted(""), "nothing may have been recorded");
         assert!(!branch.has_changes(), "a refused unlink is not a change");
 
-        branch.commit().expect("a branch with nothing recorded must commit cleanly");
+        branch
+            .commit()
+            .expect("a branch with nothing recorded must commit cleanly");
         assert_eq!(
             fs::read_to_string(workdir.path().join("a.txt")).unwrap(),
             "must survive",
@@ -7128,7 +7371,9 @@ mod tests {
 
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let wd = workdir.path().canonicalize().unwrap();
-        assert!(branch.handle_chmod(&format!("{}/f.txt", wd.display()), 0o600).unwrap());
+        assert!(branch
+            .handle_chmod(&format!("{}/f.txt", wd.display()), 0o600)
+            .unwrap());
         assert_eq!(
             branch
                 .changes()
@@ -7176,7 +7421,11 @@ mod tests {
 
         for (name, mode) in [("script.sh", 0o755u32), ("secret", 0o600), ("plain", 0o644)] {
             assert_eq!(
-                fs::metadata(workdir.path().join(name)).unwrap().permissions().mode() & 0o777,
+                fs::metadata(workdir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 mode,
                 "{name} must be committed with the mode the run gave it",
             );
@@ -7279,10 +7528,15 @@ mod tests {
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("f.txt"), "from the run").unwrap();
         branch.commit().unwrap();
-        assert_eq!(fs::read_to_string(workdir.path().join("f.txt")).unwrap(), "from the run");
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("f.txt")).unwrap(),
+            "from the run"
+        );
 
         fs::write(workdir.path().join("f.txt"), "edited afterwards").unwrap();
-        branch.commit().expect("a second commit is a no-op, not an error");
+        branch
+            .commit()
+            .expect("a second commit is a no-op, not an error");
 
         assert_eq!(
             fs::read_to_string(workdir.path().join("f.txt")).unwrap(),
@@ -7339,9 +7593,21 @@ mod tests {
         let rel = |suffix: &str| branch.safe_rel(&format!("{}{}", wd.display(), suffix));
 
         assert_eq!(rel("/a.txt").as_deref(), Some("a.txt"));
-        assert_eq!(rel("/./a.txt").as_deref(), Some("a.txt"), "a `.` component normalises away");
-        assert_eq!(rel("//a.txt").as_deref(), Some("a.txt"), "a doubled separator normalises away");
-        assert_eq!(rel("/sub/").as_deref(), Some("sub"), "a trailing separator normalises away");
+        assert_eq!(
+            rel("/./a.txt").as_deref(),
+            Some("a.txt"),
+            "a `.` component normalises away"
+        );
+        assert_eq!(
+            rel("//a.txt").as_deref(),
+            Some("a.txt"),
+            "a doubled separator normalises away"
+        );
+        assert_eq!(
+            rel("/sub/").as_deref(),
+            Some("sub"),
+            "a trailing separator normalises away"
+        );
         assert_eq!(
             branch.safe_rel(wd.to_str().unwrap()).as_deref(),
             Some(""),
@@ -7387,14 +7653,18 @@ mod tests {
             "a target walking out of the tree must be refused",
         );
         assert!(
-            !branch.upper_dir().join("abs").is_symlink() && !branch.upper_dir().join("up").is_symlink(),
+            !branch.upper_dir().join("abs").is_symlink()
+                && !branch.upper_dir().join("up").is_symlink(),
             "a refused symlink must not be recorded in the upper",
         );
         assert!(
             branch.handle_symlink("inside.txt", &link("ok")).unwrap(),
             "an ordinary relative in-tree target is recorded",
         );
-        assert_eq!(fs::read_link(branch.upper_dir().join("ok")).unwrap(), PathBuf::from("inside.txt"));
+        assert_eq!(
+            fs::read_link(branch.upper_dir().join("ok")).unwrap(),
+            PathBuf::from("inside.txt")
+        );
 
         // The asymmetry: the same target, already on disk, IS copied up.
         branch.ensure_cow_copy("preexisting").unwrap();
@@ -7428,7 +7698,10 @@ mod tests {
         assert_eq!(p.workdir, PathBuf::from("/w"));
         assert_eq!(p.upper, PathBuf::from("/s/upper"));
         assert_eq!(p.pid, 41);
-        assert!(p.deleted.is_empty(), "no deletions were recorded, so there are none");
+        assert!(
+            p.deleted.is_empty(),
+            "no deletions were recorded, so there are none"
+        );
     }
 
     #[test]
@@ -7463,7 +7736,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_preserved(with_key.path()).expect("an unknown key must not break parsing").reason,
+            read_preserved(with_key.path())
+                .expect("an unknown key must not break parsing")
+                .reason,
             PreserveReason::Kept,
         );
 
@@ -7513,7 +7788,10 @@ mod tests {
         // not passing for some unrelated reason.
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(PRESERVED_MARKER), full).unwrap();
-        assert!(read_preserved(dir.path()).is_some(), "the control must parse");
+        assert!(
+            read_preserved(dir.path()).is_some(),
+            "the control must parse"
+        );
     }
 
     /// A marker truncated at any byte offset must read back as "not a preserved
@@ -7552,7 +7830,11 @@ mod tests {
         let marker = storage_dir.join(PRESERVED_MARKER);
         let full = fs::read(&marker).unwrap();
         let complete = read_preserved(&storage_dir).expect("the complete marker must parse");
-        assert_eq!(complete.deleted.len(), 2, "precondition: both deletions are recorded");
+        assert_eq!(
+            complete.deleted.len(),
+            2,
+            "precondition: both deletions are recorded"
+        );
 
         for cut in 0..full.len() {
             fs::write(&marker, &full[..cut]).unwrap();
@@ -7579,7 +7861,9 @@ mod tests {
     fn the_marker_round_trips_a_workdir_path_that_is_not_utf8() {
         use std::os::unix::ffi::OsStrExt;
         let root = tempfile::tempdir().unwrap();
-        let workdir = root.path().join(std::ffi::OsStr::from_bytes(b"dir-\xff-name"));
+        let workdir = root
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"dir-\xff-name"));
         fs::create_dir(&workdir).unwrap();
         let storage = tempfile::tempdir().unwrap();
 
@@ -7596,7 +7880,11 @@ mod tests {
             "the raw bytes of the workdir path must survive the marker round-trip",
         );
         assert!(
-            found[0].workdir.as_os_str().as_bytes().ends_with(b"dir-\xff-name"),
+            found[0]
+                .workdir
+                .as_os_str()
+                .as_bytes()
+                .ends_with(b"dir-\xff-name"),
             "the 0xff byte must come back as itself; a lossy conversion anywhere in the \
              round-trip would have replaced it with the three bytes of U+FFFD",
         );
@@ -7618,11 +7906,18 @@ mod tests {
         let wd = workdir.path().canonicalize().unwrap();
 
         let upper = branch
-            .handle_open(&format!("{}/{}", wd.display(), PRESERVED_MARKER), O_WRONLY | O_CREAT)
+            .handle_open(
+                &format!("{}/{}", wd.display(), PRESERVED_MARKER),
+                O_WRONLY | O_CREAT,
+            )
             .unwrap()
             .expect("the child's write must be redirected into the upper");
         assert_eq!(upper, branch.upper_dir().join(PRESERVED_MARKER));
-        fs::write(&upper, b"reason=kept\nworkdir=/etc\nupper=/etc\npid=1\n".as_slice()).unwrap();
+        fs::write(
+            &upper,
+            b"reason=kept\nworkdir=/etc\nupper=/etc\npid=1\n".as_slice(),
+        )
+        .unwrap();
 
         assert_eq!(
             read_preserved(&storage_dir),
@@ -7632,7 +7927,10 @@ mod tests {
 
         branch.preserve(PreserveReason::CommitDeferred);
         let p = read_preserved(&storage_dir).expect("the real marker must be there");
-        assert_eq!(p.workdir, wd, "the real marker names the real workdir, not the forged one");
+        assert_eq!(
+            p.workdir, wd,
+            "the real marker names the real workdir, not the forged one"
+        );
 
         branch.abort().unwrap();
         // ...and the child's file was an ordinary change all along.
@@ -7664,18 +7962,33 @@ mod tests {
         fs::write(branch.upper.join("added.txt"), "payload").unwrap();
         branch.mark_deleted("gone.txt");
         branch.preserve(PreserveReason::CommitDeferred);
-        assert_eq!(list_preserved(storage.path()).len(), 1, "precondition: it is preserved");
+        assert_eq!(
+            list_preserved(storage.path()).len(),
+            1,
+            "precondition: it is preserved"
+        );
 
-        branch.commit().expect("a deferred commit must still be runnable");
+        branch
+            .commit()
+            .expect("a deferred commit must still be runnable");
 
         assert_eq!(
             fs::read_to_string(workdir.path().join("added.txt")).unwrap(),
             "payload",
             "the deferred change set must publish",
         );
-        assert!(!workdir.path().join("gone.txt").exists(), "including its deletions");
-        assert!(!storage_dir.exists(), "and the storage is reclaimed once it has landed");
-        assert!(list_preserved(storage.path()).is_empty(), "so no sweep still sees work here");
+        assert!(
+            !workdir.path().join("gone.txt").exists(),
+            "including its deletions"
+        );
+        assert!(
+            !storage_dir.exists(),
+            "and the storage is reclaimed once it has landed"
+        );
+        assert!(
+            list_preserved(storage.path()).is_empty(),
+            "so no sweep still sees work here"
+        );
     }
 
     /// A preserved branch listed by the sweep can be destroyed by `abort()` —
@@ -7687,7 +8000,10 @@ mod tests {
     /// and it is what the whole `is_disposed` split exists for.
     #[test]
     fn abort_destroys_preserved_storage_except_when_it_was_kept() {
-        for reason in [PreserveReason::MergeInterrupted, PreserveReason::CommitDeferred] {
+        for reason in [
+            PreserveReason::MergeInterrupted,
+            PreserveReason::CommitDeferred,
+        ] {
             let workdir = tempfile::tempdir().unwrap();
             let storage = tempfile::tempdir().unwrap();
             let mut branch =
@@ -7695,11 +8011,18 @@ mod tests {
             let storage_dir = branch.storage_dir.clone();
             fs::write(branch.upper.join("added.txt"), "payload").unwrap();
             branch.preserve(reason);
-            assert_eq!(list_preserved(storage.path()).len(), 1, "precondition for {reason:?}");
+            assert_eq!(
+                list_preserved(storage.path()).len(),
+                1,
+                "precondition for {reason:?}"
+            );
 
             branch.abort().unwrap();
 
-            assert!(!storage_dir.exists(), "abort must destroy {reason:?} storage");
+            assert!(
+                !storage_dir.exists(),
+                "abort must destroy {reason:?} storage"
+            );
             assert!(
                 list_preserved(storage.path()).is_empty(),
                 "and it must disappear from the sweep, mid-flight or not",
@@ -7713,7 +8036,10 @@ mod tests {
         fs::write(branch.upper.join("added.txt"), "payload").unwrap();
         branch.keep();
         branch.abort().unwrap();
-        assert!(storage_dir.exists(), "abort must not destroy storage that was kept");
+        assert!(
+            storage_dir.exists(),
+            "abort must not destroy storage that was kept"
+        );
     }
 
     /// `changes()` on a branch kept for inspection still reports the whole
@@ -7735,8 +8061,12 @@ mod tests {
         branch.mark_deleted("gone.txt");
         branch.keep();
 
-        let mut reported: Vec<(ChangeKind, PathBuf)> =
-            branch.changes().unwrap().into_iter().map(|c| (c.kind, c.path)).collect();
+        let mut reported: Vec<(ChangeKind, PathBuf)> = branch
+            .changes()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, c.path))
+            .collect();
         reported.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
             reported,
@@ -7762,8 +8092,7 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
 
         // Another merge in flight: hold LOCK_EX on the workdir from a second fd.
@@ -7780,8 +8109,14 @@ mod tests {
             .expect_err("a held workdir lock must block the commit");
         drop(held);
 
-        assert!(matches!(err, CommitError::Contended(_)), "expected contention, got: {err:?}");
-        assert!(polls > 0, "the poll loop must actually have waited for the holder");
+        assert!(
+            matches!(err, CommitError::Contended(_)),
+            "expected contention, got: {err:?}"
+        );
+        assert!(
+            polls > 0,
+            "the poll loop must actually have waited for the holder"
+        );
         assert!(
             !workdir.path().join("a.txt").exists(),
             "nothing may be merged while another holder has the lock"
@@ -7804,8 +8139,7 @@ mod tests {
 
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
 
         let defer = |branch: &mut SeccompCowBranch| {
@@ -7851,8 +8185,7 @@ mod tests {
         // regular file (fails under O_NOFOLLOW), leaving the branch half merged.
         std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
 
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let storage_dir = branch.storage_dir.clone();
         fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
 
@@ -7885,7 +8218,10 @@ mod tests {
             .expect_err("the retry must fail: the lock is held");
         drop(held);
 
-        assert!(matches!(err, CommitError::Contended(_)), "expected contention, got: {err:?}");
+        assert!(
+            matches!(err, CommitError::Contended(_)),
+            "expected contention, got: {err:?}"
+        );
         // The invariant: the stronger reason must survive the contended retry, in
         // memory AND on disk. A downgrade here is the S3 bug.
         assert_eq!(
@@ -7915,21 +8251,27 @@ mod tests {
     fn commit_does_not_self_deadlock_uncontended() {
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
 
         let mut polls = 0usize;
         branch
             .commit_with_lock_polling(Duration::from_millis(20), |_| polls += 1)
             .expect("an uncontended commit must not deadlock on its own lock");
-        assert_eq!(polls, 0, "an uncontended commit must take the lock without waiting");
+        assert_eq!(
+            polls, 0,
+            "an uncontended commit must take the lock without waiting"
+        );
         assert_eq!(
             std::fs::read_to_string(workdir.path().join("a.txt")).unwrap(),
             "plan\n",
             "the merge must have landed"
         );
-        assert_eq!(branch.state, BranchState::Finished, "a merged branch is Finished");
+        assert_eq!(
+            branch.state,
+            BranchState::Finished,
+            "a merged branch is Finished"
+        );
     }
 
     /// The thin `commit()` wrapper (the plain-Sandbox / Drop path) also
@@ -7942,8 +8284,7 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
 
         let held = std::fs::File::open(workdir.path()).unwrap();
@@ -7967,7 +8308,10 @@ mod tests {
             BranchState::Preserved(PreserveReason::CommitDeferred),
             "the deferred commit must preserve for recovery, not reclaim"
         );
-        assert!(!workdir.path().join("a.txt").exists(), "nothing may be merged under contention");
+        assert!(
+            !workdir.path().join("a.txt").exists(),
+            "nothing may be merged under contention"
+        );
         assert_eq!(
             std::fs::read_to_string(branch.upper.join("a.txt")).unwrap(),
             "plan\n",
@@ -7991,8 +8335,7 @@ mod tests {
         // MergeInterrupted: a symlink in the workdir where the upper holds a regular
         // file fails under O_NOFOLLOW.
         std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         let storage_dir = branch.storage_dir.clone();
         fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
 
@@ -8071,9 +8414,18 @@ mod tests {
             let elapsed = started.elapsed();
             drop(held);
 
-            assert_eq!(polls, 0, "a disposed branch must not poll the workdir lock (kept={kept})");
-            assert!(elapsed < Duration::from_secs(1), "must return at once, took {elapsed:?}");
-            assert_eq!(branch.state, expected_state, "disposition must be unchanged (kept={kept})");
+            assert_eq!(
+                polls, 0,
+                "a disposed branch must not poll the workdir lock (kept={kept})"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "must return at once, took {elapsed:?}"
+            );
+            assert_eq!(
+                branch.state, expected_state,
+                "disposition must be unchanged (kept={kept})"
+            );
         }
     }
 
@@ -8085,8 +8437,7 @@ mod tests {
         // Separate storage: survives removing the workdir below.
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let mut branch =
-            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         fs::write(branch.upper.join("a.txt"), "plan\n").unwrap();
 
         // Remove the workdir so the lock's File::open is ENOENT -> Io (not contention).
@@ -8176,7 +8527,10 @@ mod tests {
         let fresh = root.path().join("fresh-base");
         ensure_secure_base(&fresh, uid).expect("a base we create must be accepted");
         let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "a freshly-created base must be 0700, got {mode:o}");
+        assert_eq!(
+            mode, 0o700,
+            "a freshly-created base must be 0700, got {mode:o}"
+        );
         ensure_secure_base(&fresh, uid).expect("an existing owned dir must still be accepted");
 
         // A reused base owned by us but widened to group/world access is rejected
@@ -8213,8 +8567,15 @@ mod tests {
 
         let err = ensure_secure_base(&leaf, uid)
             .expect_err("a base under a missing parent cannot be created non-recursively");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "expected ENOENT, got: {err:?}");
-        assert!(!missing.exists(), "the missing parent must NOT be fabricated");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "expected ENOENT, got: {err:?}"
+        );
+        assert!(
+            !missing.exists(),
+            "the missing parent must NOT be fabricated"
+        );
         assert!(!leaf.exists(), "the leaf must not exist either");
     }
 
@@ -8319,9 +8680,13 @@ mod tests {
         // The resolver must fall back to the secure per-uid tmp base, creating
         // it 0700 on the way.
         let tmp_base = tmp_storage_base(tmp_root.path(), uid);
-        let chosen =
-            resolve_default_storage_base(Some(xdg_root.path().as_os_str()), tmp_root.path(), uid, uid)
-                .expect("an insecure XDG base must fall back, not fail");
+        let chosen = resolve_default_storage_base(
+            Some(xdg_root.path().as_os_str()),
+            tmp_root.path(),
+            uid,
+            uid,
+        )
+        .expect("an insecure XDG base must fall back, not fail");
         assert_eq!(
             chosen, tmp_base,
             "an insecure XDG base must fall back to the secure per-uid tmp base",
@@ -8341,7 +8706,10 @@ mod tests {
             uid,
             uid,
         ) {
-            Ok(b) => panic!("both bases insecure must be a hard error, got base {}", b.display()),
+            Ok(b) => panic!(
+                "both bases insecure must be a hard error, got base {}",
+                b.display()
+            ),
             Err(e) => e,
         };
         assert!(
@@ -8390,7 +8758,9 @@ mod tests {
         );
         let pid = std::process::id().to_string();
         assert!(
-            !chosen_base.components().any(|c| c.as_os_str() == pid.as_str()),
+            !chosen_base
+                .components()
+                .any(|c| c.as_os_str() == pid.as_str()),
             "the default base must carry NO pid component, got {}",
             chosen_base.display(),
         );

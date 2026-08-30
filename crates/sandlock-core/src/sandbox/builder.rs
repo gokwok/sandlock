@@ -7,10 +7,16 @@ use super::*;
 /// duplicating the flag declarations.
 #[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct SandboxBuilder {
-    #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(short = 'r', long = "fs-read", value_name = "PATH")
+    )]
     pub fs_readable: Vec<PathBuf>,
 
-    #[cfg_attr(feature = "cli", arg(short = 'w', long = "fs-write", value_name = "PATH"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(short = 'w', long = "fs-write", value_name = "PATH")
+    )]
     pub fs_writable: Vec<PathBuf>,
 
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
@@ -18,13 +24,19 @@ pub struct SandboxBuilder {
 
     /// Extra syscall or syscall-group name to deny, in addition to Sandlock's
     /// default blocklist (groups: sysv_ipc). Repeatable.
-    #[cfg_attr(feature = "cli", arg(long = "extra-deny-syscall", value_name = "NAME|GROUP"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(long = "extra-deny-syscall", value_name = "NAME|GROUP")
+    )]
     pub extra_deny_syscalls: Vec<String>,
 
     /// Syscall group name to allow back from the default blocklist
     /// (groups: sysv_ipc). Individual syscalls cannot be re-allowed.
     /// Repeatable.
-    #[cfg_attr(feature = "cli", arg(long = "extra-allow-syscall", value_name = "GROUP"))]
+    #[cfg_attr(
+        feature = "cli",
+        arg(long = "extra-allow-syscall", value_name = "GROUP")
+    )]
     pub extra_allow_syscalls: Vec<String>,
 
     /// Outbound endpoint allow rule. Repeatable. Each value is
@@ -383,7 +395,8 @@ impl SandboxBuilder {
     /// continue to report the degraded protection so the posture is
     /// observable.
     pub fn allow_degraded(mut self, protection: Protection) -> Self {
-        self.protection_policy.set(protection, ProtectionState::Degradable);
+        self.protection_policy
+            .set(protection, ProtectionState::Degradable);
         self
     }
 
@@ -400,7 +413,8 @@ impl SandboxBuilder {
     /// Use [`allow_degraded`](Self::allow_degraded) if you want REFER
     /// enforced only where the kernel supports it.
     pub fn disable(mut self, protection: Protection) -> Self {
-        self.protection_policy.set(protection, ProtectionState::Disabled);
+        self.protection_policy
+            .set(protection, ProtectionState::Disabled);
         self
     }
 
@@ -670,14 +684,22 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn fs_mount(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
+    pub fn fs_mount(
+        mut self,
+        virtual_path: impl Into<PathBuf>,
+        host_path: impl Into<PathBuf>,
+    ) -> Self {
         self.fs_mount.push((virtual_path.into(), host_path.into()));
         self
     }
 
     /// Add a read-only mount: the host path is visible at `virtual_path` for
     /// reading, but writes through it are denied (e.g. the host procfs mount).
-    pub fn fs_mount_ro(mut self, virtual_path: impl Into<PathBuf>, host_path: impl Into<PathBuf>) -> Self {
+    pub fn fs_mount_ro(
+        mut self,
+        virtual_path: impl Into<PathBuf>,
+        host_path: impl Into<PathBuf>,
+    ) -> Self {
         let virtual_path = virtual_path.into();
         self.fs_mount.push((virtual_path.clone(), host_path.into()));
         self.fs_mount_ro.push(virtual_path);
@@ -693,7 +715,6 @@ impl SandboxBuilder {
         self.env.insert(key.into(), value.into());
         self
     }
-
 
     pub fn gpu_devices(mut self, devices: Vec<u32>) -> Self {
         self.gpu_devices = Some(devices);
@@ -739,7 +760,13 @@ impl SandboxBuilder {
 
     pub fn policy_fn(
         mut self,
-        f: impl Fn(crate::policy_fn::SyscallEvent, &mut crate::policy_fn::PolicyContext) -> crate::policy_fn::Verdict + Send + Sync + 'static,
+        f: impl Fn(
+                crate::policy_fn::SyscallEvent,
+                &mut crate::policy_fn::PolicyContext,
+            ) -> crate::policy_fn::Verdict
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         self.policy_fn = Some(std::sync::Arc::new(f));
         self
@@ -858,10 +885,7 @@ impl SandboxBuilder {
             ));
         }
         // --http-ca-out needs an actual CA to export (BYO or generated).
-        if self.http_ca_out.is_some()
-            && self.http_ca.is_none()
-            && self.http_inject_ca.is_empty()
-        {
+        if self.http_ca_out.is_some() && self.http_ca.is_none() && self.http_inject_ca.is_empty() {
             return Err(SandboxError::Invalid(
                 "--http-ca-out requires --http-ca or --http-inject-ca".into(),
             ));
@@ -947,15 +971,16 @@ impl SandboxBuilder {
         let inject = std::sync::Arc::new(inject_rules);
 
         // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
-        let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
-            let mut ports = vec![80];
-            if self.http_ca.is_some() || !self.http_inject_ca.is_empty() {
-                ports.push(443);
-            }
-            ports
-        } else {
-            self.http_ports
-        };
+        let http_ports =
+            if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
+                let mut ports = vec![80];
+                if self.http_ca.is_some() || !self.http_inject_ca.is_empty() {
+                    ports.push(443);
+                }
+                ports
+            } else {
+                self.http_ports
+            };
 
         // Parse user-supplied --net-allow specs. A scheme-less spec
         // covers TCP and UDP, so one spec can yield two rules.
@@ -1051,9 +1076,9 @@ impl SandboxBuilder {
             cow_upper: None,
             init_fn: self.init_fn,
             work_fn: self.work_fn,
-            keep_branch_if_abandoned: std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
+            keep_branch_if_abandoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             runtime: None,
             restore_skipped: Vec::new(),
         })
@@ -1193,10 +1218,16 @@ mod tests {
         assert_eq!(found(std::slice::from_ref(&secret)), None);
         assert_eq!(found(std::slice::from_ref(&dir)), None);
         // A deny elsewhere does not suppress the warning.
-        assert_eq!(found(&[PathBuf::from("/nonexistent-deny")]), Some(dir.clone()));
+        assert_eq!(
+            found(&[PathBuf::from("/nonexistent-deny")]),
+            Some(dir.clone())
+        );
         // Outside every grant: nothing to report.
         let other = vec![PathBuf::from("/nonexistent-grant")];
-        assert_eq!(exposing_grant(&secret, other.iter(), &[], None).map(|e| e.grant), None);
+        assert_eq!(
+            exposing_grant(&secret, other.iter(), &[], None).map(|e| e.grant),
+            None
+        );
 
         let _ = std::fs::remove_file(&secret);
         let _ = std::fs::remove_dir(&dir);
@@ -1225,15 +1256,17 @@ mod tests {
         // what the warning now advises) suppresses it.
         assert!(exposing_grant(&secret, grants.iter(), &[virtual_path.clone()], chroot).is_none());
         // Denying a covering in-jail directory also suppresses.
-        assert!(
-            exposing_grant(&secret, grants.iter(), &[PathBuf::from("/etc")], chroot).is_none()
-        );
+        assert!(exposing_grant(&secret, grants.iter(), &[PathBuf::from("/etc")], chroot).is_none());
         // The old advice (the host path) does NOT suppress: at runtime the child
         // opens /etc/token, so a /jail/etc/token deny never fires. This is the
         // regression the fix closes.
-        assert!(
-            exposing_grant(&secret, grants.iter(), std::slice::from_ref(&secret), chroot).is_some()
-        );
+        assert!(exposing_grant(
+            &secret,
+            grants.iter(),
+            std::slice::from_ref(&secret),
+            chroot
+        )
+        .is_some());
 
         let _ = std::fs::remove_file(&secret);
         let _ = std::fs::remove_dir(&etc);

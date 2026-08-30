@@ -2793,7 +2793,9 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
     // keeps running; the Sandbox owns it). Skipped fds live on the Sandbox.
     let cp_ref = &(*cp)._private;
     let restored = matches!(
-        block_on_runtime(&rt, async { sb.restore_interactive(cp_ref).await.map(|_| ()) }),
+        block_on_runtime(&rt, async {
+            sb.restore_interactive(cp_ref).await.map(|_| ())
+        }),
         Some(Ok(()))
     );
     if !restored {
@@ -2813,9 +2815,7 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
 /// # Safety
 /// `h` must be null or a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(
-    h: *const sandlock_handle_t,
-) -> usize {
+pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(h: *const sandlock_handle_t) -> usize {
     if h.is_null() {
         return 0;
     }
@@ -2921,12 +2921,24 @@ mod tests {
 
     #[test]
     fn exit_reason_maps_every_exit_status() {
-        assert!(matches!(exit_reason(&ExitStatus::Code(0)), sandlock_exit_reason_t::Exited));
-        assert!(matches!(exit_reason(&ExitStatus::Signal(15)), sandlock_exit_reason_t::Signaled));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Code(0)),
+            sandlock_exit_reason_t::Exited
+        ));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Signal(15)),
+            sandlock_exit_reason_t::Signaled
+        ));
         // SIGKILL folds into Killed in core, so KILLED is a distinct reason with
         // no recoverable signal — the "systemd-style minus oom-kill" boundary.
-        assert!(matches!(exit_reason(&ExitStatus::Killed), sandlock_exit_reason_t::Killed));
-        assert!(matches!(exit_reason(&ExitStatus::Timeout), sandlock_exit_reason_t::Timeout));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Killed),
+            sandlock_exit_reason_t::Killed
+        ));
+        assert!(matches!(
+            exit_reason(&ExitStatus::Timeout),
+            sandlock_exit_reason_t::Timeout
+        ));
         assert_eq!(exit_signal(&ExitStatus::Signal(15)), 15);
         for s in [ExitStatus::Code(7), ExitStatus::Killed, ExitStatus::Timeout] {
             assert_eq!(exit_signal(&s), -1, "only Signal(n) yields a number");
