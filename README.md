@@ -79,6 +79,47 @@ Sandlock is implemented in **Rust** for performance and safety:
 Protections can be selectively waived per-policy when needed — see
 [`docs/sandbox-reference.md#protection-opt-out`](docs/sandbox-reference.md#protection-opt-out).
 
+### Optional Bubblewrap filesystem backend
+
+Landlock remains the default. `--filesystem-backend bubblewrap` opts into an
+empty mount namespace populated only with explicit filesystem grants; `auto`
+prefers Landlock when it satisfies every strict protection, otherwise tries
+Bubblewrap. Failure to provide a strict protection is still fatal.
+
+Bubblewrap requires `bwrap`, working unprivileged user/mount namespaces, and
+Sandlock's seccomp supervisor. It does not require Landlock or host root, but
+the deployment must permit these kernel facilities. Run `sandlock check` as
+the actual service user to exercise the bootstrap, not just inspect versions.
+
+The mount backend supplies filesystem refer/truncate isolation. It does not
+replace Landlock's TCP, device-ioctl, signal, or abstract Unix socket
+protections; explicitly allow those to degrade only when appropriate:
+
+```bash
+sandlock run --filesystem-backend bubblewrap \
+  --allow-degraded net-tcp --allow-degraded fs-ioctl-dev \
+  --allow-degraded signal-scope --allow-degraded abstract-unix-socket-scope \
+  -r /usr -r /lib -r /etc/ld.so.cache -w /dev/null \
+  -- sh -c 'echo bubblewrap-ok'
+```
+
+The example assumes a merged-`/usr` Linux installation. Grant any additional
+runtime libraries explicitly. An empty filesystem or network allowlist never
+means unrestricted access; network equivalence between backends is not claimed.
+
+The CLI hosts its own trusted bootstrap. Library/FFI users must also deploy
+`sandlock-bootstrap` (`cargo build --release -p sandlock-core --bin
+sandlock-bootstrap`) and configure its trusted path or place it beside the
+application/on the service's trusted `PATH`. `bubblewrap_path` and
+`bubblewrap_bootstrap_path` are deployment settings, not serialized policy.
+
+COW remains supervisor-managed: `workdir` identifies the host lower and
+`workdir_virtual` optionally gives its guest path. The lower is mounted
+read-only; writes remain in private COW storage. `create`/`start`, resource
+accounting, and process-group lifecycle stay Sandlock-owned. Bubblewrap does
+not support `no_supervisor` or in-process child entrypoints; OCI continues
+using the default Landlock path.
+
 ## Install
 
 ### From source
