@@ -4,7 +4,8 @@
 Profiles use the sectioned policy schema (the same one parsed by the
 Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
 
-    [config]      → http_ca, http_key, fs_storage, workdir
+    [config]      → filesystem_backend, http_ca, http_key, fs_storage,
+                    workdir, workdir_virtual
     [determinism] → random_seed, time_start, deterministic_dirs,
                     no_randomize_memory
     [program]     → env, cwd, uid, clean_env, no_coredump, no_huge_pages
@@ -54,12 +55,14 @@ _PROFILES_DIR = Path("~/.config/sandlock/profiles").expanduser()
 # program identity, not Sandbox config).
 _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
     "config": {
+        "filesystem_backend": ("filesystem_backend", str),
         "http_ca":    ("http_ca",    str),
         "http_key":   ("http_key",   str),
         "http_inject_ca": ("http_inject_ca", list),
         "http_ca_out":    ("http_ca_out",    str),
         "fs_storage": ("fs_storage", str),
         "workdir":    ("workdir",    str),
+        "workdir_virtual": ("workdir_virtual", str),
     },
     "determinism": {
         "random_seed":         ("random_seed",         int),

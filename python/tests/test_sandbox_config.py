@@ -71,6 +71,10 @@ class TestEnsureNative:
 class TestPolicy:
     def test_defaults(self):
         p = Sandbox()
+        assert p.filesystem_backend == "landlock"
+        assert p.bubblewrap_path is None
+        assert p.bubblewrap_bootstrap_path is None
+        assert p.workdir_virtual is None
         assert p.fs_writable == []
         assert p.fs_readable == []
         assert p.fs_denied == []
@@ -81,6 +85,10 @@ class TestPolicy:
         assert p.max_memory is None
         assert p.max_processes == 64
         assert p.max_cpu is None
+
+    def test_invalid_filesystem_backend_is_rejected_before_build(self):
+        with pytest.raises(ValueError, match="filesystem_backend"):
+            Sandbox(filesystem_backend="unknown")._ensure_native()
 
     def test_mutable_config(self):
         # Sandbox is no longer frozen — it holds runtime state too.
@@ -255,4 +263,3 @@ class TestNetDeny:
     def test_specs_preserved_as_strings(self):
         p = Sandbox(net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"])
         assert list(p.net_deny) == ["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
-

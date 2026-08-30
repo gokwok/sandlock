@@ -163,7 +163,17 @@ class Sandbox:
     ``metadata={"runtime": True}`` so serializers can skip them.
     """
 
-    # Filesystem (Landlock)
+    # Static filesystem isolation
+    filesystem_backend: str = "landlock"
+    """Static filesystem provider: ``landlock``, ``bubblewrap``, or ``auto``."""
+
+    bubblewrap_path: str | None = None
+    """Trusted Bubblewrap executable override."""
+
+    bubblewrap_bootstrap_path: str | None = None
+    """Trusted Sandlock Bubblewrap bootstrap executable override."""
+
+    # Filesystem policy
     fs_writable: Sequence[str] = field(default_factory=list)
     """Paths the sandbox can write to."""
 
@@ -381,6 +391,9 @@ class Sandbox:
     workdir: str | None = None
     """COW root directory.  Only controls which directory COW tracks —
     does NOT set the child's working directory.  Use ``cwd`` for that."""
+
+    workdir_virtual: str | None = None
+    """Guest-visible path corresponding to ``workdir``'s host lower."""
 
     cwd: str | None = None
     """Child working directory (chdir target).  The child process starts

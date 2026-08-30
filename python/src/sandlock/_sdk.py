@@ -75,8 +75,12 @@ _b_fs_read = _builder_fn("sandlock_sandbox_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_sandbox_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_sandbox_builder_fs_deny", ctypes.c_char_p)
 _b_fs_storage = _builder_fn("sandlock_sandbox_builder_fs_storage", ctypes.c_char_p)
+_b_filesystem_backend = _builder_fn("sandlock_sandbox_builder_filesystem_backend", ctypes.c_uint32)
 _b_gpu_devices = _builder_fn("sandlock_sandbox_builder_gpu_devices", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 _b_workdir = _builder_fn("sandlock_sandbox_builder_workdir", ctypes.c_char_p)
+_b_workdir_virtual = _builder_fn("sandlock_sandbox_builder_workdir_virtual", ctypes.c_char_p)
+_b_bubblewrap_path = _builder_fn("sandlock_sandbox_builder_bubblewrap_path", ctypes.c_char_p)
+_b_bubblewrap_bootstrap_path = _builder_fn("sandlock_sandbox_builder_bubblewrap_bootstrap_path", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_sandbox_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_sandbox_builder_chroot", ctypes.c_char_p)
 _b_fs_mount = _builder_fn("sandlock_sandbox_builder_fs_mount", ctypes.c_char_p, ctypes.c_char_p)
@@ -1021,7 +1025,8 @@ class _NativePolicy:
     # is Python-side only; no_coredump is a Python convenience alias).
     _HANDLED_FIELDS: set[str] = {
         "fs_writable", "fs_readable", "fs_denied", "fs_storage",
-        "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
+        "filesystem_backend", "bubblewrap_path", "bubblewrap_bootstrap_path",
+        "workdir", "workdir_virtual", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
@@ -1055,6 +1060,17 @@ class _NativePolicy:
         for p in (policy.fs_denied or []):
             b = _b_fs_deny(b, _encode(str(p)))
 
+        backend_map = {"landlock": 0, "bubblewrap": 1, "auto": 2}
+        try:
+            backend = backend_map[str(policy.filesystem_backend)]
+        except KeyError as exc:
+            raise ValueError("filesystem_backend must be landlock, bubblewrap, or auto") from exc
+        b = _b_filesystem_backend(b, backend)
+        if policy.bubblewrap_path:
+            b = _b_bubblewrap_path(b, _encode(str(policy.bubblewrap_path)))
+        if policy.bubblewrap_bootstrap_path:
+            b = _b_bubblewrap_bootstrap_path(b, _encode(str(policy.bubblewrap_bootstrap_path)))
+
         if policy.fs_storage:
             b = _b_fs_storage(b, _encode(str(policy.fs_storage)))
 
@@ -1064,6 +1080,8 @@ class _NativePolicy:
 
         if policy.workdir:
             b = _b_workdir(b, _encode(str(policy.workdir)))
+        if policy.workdir_virtual:
+            b = _b_workdir_virtual(b, _encode(str(policy.workdir_virtual)))
         if policy.cwd:
             b = _b_cwd(b, _encode(str(policy.cwd)))
         if policy.chroot:

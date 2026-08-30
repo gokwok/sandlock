@@ -138,16 +138,20 @@ class TestPolicyFromDict:
     def test_config_section(self):
         p = policy_from_dict({
             "config": {
+                "filesystem_backend": "bubblewrap",
                 "http_ca": "/etc/sandlock/ca.pem",
                 "http_key": "/etc/sandlock/ca.key",
                 "fs_storage": "/var/sandlock/store",
                 "workdir": "/var/sandlock/work",
+                "workdir_virtual": "/workspace",
             },
         })
+        assert p.filesystem_backend == "bubblewrap"
         assert p.http_ca == "/etc/sandlock/ca.pem"
         assert p.http_key == "/etc/sandlock/ca.key"
         assert p.fs_storage == "/var/sandlock/store"
         assert p.workdir == "/var/sandlock/work"
+        assert p.workdir_virtual == "/workspace"
 
     def test_determinism_section(self):
         p = policy_from_dict({

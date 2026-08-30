@@ -4,7 +4,9 @@ Python bindings for [sandlock](https://github.com/multikernel/sandlock), a
 lightweight process sandbox using Landlock and seccomp. No root, no Docker,
 no namespaces required.
 
-Requires Linux 6.7+ with Landlock ABI v6.
+The default strict policy requires Linux 6.12+ with Landlock ABI v6.
+The opt-in Bubblewrap filesystem backend supports hosts without Landlock;
+see [backend requirements and limitations](../README.md#optional-bubblewrap-filesystem-backend).
 
 ```
 pip install sandlock
@@ -94,14 +96,18 @@ with Sandbox(fs_readable=["/usr", "/lib"]) as sb:
     result = sb.run(["echo", "hello"])
 ```
 
-#### Filesystem (Landlock)
+#### Filesystem
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `filesystem_backend` | `str` | `"landlock"` | `landlock`, `bubblewrap`, or `auto`; automatic selection does not relax strict protections |
+| `bubblewrap_path` | `str \| None` | `None` | Trusted `bwrap` executable override; deployment-only |
+| `bubblewrap_bootstrap_path` | `str \| None` | `None` | Trusted `sandlock-bootstrap` executable override; deployment-only |
 | `fs_readable` | `list[str]` | `[]` | Paths the sandbox can read |
 | `fs_writable` | `list[str]` | `[]` | Paths the sandbox can write |
 | `fs_denied` | `list[str]` | `[]` | Paths explicitly denied |
 | `workdir` | `str \| None` | `None` | Working directory; enables COW protection |
+| `workdir_virtual` | `str \| None` | `None` | Guest-visible COW root corresponding to the host `workdir` lower |
 | `chroot` | `str \| None` | `None` | Path to chroot into before confinement |
 | `fs_mount` | `dict[str, str]` | `{}` | Map virtual paths to host directories inside chroot |
 | `cwd` | `str \| None` | `None` | Child working directory |
