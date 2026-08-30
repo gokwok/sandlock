@@ -84,6 +84,23 @@ struct RunArgs {
     #[clap(flatten)]
     sandbox_builder: SandboxBuilder,
 
+    /// Static filesystem isolation provider. Defaults to Landlock unless a
+    /// profile selects another backend.
+    #[arg(long = "filesystem-backend", value_name = "landlock|bubblewrap|auto")]
+    filesystem_backend: Option<sandlock_core::FilesystemBackend>,
+
+    /// Trusted Bubblewrap executable override.
+    #[arg(long = "bubblewrap-path", value_name = "PATH")]
+    bubblewrap_path: Option<PathBuf>,
+
+    /// Trusted post-mount bootstrap executable override.
+    #[arg(long = "bubblewrap-bootstrap-path", value_name = "PATH")]
+    bubblewrap_bootstrap_path: Option<PathBuf>,
+
+    /// Guest-visible path corresponding to the host COW lower.
+    #[arg(long = "workdir-virtual", value_name = "PATH")]
+    workdir_virtual: Option<PathBuf>,
+
     // ── Sandbox-builder fields that need special parsing (not in SandboxBuilder's clap derive) ──
     #[arg(short = 'm', long = "max-memory")]
     max_memory: Option<String>,
@@ -258,8 +275,20 @@ struct LearnArgs {
     cmd: Vec<String>,
 }
 
+fn main() -> Result<()> {
+    // Dispatch before creating Tokio workers: the trusted bootstrap clones
+    // its listener relay and must start from a single-threaded process.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--filter-fd")
+    {
+        sandlock_core::bootstrap::main();
+    }
+    run_cli()
+}
+
 #[tokio::main(worker_threads = 2)]
-async fn main() -> Result<()> {
+async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -472,6 +501,45 @@ async fn main() -> Result<()> {
                     println!("  Status:   UNSUPPORTED");
                 }
             }
+            let mut bubblewrap = Sandbox::builder()
+                .filesystem_backend(sandlock_core::FilesystemBackend::Bubblewrap)
+                .bubblewrap_bootstrap_path(std::env::current_exe()?);
+            for protection in [
+                sandlock_core::Protection::NetTcp,
+                sandlock_core::Protection::FsIoctlDev,
+                sandlock_core::Protection::SignalScope,
+                sandlock_core::Protection::AbstractUnixSocketScope,
+            ] {
+                bubblewrap = bubblewrap.allow_degraded(protection);
+            }
+            for path in ["/usr", "/lib", "/lib64", "/etc/ld.so.cache", "/dev/null"] {
+                if std::path::Path::new(path).exists() {
+                    bubblewrap = bubblewrap.fs_read(path);
+                }
+            }
+            if std::path::Path::new("/dev/null").exists() {
+                bubblewrap = bubblewrap.fs_write("/dev/null");
+            }
+            let mut bubblewrap = bubblewrap.build()?;
+            match bubblewrap.filesystem_backend_report() {
+                Ok(report) => match bubblewrap.run(&["sh", "-c", "test ! -e /root"]).await {
+                    Ok(result) if result.success() => println!(
+                        "  Bubblewrap:     OK — {} ({})",
+                        report
+                            .executable
+                            .as_deref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "available".to_owned()),
+                        report.implementation_id
+                    ),
+                    Ok(result) => println!(
+                        "  Bubblewrap:     unavailable (probe exited {:?})",
+                        result.exit_status
+                    ),
+                    Err(error) => println!("  Bubblewrap:     unavailable ({error})"),
+                },
+                Err(error) => println!("  Bubblewrap:     unavailable ({error})"),
+            }
             println!("  Platform: {}", std::env::consts::ARCH);
         }
 
@@ -579,6 +647,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for p in &base.fs_denied {
             b = b.fs_deny(p);
         }
+        b = b.filesystem_backend(base.filesystem_backend);
         for rule in &base.net_allow {
             b = b.net_allow(sandlock_core::format_net_rule(rule));
         }
@@ -638,6 +707,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         }
         if let Some(ref w) = base.workdir {
             b = b.workdir(w);
+        }
+        if let Some(ref w) = base.workdir_virtual {
+            b = b.workdir_virtual(w);
         }
         if let Some(ref c) = base.cwd {
             b = b.cwd(c);
@@ -745,6 +817,22 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     }
     if let Some(ref path) = pb.workdir {
         builder = builder.workdir(path);
+    }
+    if let Some(backend) = args.filesystem_backend {
+        builder = builder.filesystem_backend(backend);
+    }
+    if let Some(ref path) = args.bubblewrap_path {
+        builder = builder.bubblewrap_path(path);
+    }
+    if let Some(ref path) = args.bubblewrap_bootstrap_path {
+        builder = builder.bubblewrap_bootstrap_path(path);
+    } else {
+        // The CLI binary implements the trusted bootstrap entry point itself,
+        // so a normal installation does not depend on a helper found in PATH.
+        builder = builder.bubblewrap_bootstrap_path(std::env::current_exe()?);
+    }
+    if let Some(ref path) = args.workdir_virtual {
+        builder = builder.workdir_virtual(path);
     }
     if let Some(ref path) = pb.cwd {
         builder = builder.cwd(path);
@@ -1101,6 +1189,15 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     }
     if pb.workdir.is_some() {
         bad.push("--workdir");
+    }
+    if args.workdir_virtual.is_some() {
+        bad.push("--workdir-virtual");
+    }
+    if args
+        .filesystem_backend
+        .is_some_and(|backend| backend != sandlock_core::FilesystemBackend::Landlock)
+    {
+        bad.push("--filesystem-backend");
     }
     if pb.cwd.is_some() {
         bad.push("--cwd");
