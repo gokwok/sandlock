@@ -153,6 +153,12 @@ impl TryFrom<&Sandbox> for Confinement {
 
     fn try_from(sandbox: &Sandbox) -> Result<Self, Self::Error> {
         let mut unsupported = Vec::new();
+        if sandbox.filesystem_backend != crate::filesystem_backend::FilesystemBackend::Landlock {
+            unsupported.push("filesystem_backend");
+        }
+        if sandbox.workdir_virtual.is_some() {
+            unsupported.push("workdir_virtual");
+        }
         if !sandbox.fs_denied.is_empty() {
             unsupported.push("fs_denied");
         }
@@ -369,8 +375,16 @@ impl StdioSpec {
 struct Runtime {
     name: String,
     state: RuntimeState,
+    /// Direct child. For Bubblewrap this is the
+    /// monitor/launcher whose exit status mirrors the workload.
     child_pid: Option<i32>,
+    /// Process that installed Sandlock's seccomp listener. Equal to
+    /// `child_pid` for Landlock and distinct for Bubblewrap.
+    payload_pid: Option<i32>,
+    /// Workload process group controlled by pause/resume/kill.
+    process_group: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
+    supervised_pidfd: Option<std::os::fd::OwnedFd>,
     notif_handle: Option<JoinHandle<()>>,
     throttle_handle: Option<JoinHandle<()>>,
     loadavg_handle: Option<JoinHandle<()>>,
@@ -565,6 +579,18 @@ pub struct Sandbox {
     pub fs_readable: Vec<PathBuf>,
     pub fs_denied: Vec<PathBuf>,
 
+    /// Static filesystem boundary provider. Defaults to Landlock to preserve
+    /// the historical security contract; Bubblewrap is an explicit opt-in.
+    #[serde(default)]
+    pub filesystem_backend: crate::filesystem_backend::FilesystemBackend,
+
+    /// Trusted deployment paths for the Bubblewrap launcher and Sandlock's
+    /// pre-exec bootstrap. Runtime configuration, not persisted policy.
+    #[serde(skip)]
+    pub(crate) bubblewrap_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub(crate) bubblewrap_bootstrap_path: Option<PathBuf>,
+
     // Extra syscall filtering on top of Sandlock's default blocklist.
     pub extra_deny_syscalls: Vec<String>,
     pub extra_allow_syscalls: Vec<String>,
@@ -672,6 +698,11 @@ pub struct Sandbox {
 
     // Filesystem branch
     pub workdir: Option<PathBuf>,
+    /// Guest-visible root corresponding to `workdir`. Defaults to the host
+    /// workdir path. This separates ThinkThread's logical Fs path from its
+    /// immutable snapshot lower.
+    #[serde(default)]
+    pub workdir_virtual: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub max_disk: Option<ByteSize>,
@@ -795,6 +826,9 @@ impl Clone for Sandbox {
             fs_writable: self.fs_writable.clone(),
             fs_readable: self.fs_readable.clone(),
             fs_denied: self.fs_denied.clone(),
+            filesystem_backend: self.filesystem_backend,
+            bubblewrap_path: self.bubblewrap_path.clone(),
+            bubblewrap_bootstrap_path: self.bubblewrap_bootstrap_path.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             protection_policy: self.protection_policy.clone(),
@@ -825,6 +859,7 @@ impl Clone for Sandbox {
             // spawn-time upper grant lands in fs_readable.
             cow_upper: self.cow_upper.clone(),
             workdir: self.workdir.clone(),
+            workdir_virtual: self.workdir_virtual.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
@@ -994,28 +1029,96 @@ impl Sandbox {
 
     /// Validate cross-section invariants — checks that span multiple fields.
     ///
-    /// Currently a no-op; retained as an extension point and for API
-    /// stability. Idempotent: calling repeatedly is safe.
+    /// Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
+        if let Some(virtual_root) = &self.workdir_virtual {
+            if self.workdir.is_none() {
+                return Err(SandboxError::Invalid(
+                    "workdir_virtual requires a host workdir lower".into(),
+                ));
+            }
+            if !virtual_root.is_absolute()
+                || virtual_root
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir)
+            {
+                return Err(SandboxError::Invalid(format!(
+                    "workdir_virtual must be an absolute path without '..': {}",
+                    virtual_root.display()
+                )));
+            }
+        }
+        if self.filesystem_backend == crate::filesystem_backend::FilesystemBackend::Bubblewrap
+            && self.no_supervisor
+        {
+            return Err(SandboxError::Invalid(
+                "the Bubblewrap filesystem backend requires the seccomp supervisor".into(),
+            ));
+        }
         Ok(())
     }
 
-    /// Resolve the per-protection state against the host's current
-    /// Landlock ABI. Returns one entry per `Protection`. Useful for
-    /// post-`build()` posture inspection.
+    /// Resolve the configured filesystem backend on this host.
+    pub fn resolved_filesystem_backend(
+        &self,
+    ) -> Result<crate::filesystem_backend::ResolvedFilesystemBackend, crate::error::SandlockError>
+    {
+        crate::filesystem_backend::resolve_backend(self).map_err(|error| {
+            crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
+                error,
+            ))
+        })
+    }
+
+    /// Resolve the backend together with its executable and stable semantic
+    /// identity. Downstream exact-run caches must include `implementation_id`.
+    pub fn filesystem_backend_report(
+        &self,
+    ) -> Result<crate::filesystem_backend::FilesystemBackendReport, crate::error::SandlockError>
+    {
+        let resolved = self.resolved_filesystem_backend()?;
+        let executable = if matches!(
+            &resolved,
+            crate::filesystem_backend::ResolvedFilesystemBackend::Bubblewrap { .. }
+        ) {
+            Some(
+                crate::bubblewrap::probe(self)
+                    .map_err(crate::error::SandboxRuntimeError::Io)?
+                    .0,
+            )
+        } else {
+            None
+        };
+        let implementation_id = resolved.implementation_id();
+        Ok(crate::filesystem_backend::FilesystemBackendReport {
+            requested: self.filesystem_backend,
+            resolved,
+            executable,
+            implementation_id,
+        })
+    }
+
+    /// Resolve every semantic protection and report the provider responsible
+    /// for active entries.
+    pub fn active_protection_reports(
+        &self,
+    ) -> Result<Vec<crate::filesystem_backend::ProtectionReport>, crate::error::SandlockError> {
+        let backend = self.resolved_filesystem_backend()?;
+        Ok(crate::filesystem_backend::protection_reports(
+            self, &backend,
+        ))
+    }
+
+    /// Resolve the per-protection state against the selected providers.
+    /// Returns one entry per `Protection`. Kept as the compatibility view for
+    /// callers that do not need provider attribution.
     pub fn active_protections(
         &self,
     ) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
-        let host_abi = crate::landlock::abi_version().map_err(|e| {
-            crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-        })?;
-        Ok(Protection::all()
-            .map(|p| {
-                (
-                    p,
-                    ProtectionStatus::resolve(p, host_abi, &self.protection_policy),
-                )
-            })
+        Ok(self
+            .active_protection_reports()?
+            .into_iter()
+            .map(|report| (report.protection, report.status))
             .collect())
     }
 
@@ -1080,9 +1183,26 @@ impl Sandbox {
             .or_else(|| self.name.as_deref())
     }
 
-    /// Return the child PID if spawned.
+    /// Return the workload PID. The workload is also the process-group leader.
     pub fn pid(&self) -> Option<i32> {
-        self.runtime.as_ref().and_then(|r| r.child_pid)
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.payload_pid)
+    }
+
+    /// Return the workload process that installed the seccomp listener.
+    /// An explicit alias of [`Sandbox::pid`], not the Bubblewrap monitor PID.
+    pub fn payload_pid(&self) -> Option<i32> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.payload_pid)
+    }
+
+    /// Return the process group controlled by lifecycle operations.
+    pub fn process_group(&self) -> Option<i32> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.process_group)
     }
 
     /// Return whether the child is currently running or paused.
@@ -1099,7 +1219,7 @@ impl Sandbox {
         let pid = self
             .runtime
             .as_ref()
-            .and_then(|rt| rt.child_pid)
+            .and_then(|rt| rt.process_group)
             .ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGSTOP) };
         if ret < 0 {
@@ -1115,7 +1235,7 @@ impl Sandbox {
         let pid = self
             .runtime
             .as_ref()
-            .and_then(|rt| rt.child_pid)
+            .and_then(|rt| rt.process_group)
             .ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGCONT) };
         if ret < 0 {
@@ -1138,7 +1258,7 @@ impl Sandbox {
         let pid = self
             .runtime
             .as_ref()
-            .and_then(|rt| rt.child_pid)
+            .and_then(|rt| rt.process_group)
             .ok_or(SandboxRuntimeError::NotRunning)?;
         let restart_throttle = self.stop_cpu_throttle().await;
         if let Err(error) = self.pause() {
@@ -1210,7 +1330,7 @@ impl Sandbox {
         if runtime.throttle_handle.is_some() || !matches!(runtime.state, RuntimeState::Running) {
             return;
         }
-        let Some(child_pid) = runtime.child_pid else {
+        let Some(child_pid) = runtime.process_group else {
             return;
         };
         runtime.throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
@@ -1222,7 +1342,7 @@ impl Sandbox {
         let pid = self
             .runtime
             .as_ref()
-            .and_then(|rt| rt.child_pid)
+            .and_then(|rt| rt.process_group)
             .ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGKILL) };
         if ret < 0 {
@@ -1360,7 +1480,7 @@ impl Sandbox {
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
-            sandbox_restore_tty_foreground(pid);
+            sandbox_restore_tty_foreground(self.rt().process_group.unwrap_or(pid));
             self.rt_mut().tty_foreground_taken = false;
         }
 
@@ -1763,7 +1883,7 @@ impl Sandbox {
             .as_ref()
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         let pid = rt
-            .child_pid
+            .process_group
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
@@ -1783,7 +1903,7 @@ impl Sandbox {
             .as_ref()
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         let pid = rt
-            .child_pid
+            .process_group
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
@@ -1804,7 +1924,7 @@ impl Sandbox {
         let pid = self
             .runtime
             .as_ref()
-            .and_then(|rt| rt.child_pid)
+            .and_then(|rt| rt.payload_pid)
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         self.checkpoint_pid(pid).await
     }
@@ -1984,6 +2104,12 @@ impl Sandbox {
         }
 
         let mut cow = branch.take_cow().map_err(SandboxRuntimeError::Branch)?;
+        if let Some(virtual_root) = self.workdir_virtual.as_deref() {
+            if let Err(error) = cow.set_virtual_root(virtual_root) {
+                branch.replace_cow(cow);
+                return Err(SandboxRuntimeError::Branch(error).into());
+            }
+        }
         if let Err(error) = cow.prepare_attachment() {
             branch.replace_cow(cow);
             return Err(SandboxRuntimeError::Branch(error).into());
@@ -2012,7 +2138,7 @@ impl Sandbox {
         {
             return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
         }
-        if let Some(pid) = runtime.child_pid {
+        if let Some(pid) = runtime.process_group {
             quiesce_process_group(pid, runtime.supervisor_resource.as_ref())
                 .await
                 .map_err(SandboxRuntimeError::Io)?;
@@ -2276,6 +2402,8 @@ impl Sandbox {
             }
         }
         self.rt_mut().child_pid = Some(pid);
+        self.rt_mut().payload_pid = Some(pid);
+        self.rt_mut().process_group = Some(pid);
         self.rt_mut().state = RuntimeState::Running;
 
         let ctrl_fd = ctrl_parent.as_raw_fd();
@@ -2325,7 +2453,10 @@ impl Sandbox {
                     crate::result::ExitStatus::Killed
                 }),
                 child_pid: Some(clone_pid),
+                payload_pid: Some(clone_pid),
+                process_group: Some(clone_pid),
                 pidfd: None,
+                supervised_pidfd: None,
                 notif_handle: None,
                 throttle_handle: None,
                 loadavg_handle: None,
@@ -2443,7 +2574,10 @@ impl Sandbox {
             name,
             state: RuntimeState::Created,
             child_pid: None,
+            payload_pid: None,
+            process_group: None,
             pidfd: None,
+            supervised_pidfd: None,
             notif_handle: None,
             throttle_handle: None,
             loadavg_handle: None,
@@ -2558,6 +2692,27 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
+        let resolved_filesystem_backend = crate::filesystem_backend::resolve_backend(self)
+            .map_err(SandboxRuntimeError::Confinement)?;
+        crate::filesystem_backend::validate_protections(self, &resolved_filesystem_backend)
+            .map_err(SandboxRuntimeError::Confinement)?;
+        let use_bubblewrap = matches!(
+            resolved_filesystem_backend,
+            crate::filesystem_backend::ResolvedFilesystemBackend::Bubblewrap { .. }
+        );
+        if use_bubblewrap && self.no_supervisor {
+            return Err(SandboxRuntimeError::Child(
+                "the Bubblewrap filesystem backend requires the seccomp supervisor".into(),
+            )
+            .into());
+        }
+        if use_bubblewrap && self.in_child_main.is_some() {
+            return Err(SandboxRuntimeError::Child(
+                "in-process child entrypoints are not supported by the Bubblewrap backend".into(),
+            )
+            .into());
+        }
+
         // Resolve the chroot root eagerly, before any fork or confinement work:
         // a configured-but-missing chroot must be a hard error, never a silent
         // drop to "no confinement".
@@ -2659,7 +2814,9 @@ impl Sandbox {
         // shared upper so a binary created in the workdir stays executable.
         let shared_cow = self.rt().shared_cow.clone();
         let seccomp_cow_branch = if let Some(ref shared) = shared_cow {
-            self.fs_readable.push(shared.upper_dir.clone());
+            if !use_bubblewrap {
+                self.fs_readable.push(shared.upper_dir.clone());
+            }
             self.cow_upper = Some(shared.upper_dir.clone());
             None
         } else if !no_supervisor && self.workdir.is_some() {
@@ -2672,6 +2829,11 @@ impl Sandbox {
                 max_disk,
             )
             .map_err(SandboxRuntimeError::Branch)?;
+            if let Some(virtual_root) = self.workdir_virtual.as_deref() {
+                branch
+                    .set_virtual_root(virtual_root)
+                    .map_err(SandboxRuntimeError::Branch)?;
+            }
             // `Keep` must survive a sandbox that is never `wait()`ed:
             // the branch only reaches `Sandbox`'s own disposition after
             // a completed `wait()`, and the branch's `Drop` would otherwise
@@ -2683,7 +2845,9 @@ impl Sandbox {
                 std::sync::atomic::Ordering::Release,
             );
             branch.set_keep_if_abandoned(Arc::clone(&self.keep_branch_if_abandoned));
-            self.fs_readable.push(branch.upper_dir().to_path_buf());
+            if !use_bubblewrap {
+                self.fs_readable.push(branch.upper_dir().to_path_buf());
+            }
             self.cow_upper = Some(branch.upper_dir().to_path_buf());
             Some(branch)
         } else {
@@ -2692,11 +2856,66 @@ impl Sandbox {
 
         let handler_syscalls: Vec<i64> = self.rt().handlers.iter().map(|(nr, _)| *nr).collect();
         let resolved_sandbox_name = self.rt().name.clone();
+        // Bubblewrap has already materialized the guest path view. Enabling the
+        // legacy chroot dispatcher as well would translate namespace paths a
+        // second time (and can route exec/open back to host lower paths).
+        let mut seccomp_sandbox = self.clone();
+        if use_bubblewrap {
+            seccomp_sandbox.chroot = None;
+            // The mount namespace is the authoritative path boundary. In
+            // particular, an explicitly bound pathname Unix socket must be
+            // connectable inside the guest. Keeping the Landlock-era
+            // supervisor gate active here would compare that guest path
+            // against an empty host/chroot grant list and reject every named
+            // socket with EACCES. Namespace lookup cannot escape through a
+            // symlink because targets outside the materialized view are
+            // absent, so the kernel can safely perform the final connect.
+            seccomp_sandbox.fs_readable.clear();
+            seccomp_sandbox.fs_writable.clear();
+            seccomp_sandbox.fs_mount.clear();
+            seccomp_sandbox.fs_mount_ro.clear();
+        }
         let resolved = crate::resolved::ResolvedSandbox::from_sandbox(
-            self,
+            &seccomp_sandbox,
             Some(resolved_sandbox_name.as_str()),
             &handler_syscalls,
         );
+
+        let extra_syscalls = handler_syscalls
+            .iter()
+            .map(|syscall| *syscall as u32)
+            .collect::<Vec<_>>();
+        // Clone and project these before fork. The Bubblewrap child may be
+        // forked from a multithreaded runtime and must reach exec without
+        // touching the allocator.
+        let extra_fds_copy = self.rt().extra_fds.clone();
+        let gather_keep_fds = extra_fds_copy
+            .iter()
+            .map(|(target, _)| *target)
+            .collect::<Vec<_>>();
+        let mut bubblewrap_launch = if use_bubblewrap {
+            let plan = crate::filesystem_backend::FilesystemPlan::from_sandbox(self)?;
+            let filter = crate::context::assemble_supervisor_filter(
+                &seccomp_sandbox,
+                Some(resolved_sandbox_name.as_str()),
+                &extra_syscalls,
+            )
+            .map_err(SandboxRuntimeError::Io)?;
+            Some(
+                crate::bubblewrap::PreparedBubblewrap::prepare(
+                    self,
+                    &plan,
+                    &filter,
+                    &pipes,
+                    cmd,
+                    &gather_keep_fds,
+                    stdio.all_inherit() || self.rt().pty_slave.is_some(),
+                )
+                .map_err(SandboxRuntimeError::Io)?,
+            )
+        } else {
+            None
+        };
 
         // Per-stream stdio wiring. Each Piped stream gets a CLOEXEC pipe whose
         // parent-side end we keep: the caller writes the child's stdin and reads
@@ -2769,7 +2988,6 @@ impl Sandbox {
                 }
             }
 
-            let extra_fds_copy = self.rt().extra_fds.clone();
             for &(target_fd, source_fd) in &extra_fds_copy {
                 unsafe { libc::dup2(source_fd, target_fd) };
             }
@@ -2816,8 +3034,9 @@ impl Sandbox {
                 wire_child_stdio(stdio.stderr, 2, safe_err, libc::O_WRONLY);
             }
 
-            let gather_keep_fds: Vec<i32> =
-                extra_fds_copy.iter().map(|&(target, _)| target).collect();
+            if let Some(launch) = bubblewrap_launch.take() {
+                launch.exec_child(self, &pipes, parent_pid, foreground, session_created);
+            }
 
             let extra_syscalls: Vec<u32> = self.rt().handlers.iter().map(|h| h.0 as u32).collect();
 
@@ -2855,6 +3074,7 @@ impl Sandbox {
         self.rt_mut()._stderr_read = stderr_p.map(|(r, _w)| r);
 
         self.rt_mut().child_pid = Some(pid);
+        self.rt_mut().process_group = Some(pid);
         self.rt_mut().tty_foreground_taken = tty_foreground_taken;
         self.rt_mut().exec_status_r = Some(pipes.exec_status_r);
         // State remains `Created` until `do_start` writes ready_w to release
@@ -2865,8 +3085,48 @@ impl Sandbox {
             Err(_) => None,
         };
 
-        let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
-            .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
+        let mut payload_pid = pid;
+        let mut supervised_pidfd = None;
+        let (notif_fd, _is_nested_mode) = if let Some(launch) = bubblewrap_launch.as_mut() {
+            launch.parent_after_fork();
+            let (listener, actual_payload_pid) = launch.receive_listener().map_err(|error| {
+                SandboxRuntimeError::Child(format!(
+                    "receive seccomp listener from Bubblewrap bootstrap: {error}"
+                ))
+            })?;
+            payload_pid = actual_payload_pid;
+            supervised_pidfd = syscall::pidfd_open(actual_payload_pid as u32, 0).ok();
+            (Some(listener), false)
+        } else {
+            let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd()).map_err(|error| {
+                SandboxRuntimeError::Child(format!("read notif fd from child: {error}"))
+            })?;
+            if notif_fd_num == 0 {
+                (None, true)
+            } else if let Some(ref pfd) = pidfd {
+                (
+                    Some(
+                        syscall::pidfd_getfd(pfd, notif_fd_num as i32, 0).map_err(|error| {
+                            SandboxRuntimeError::Child(format!("pidfd_getfd: {error}"))
+                        })?,
+                    ),
+                    false,
+                )
+            } else {
+                let path = format!("/proc/{pid}/fd/{notif_fd_num}");
+                let cpath = CString::new(path).unwrap();
+                let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+                if raw < 0 {
+                    return Err(SandboxRuntimeError::Child(
+                        "failed to open notif fd from /proc".into(),
+                    )
+                    .into());
+                }
+                (Some(unsafe { OwnedFd::from_raw_fd(raw) }), false)
+            }
+        };
+        self.rt_mut().payload_pid = Some(payload_pid);
+        self.rt_mut().process_group = Some(payload_pid);
 
         // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
         // can discover and list them.  The control socket is only created when
@@ -2915,28 +3175,6 @@ impl Sandbox {
             }
         }
 
-        let is_nested_mode = notif_fd_num == 0;
-
-        let notif_fd = if is_nested_mode {
-            None
-        } else if let Some(ref pfd) = pidfd {
-            Some(
-                syscall::pidfd_getfd(pfd, notif_fd_num as i32, 0)
-                    .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)))?,
-            )
-        } else {
-            let path = format!("/proc/{}/fd/{}", pid, notif_fd_num);
-            let cpath = CString::new(path).unwrap();
-            let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-            if raw < 0 {
-                return Err(SandboxRuntimeError::Child(
-                    "failed to open notif fd from /proc".into(),
-                )
-                .into());
-            }
-            Some(unsafe { OwnedFd::from_raw_fd(raw) })
-        };
-
         if let Some(notif_fd) = notif_fd {
             // Set up the per-sandbox runtime dir and control socket.  Must
             // happen before the notif supervisor is spawned so the socket
@@ -2954,7 +3192,7 @@ impl Sandbox {
             if self.control_socket {
                 match crate::control::setup_runtime_dir(
                     &sandbox_name,
-                    pid,
+                    payload_pid,
                     supervisor_pid,
                     self.mode.as_deref(),
                 ) {
@@ -2994,7 +3232,9 @@ impl Sandbox {
                 let time_offset = self
                     .time_start
                     .map(|t| crate::time::calculate_time_offset(t));
-                if let Err(e) = crate::vdso::patch(pid, time_offset, self.random_seed.is_some()) {
+                if let Err(e) =
+                    crate::vdso::patch(payload_pid, time_offset, self.random_seed.is_some())
+                {
                     eprintln!(
                         "sandlock: pre-exec vDSO patching failed (will retry after exec): {}",
                         e
@@ -3022,12 +3262,28 @@ impl Sandbox {
                 num_cpus: self.num_cpus,
                 port_remap: resolved.features.port_remap,
                 cow_enabled: resolved.features.cow,
-                chroot_root: chroot_root.clone(),
-                chroot_readable: self.fs_readable.clone(),
-                chroot_writable: self.fs_writable.clone(),
+                chroot_root: (!use_bubblewrap).then(|| chroot_root.clone()).flatten(),
+                chroot_readable: if use_bubblewrap {
+                    Vec::new()
+                } else {
+                    self.fs_readable.clone()
+                },
+                chroot_writable: if use_bubblewrap {
+                    Vec::new()
+                } else {
+                    self.fs_writable.clone()
+                },
                 chroot_denied: self.fs_denied.clone(),
-                chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
-                chroot_mount_ro: self.fs_mount_ro.clone(),
+                chroot_mounts: if use_bubblewrap {
+                    Vec::new()
+                } else {
+                    crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount)
+                },
+                chroot_mount_ro: if use_bubblewrap {
+                    Vec::new()
+                } else {
+                    self.fs_mount_ro.clone()
+                },
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
                 has_http_acl: resolved.features.http_acl,
@@ -3160,7 +3416,10 @@ impl Sandbox {
             let chroot_state = ChrootState::new();
 
             let notif_raw_fd = notif_fd.as_raw_fd();
-            let child_pidfd_raw = pidfd.as_ref().map(|pfd| pfd.as_raw_fd());
+            let child_pidfd_raw = supervised_pidfd
+                .as_ref()
+                .or(pidfd.as_ref())
+                .map(|pfd| pfd.as_raw_fd());
 
             let res_state = Arc::new(tokio::sync::Mutex::new(res_state));
             self.rt_mut().supervisor_resource = Some(Arc::clone(&res_state));
@@ -3256,13 +3515,14 @@ impl Sandbox {
 
         if let Some(cpu_pct) = self.max_cpu {
             if cpu_pct < 100 {
-                let child_pid = pid;
+                let child_pid = payload_pid;
                 self.rt_mut().throttle_handle =
                     Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
             }
         }
 
         self.rt_mut().pidfd = pidfd;
+        self.rt_mut().supervised_pidfd = supervised_pidfd;
         self.rt_mut().ready_w = Some(pipes.ready_w);
 
         Ok(())
@@ -3392,23 +3652,24 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
+                let process_group = rt.process_group.unwrap_or(pid);
                 // Attached executions prohibit changing process groups. Kill
                 // remaining descendants even when the top-level child was
                 // already reaped; the Attached marker remains non-actionable
                 // if teardown cannot prove the complete group is gone.
                 if rt.attached_execution {
-                    unsafe { libc::killpg(pid, libc::SIGKILL) };
+                    unsafe { libc::killpg(process_group, libc::SIGKILL) };
                 }
                 if matches!(
                     rt.state,
                     RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused
                 ) {
-                    unsafe { libc::killpg(pid, libc::SIGKILL) };
+                    unsafe { libc::killpg(process_group, libc::SIGKILL) };
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
                 }
                 if rt.tty_foreground_taken {
-                    sandbox_restore_tty_foreground(pid);
+                    sandbox_restore_tty_foreground(process_group);
                     rt.tty_foreground_taken = false;
                 }
             }

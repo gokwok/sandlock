@@ -46,6 +46,8 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSection {
+    #[serde(skip_serializing_if = "is_default")]
+    pub filesystem_backend: crate::filesystem_backend::FilesystemBackend,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_ca: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +60,8 @@ pub struct ConfigSection {
     pub fs_storage: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir_virtual: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -211,6 +215,7 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     let mut b = Sandbox::builder();
 
     // [config]
+    b = b.filesystem_backend(input.config.filesystem_backend);
     if let Some(p) = input.config.http_ca {
         b = b.http_ca(p);
     }
@@ -228,6 +233,9 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     }
     if let Some(p) = input.config.workdir {
         b = b.workdir(p);
+    }
+    if let Some(p) = input.config.workdir_virtual {
+        b = b.workdir_virtual(p);
     }
 
     // [determinism]
@@ -572,12 +580,14 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
 
     ProfileInput {
         config: ConfigSection {
+            filesystem_backend: s.filesystem_backend,
             http_ca: s.http_ca.clone(),
             http_key: s.http_key.clone(),
             http_inject_ca: s.http_inject_ca.clone(),
             http_ca_out: s.http_ca_out.clone(),
             fs_storage: s.fs_storage.clone(),
             workdir: s.workdir.clone(),
+            workdir_virtual: s.workdir_virtual.clone(),
         },
         determinism: DeterminismSection {
             random_seed: s.random_seed,

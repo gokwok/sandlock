@@ -84,3 +84,6 @@ mod test_popen;
 
 #[path = "integration/test_tty.rs"]
 mod test_tty;
+
+#[path = "integration/test_bubblewrap_backend.rs"]
+mod test_bubblewrap_backend;

@@ -659,8 +659,14 @@ pub(crate) enum CommitError {
 /// and tracks deletions in a subtree-aware whiteout set, mirrored to an
 /// append-only log beside the upper.
 pub struct SeccompCowBranch {
+    /// Host-visible immutable lower directory. All real lower-tree I/O uses
+    /// this path.
     workdir: PathBuf,
-    workdir_str: String,
+    /// Path prefix visible to the confined workload. This normally equals
+    /// `workdir`, but mount-namespace backends may expose the lower at a
+    /// different guest path (for example `/workspace`).
+    virtual_root: PathBuf,
+    virtual_root_str: String,
     upper: PathBuf,
     storage_dir: PathBuf,
     deleted: crate::cow::deletions::DeletionSet,
@@ -814,7 +820,8 @@ impl SeccompCowBranch {
             crate::cow::deletions::DeletionSet::create(Some(&branch_dir.join("deleted.log")));
 
         Ok(Self {
-            workdir_str: workdir.to_string_lossy().into_owned(),
+            virtual_root_str: workdir.to_string_lossy().into_owned(),
+            virtual_root: workdir.clone(),
             workdir,
             upper,
             storage_dir: branch_dir,
@@ -1074,7 +1081,8 @@ impl SeccompCowBranch {
         let _ = sync_dir(&recorded.branch_dir);
 
         Ok(Self {
-            workdir_str: workdir.to_string_lossy().into_owned(),
+            virtual_root_str: workdir.to_string_lossy().into_owned(),
+            virtual_root: workdir.clone(),
             workdir,
             upper: recorded.upper,
             storage_dir: recorded.branch_dir,
@@ -1123,6 +1131,27 @@ impl SeccompCowBranch {
     /// The original workdir (lower layer).
     pub fn workdir(&self) -> &Path {
         &self.workdir
+    }
+
+    /// Change the path prefix used when matching workload-visible paths.
+    ///
+    /// The lower directory remains [`Self::workdir`]; only seccomp path
+    /// classification changes. The path is lexical because it exists in the
+    /// child's mount namespace and may intentionally not exist on the host.
+    pub(crate) fn set_virtual_root(&mut self, path: &Path) -> Result<(), BranchError> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(BranchError::Operation(format!(
+                "COW virtual root must be an absolute path without '..': {}",
+                path.display()
+            )));
+        }
+        self.virtual_root = path.to_path_buf();
+        self.virtual_root_str = path.to_string_lossy().into_owned();
+        Ok(())
     }
 
     /// Private storage directory for this branch.
@@ -1472,7 +1501,7 @@ impl SeccompCowBranch {
             });
             for entry in removals {
                 let before = entry.before.as_ref().expect("removal has a base entry");
-                let path = self.workdir.join(&entry.change.path);
+                let path = self.virtual_root.join(&entry.change.path);
                 let path = path.to_str().ok_or_else(|| {
                     BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
                         entry.change.path.display().to_string(),
@@ -1512,7 +1541,7 @@ impl SeccompCowBranch {
             directories.sort_by_key(|entry| entry.change.path.components().count());
             for entry in directories {
                 let after = entry.after.as_ref().expect("directory has a target entry");
-                let path = self.workdir.join(&entry.change.path);
+                let path = self.virtual_root.join(&entry.change.path);
                 let path = path.to_str().ok_or_else(|| {
                     BranchError::Snapshot(crate::error::SnapshotError::InvalidPath(
                         entry.change.path.display().to_string(),
@@ -1658,9 +1687,12 @@ impl SeccompCowBranch {
         Ok(())
     }
 
-    /// The workdir as a string (for fast prefix matching).
+    /// The workload-visible COW root as a string (for fast prefix matching).
+    ///
+    /// Kept under the historical name because seccomp handlers use this
+    /// accessor as their logical path prefix.
     pub fn workdir_str(&self) -> &str {
-        &self.workdir_str
+        &self.virtual_root_str
     }
 
     /// Whether any writes or deletions have occurred.
@@ -1668,10 +1700,10 @@ impl SeccompCowBranch {
         self.has_changes
     }
 
-    /// Check if a path is under the workdir (but not inside the COW storage).
+    /// Check if a path is under the workload-visible COW root.
     pub fn matches(&self, path: &str) -> bool {
         let p = std::path::Path::new(path);
-        p.starts_with(&self.workdir_str) && !p.starts_with(&self.storage_dir)
+        p.starts_with(&self.virtual_root) && !p.starts_with(&self.storage_dir)
     }
 
     /// Check if a path has been modified or deleted in the COW layer.
@@ -1692,9 +1724,10 @@ impl SeccompCowBranch {
         }
     }
 
-    /// Compute relative path from workdir. Returns None if path escapes.
+    /// Compute a lower-relative path from the workload-visible COW root.
+    /// Returns None if the path escapes.
     pub fn safe_rel(&self, path: &str) -> Option<String> {
-        let rel = pathdiff::diff_paths(path, &self.workdir)?;
+        let rel = pathdiff::diff_paths(path, &self.virtual_root)?;
         let rel_str = rel.to_string_lossy().into_owned();
         if rel_str == ".." || rel_str.starts_with("../") {
             return None;
@@ -3274,7 +3307,8 @@ impl SeccompCowBranch {
                 eprintln!(
                     "sandlock: commit deferred: workdir lock on {} contended for {:?}; \
                      upper preserved for recovery",
-                    self.workdir_str, waited
+                    self.workdir.display(),
+                    waited
                 );
                 if matches!(
                     self.state,
@@ -3291,7 +3325,8 @@ impl SeccompCowBranch {
                 eprintln!(
                     "sandlock: commit deferred: workdir lock on {} could not be taken ({}); \
                      upper preserved for recovery",
-                    self.workdir_str, e
+                    self.workdir.display(),
+                    e
                 );
                 if matches!(
                     self.state,
@@ -4026,6 +4061,39 @@ impl Drop for SeccompCowBranch {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn snapshot_delta_apply_uses_the_workload_visible_virtual_root() {
+        let source = tempfile::tempdir().unwrap();
+        let base_storage = tempfile::tempdir().unwrap();
+        let target_storage = tempfile::tempdir().unwrap();
+        let branch_storage = tempfile::tempdir().unwrap();
+        let mut base =
+            crate::snapshot::FsSnapshot::capture(source.path(), base_storage.path()).unwrap();
+        fs::write(source.path().join("selected.txt"), b"selected").unwrap();
+        let mut target =
+            crate::snapshot::FsSnapshot::capture(source.path(), target_storage.path()).unwrap();
+        let limits = crate::snapshot::SnapshotDeltaLimits::default();
+        let policy = crate::snapshot::SnapshotDeltaPolicy {
+            allow_symlinks: false,
+            protected_paths: Vec::new(),
+        };
+        let forward = base.delta_to(&target, limits.clone(), &policy).unwrap();
+        let reverse = target.delta_to(&base, limits, &policy).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(base.root_dir(), Some(branch_storage.path()), 0).unwrap();
+        branch.set_virtual_root(Path::new("/workspace")).unwrap();
+
+        branch.apply_snapshot_delta(&forward).unwrap();
+        assert!(branch.upper_dir().join("selected.txt").is_file());
+        branch.apply_snapshot_delta(&reverse).unwrap();
+        assert!(!branch.upper_dir().join("selected.txt").exists());
+        assert!(branch.changes().unwrap().is_empty());
+
+        branch.abort().unwrap();
+        target.destroy().unwrap();
+        base.destroy().unwrap();
+    }
 
     #[test]
     fn drop_cleans_undisposed_branch_but_keep_preserves() {

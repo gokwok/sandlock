@@ -1,5 +1,8 @@
 pub(crate) mod arch;
+#[doc(hidden)]
+pub mod bootstrap;
 pub mod branch;
+pub(crate) mod bubblewrap;
 pub(crate) mod ca_inject;
 pub(crate) mod checkpoint;
 pub(crate) mod chroot;
@@ -9,6 +12,7 @@ pub(crate) mod cow;
 pub(crate) mod credential;
 pub mod dry_run;
 pub mod error;
+pub mod filesystem_backend;
 pub mod fork;
 pub(crate) mod freeze;
 pub mod http;
@@ -40,6 +44,10 @@ pub(crate) mod vdso;
 pub use branch::{BranchInspection, BranchState, FsBranch, PendingBranch, PendingRunResult};
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use error::{BranchError, SandboxRuntimeError, SandlockError, SnapshotError};
+pub use filesystem_backend::{
+    FilesystemBackend, FilesystemBackendReport, ProtectionProvider, ProtectionReport,
+    ResolvedFilesystemBackend,
+};
 pub use pipeline::{Gather, Pipeline, Stage};
 pub use protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 pub use result::{ExitStatus, RunResult};

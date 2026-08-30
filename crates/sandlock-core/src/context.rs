@@ -254,6 +254,27 @@ pub fn arg_filters(policy: &Sandbox) -> Vec<crate::sys::structs::SockFilter> {
     crate::seccomp_plan::arg_filters(policy)
 }
 
+/// Assemble the full supervisor-backed seccomp program without installing it.
+///
+/// Landlock installs this directly in the forked child. Mount-namespace
+/// launchers serialize the same program to the trusted in-namespace bootstrap,
+/// keeping syscall policy identical across filesystem backends.
+pub(crate) fn assemble_supervisor_filter(
+    sandbox: &Sandbox,
+    sandbox_name: Option<&str>,
+    extra_syscalls: &[u32],
+) -> io::Result<Vec<crate::sys::structs::SockFilter>> {
+    let handler_syscalls: Vec<i64> = extra_syscalls.iter().map(|&nr| nr as i64).collect();
+    let resolved = ResolvedSandbox::from_sandbox(sandbox, sandbox_name, &handler_syscalls);
+    let args = arg_filters_resolved(&resolved);
+    let deny = blocklist_syscall_numbers(sandbox);
+    let mut notif = notif_syscalls_resolved(&resolved);
+    notif.extend_from_slice(extra_syscalls);
+    notif.sort_unstable();
+    notif.dedup();
+    bpf::assemble_filter(&notif, &deny, &args)
+}
+
 // ============================================================
 // Close fds above threshold
 // ============================================================
@@ -610,13 +631,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // them and the handler silently never fires.  We merge `extra_syscalls`
         // into the notif list and dedup so each syscall produces exactly one
         // JEQ in the assembled program.
-        let mut notif = notif_syscalls_resolved(&resolved);
-        if !extra_syscalls.is_empty() {
-            notif.extend_from_slice(extra_syscalls);
-        }
-        notif.sort_unstable();
-        notif.dedup();
-        let filter = match bpf::assemble_filter(&notif, &deny, &args) {
+        let _ = (deny, args, resolved);
+        let filter = match assemble_supervisor_filter(sandbox, sandbox_name, extra_syscalls) {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
         };

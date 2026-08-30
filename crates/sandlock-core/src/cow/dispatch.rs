@@ -1182,6 +1182,20 @@ pub(crate) async fn handle_cow_write(
         };
 
         op.remap_upper_paths(cow);
+        // Paths outside the configured branch belong to the surrounding
+        // filesystem provider. In particular, Bubblewrap may expose explicit
+        // writable mounts (for example an application config directory)
+        // alongside the COW workdir. Resolving those paths through the COW
+        // merged view would reject them at `safe_rel` before the kernel can
+        // service the syscall normally.
+        //
+        // Remap upper-layer paths first so a tracee path reached through an
+        // injected upper fd is still recognized as part of the branch. Keep
+        // mixed inside/outside multi-path operations in the COW handler so
+        // rename/link cannot cross the isolation boundary unnoticed.
+        if !op.paths().into_iter().any(|path| cow.matches(path)) {
+            return NotifAction::Continue;
+        }
         if let Err(errno) = op.resolve_merged_paths(cow) {
             return NotifAction::Errno(errno);
         }

@@ -22,6 +22,18 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
     pub fs_denied: Vec<PathBuf>,
 
+    /// Static filesystem boundary provider. The CLI exposes its own parsed
+    /// value; keeping this out of clap here avoids leaking runtime path knobs
+    /// into every flattened builder surface.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub filesystem_backend: crate::filesystem_backend::FilesystemBackend,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub bubblewrap_path: Option<PathBuf>,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub bubblewrap_bootstrap_path: Option<PathBuf>,
+
     /// Extra syscall or syscall-group name to deny, in addition to Sandlock's
     /// default blocklist (groups: sysv_ipc). Repeatable.
     #[cfg_attr(
@@ -151,6 +163,9 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "workdir"))]
     pub workdir: Option<PathBuf>,
 
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub workdir_virtual: Option<PathBuf>,
+
     #[cfg_attr(feature = "cli", arg(long = "cwd"))]
     pub cwd: Option<PathBuf>,
 
@@ -266,6 +281,9 @@ impl Default for SandboxBuilder {
             fs_readable: Vec::new(),
             fs_writable: Vec::new(),
             fs_denied: Vec::new(),
+            filesystem_backend: crate::filesystem_backend::FilesystemBackend::Landlock,
+            bubblewrap_path: None,
+            bubblewrap_bootstrap_path: None,
             extra_deny_syscalls: Vec::new(),
             extra_allow_syscalls: Vec::new(),
             net_allow: Vec::new(),
@@ -292,6 +310,7 @@ impl Default for SandboxBuilder {
             no_coredump: false,
             deterministic_dirs: false,
             workdir: None,
+            workdir_virtual: None,
             cwd: None,
             fs_storage: None,
             max_disk: None,
@@ -329,6 +348,9 @@ impl Clone for SandboxBuilder {
             fs_readable: self.fs_readable.clone(),
             fs_writable: self.fs_writable.clone(),
             fs_denied: self.fs_denied.clone(),
+            filesystem_backend: self.filesystem_backend,
+            bubblewrap_path: self.bubblewrap_path.clone(),
+            bubblewrap_bootstrap_path: self.bubblewrap_bootstrap_path.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             net_allow: self.net_allow.clone(),
@@ -355,6 +377,7 @@ impl Clone for SandboxBuilder {
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
             workdir: self.workdir.clone(),
+            workdir_virtual: self.workdir_virtual.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
@@ -649,8 +672,36 @@ impl SandboxBuilder {
         self
     }
 
+    /// Select the kernel provider for Sandlock's static filesystem boundary.
+    pub fn filesystem_backend(
+        mut self,
+        backend: crate::filesystem_backend::FilesystemBackend,
+    ) -> Self {
+        self.filesystem_backend = backend;
+        self
+    }
+
+    /// Override the trusted Bubblewrap executable path.
+    pub fn bubblewrap_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.bubblewrap_path = Some(path.into());
+        self
+    }
+
+    /// Override the trusted `sandlock-bootstrap` executable path.
+    pub fn bubblewrap_bootstrap_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.bubblewrap_bootstrap_path = Some(path.into());
+        self
+    }
+
     pub fn workdir(mut self, path: impl Into<PathBuf>) -> Self {
         self.workdir = Some(path.into());
+        self
+    }
+
+    /// Set the guest-visible path corresponding to the host-side COW lower.
+    /// When omitted it defaults to the `workdir` path.
+    pub fn workdir_virtual(mut self, path: impl Into<PathBuf>) -> Self {
+        self.workdir_virtual = Some(path.into());
         self
     }
 
@@ -1025,6 +1076,9 @@ impl SandboxBuilder {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
             fs_denied: self.fs_denied,
+            filesystem_backend: self.filesystem_backend,
+            bubblewrap_path: self.bubblewrap_path,
+            bubblewrap_bootstrap_path: self.bubblewrap_bootstrap_path,
             extra_deny_syscalls: self.extra_deny_syscalls,
             extra_allow_syscalls: self.extra_allow_syscalls,
             protection_policy: self.protection_policy,
@@ -1052,6 +1106,7 @@ impl SandboxBuilder {
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
             workdir: self.workdir,
+            workdir_virtual: self.workdir_virtual,
             cwd: self.cwd,
             fs_storage: self.fs_storage,
             max_disk: self.max_disk,

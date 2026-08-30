@@ -141,6 +141,9 @@ pub enum ConfinementError {
     #[error("landlock unavailable: {0}")]
     LandlockUnavailable(String),
 
+    #[error("filesystem backend unavailable: {0}")]
+    FilesystemBackendUnavailable(String),
+
     /// A `Protection` in `ProtectionState::Strict` is unavailable
     /// because the host kernel's Landlock ABI is below the
     /// protection's `min_abi()`. Build (or `confine`) refuses to

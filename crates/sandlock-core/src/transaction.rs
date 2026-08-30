@@ -539,12 +539,20 @@ async fn run_txn(
     let storage = base.fs_storage.clone();
     let max_disk = base.max_disk.map(|b| b.0).unwrap_or(0);
 
-    let branch =
+    let mut branch =
         crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
             .map_err(|source| TxnError::Branch {
                 workdir: workdir.clone(),
                 source,
             })?;
+    if let Some(virtual_root) = base.workdir_virtual.as_deref() {
+        branch
+            .set_virtual_root(virtual_root)
+            .map_err(|source| TxnError::Branch {
+                workdir: workdir.clone(),
+                source,
+            })?;
+    }
     let upper_dir = branch.upper_dir().to_path_buf();
     let shared = crate::sandbox::SharedCow::new(branch);
     let state = std::sync::Arc::clone(&shared.state);
