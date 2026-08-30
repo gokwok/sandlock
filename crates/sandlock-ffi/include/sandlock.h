@@ -133,6 +133,23 @@ typedef uint32_t sandlock_exception;
 #endif // __cplusplus
 
 /**
+ * Static filesystem isolation provider used by
+ * `sandlock_sandbox_builder_filesystem_backend`.
+ */
+enum sandlock_filesystem_backend_t
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  SANDLOCK_FILESYSTEM_BACKEND_T_LANDLOCK = 0,
+  SANDLOCK_FILESYSTEM_BACKEND_T_BUBBLEWRAP = 1,
+  SANDLOCK_FILESYSTEM_BACKEND_T_AUTO = 2,
+};
+#ifndef __cplusplus
+typedef uint32_t sandlock_filesystem_backend_t;
+#endif // __cplusplus
+
+/**
  * Opaque handle wrapping a [`Checkpoint`].
  */
 typedef struct sandlock_checkpoint_t sandlock_checkpoint_t;
@@ -336,6 +353,12 @@ sandlock_builder_t *sandlock_sandbox_builder_fs_deny(sandlock_builder_t *b, cons
 sandlock_builder_t *sandlock_sandbox_builder_fs_storage(sandlock_builder_t *b, const char *path);
 
 /**
+ * Select the static filesystem backend (0=Landlock, 1=Bubblewrap, 2=Auto).
+ */
+sandlock_builder_t *sandlock_sandbox_builder_filesystem_backend(sandlock_builder_t *b,
+                                                                unsigned int backend);
+
+/**
  * # Safety
  * `b` must be a valid pointer. `devices` must point to `len` u32 values (or be null when len == 0).
  */
@@ -348,6 +371,27 @@ sandlock_builder_t *sandlock_sandbox_builder_gpu_devices(sandlock_builder_t *b,
  * `b` and `path` must be valid pointers.
  */
 sandlock_builder_t *sandlock_sandbox_builder_workdir(sandlock_builder_t *b, const char *path);
+
+/**
+ * # Safety
+ * `b` and `path` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_workdir_virtual(sandlock_builder_t *b,
+                                                             const char *path);
+
+/**
+ * # Safety
+ * `b` and `path` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_bubblewrap_path(sandlock_builder_t *b,
+                                                             const char *path);
+
+/**
+ * # Safety
+ * `b` and `path` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_bubblewrap_bootstrap_path(sandlock_builder_t *b,
+                                                                       const char *path);
 
 /**
  * # Safety

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use sandlock_core::pipeline::Stage;
 use sandlock_core::sandbox::{BranchAction, ByteSize, SandboxBuilder};
-use sandlock_core::{ExitStatus, Protection, RunResult, Sandbox, StdioMode};
+use sandlock_core::{ExitStatus, FilesystemBackend, Protection, RunResult, Sandbox, StdioMode};
 
 pub mod handler;
 pub mod notif_repr;
@@ -56,6 +56,16 @@ pub struct sandlock_result_t {
 #[allow(non_camel_case_types)]
 pub struct sandlock_pipeline_t {
     stages: Vec<(Sandbox, Vec<String>)>,
+}
+
+/// Static filesystem isolation provider used by
+/// `sandlock_sandbox_builder_filesystem_backend`.
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum sandlock_filesystem_backend_t {
+    Landlock = 0,
+    Bubblewrap = 1,
+    Auto = 2,
 }
 
 // ----------------------------------------------------------------
@@ -127,6 +137,25 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
     Box::into_raw(Box::new(builder.fs_storage(path)))
 }
 
+/// Select the static filesystem backend (0=Landlock, 1=Bubblewrap, 2=Auto).
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_filesystem_backend(
+    b: *mut SandboxBuilder,
+    backend: c_uint,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let backend = match backend {
+        0 => FilesystemBackend::Landlock,
+        1 => FilesystemBackend::Bubblewrap,
+        2 => FilesystemBackend::Auto,
+        _ => return b,
+    };
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.filesystem_backend(backend)))
+}
+
 /// # Safety
 /// `b` must be a valid pointer. `devices` must point to `len` u32 values (or be null when len == 0).
 #[no_mangle]
@@ -160,6 +189,51 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_workdir(
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.workdir(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_workdir_virtual(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() {
+        return b;
+    }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.workdir_virtual(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_bubblewrap_path(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() {
+        return b;
+    }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.bubblewrap_path(path)))
+}
+
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_bubblewrap_bootstrap_path(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() {
+        return b;
+    }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.bubblewrap_bootstrap_path(path)))
 }
 
 /// # Safety
