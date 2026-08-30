@@ -1581,7 +1581,14 @@ fn copy_regular_file_inner(
 #[cfg(target_os = "linux")]
 fn reflink_file(source: &fs::File, destination: &fs::File) -> Result<bool, SnapshotError> {
     const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
-    let result = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE_IOCTL, source.as_raw_fd()) };
+    // This request fits both GNU's unsigned-long and musl's signed-int ABI.
+    let result = unsafe {
+        libc::ioctl(
+            destination.as_raw_fd(),
+            FICLONE_IOCTL as _,
+            source.as_raw_fd(),
+        )
+    };
     if result == 0 {
         return Ok(true);
     }

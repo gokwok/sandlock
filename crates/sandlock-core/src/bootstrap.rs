@@ -175,7 +175,8 @@ extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    // One fd's ancillary data fits both the GNU size_t and musl socklen_t fields.
+    message.msg_controllen = control.len() as _;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&message);
         if cmsg.is_null() {
@@ -183,7 +184,7 @@ extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as _;
         std::ptr::write(libc::CMSG_DATA(cmsg).cast::<RawFd>(), listener_fd);
         message.msg_controllen = (*cmsg).cmsg_len;
         if libc::sendmsg(args.control_fd, &message, 0) < 0 {

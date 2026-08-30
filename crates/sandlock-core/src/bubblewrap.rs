@@ -435,7 +435,8 @@ impl PreparedBubblewrap {
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control.len();
+        // One fd's ancillary data fits both the GNU size_t and musl socklen_t fields.
+        message.msg_controllen = control.len() as _;
         let received =
             unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
         if received < 0 {
