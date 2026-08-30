@@ -22,6 +22,19 @@ of live COW layers. `FsBranch::checkpoint` materializes the merged view into a
 new snapshot through private staging and an atomic rename. It does not modify
 the lower, clear the upper, or resolve the branch.
 
+Materialization prefers per-file reflink clones. A reflinked snapshot still has
+a complete directory tree and distinct file inodes, while unchanged file data
+extents remain shared until either clone is modified. Filesystems that reject
+`FICLONE` and cross-filesystem copies fall back to the same buffered file-copy
+semantics.
+
+Every published snapshot also contains a private file/Merkle index. Regular
+files are keyed by a BLAKE3 content hash, symlinks by their raw target bytes,
+and directories by a deterministic hash of their logical mode and immediate
+children. Paths are stored as raw Unix bytes, so the index does not narrow the
+snapshot API's non-UTF-8 behavior. The index is backend state and is never
+mounted into an Action.
+
 `FsBranch::commit` is deliberately denied for a snapshot-backed branch because
 its lower is immutable. Explicit publication into another destination is a
 separate concern and is not part of this API.
@@ -106,11 +119,12 @@ Writers outside the managed process group are not stopped by Sandlock.
 
 Capture and checkpoint use this success boundary:
 
-1. copy the complete lower into a private staging directory;
+1. reflink-clone or copy the complete lower into a private staging directory;
 2. for a branch, apply whiteouts and then the upper to staging;
-3. fsync regular files, directories, lease metadata, and snapshot metadata;
-4. atomically rename staging to its final snapshot directory;
-5. fsync the storage directory before returning the descriptor.
+3. build or incrementally update the file/Merkle index;
+4. fsync regular files, the index, directories, lease metadata, and snapshot metadata;
+5. atomically rename staging to its final snapshot directory;
+6. fsync the storage directory before returning the descriptor.
 
 An unpublished staging directory is removed after an ordinary failure and is
 never accepted by `FsSnapshot::reopen`. Sandlock compares source metadata before
@@ -143,8 +157,8 @@ All input paths are snapshot-relative. Absolute paths and `..` components are
 rejected, final symlinks are not followed by `stat` or `read_range`, and a
 symlinked parent cannot escape the snapshot root.
 
-Inspection applies hard entry, path-byte, and diff-content budgets in addition
-to caller result limits. Exceeding a budget returns
+Inspection applies hard entry and path-byte budgets, and comparisons against a
+live directory retain an explicit content-read budget. Exceeding a budget returns
 `SnapshotError::LimitExceeded`; it never silently returns a partial tree.
 Materialization stages under mode `0700`, creates regular files as `0600`, then
 applies captured modes. If the destination rename succeeds but parent-directory
@@ -153,11 +167,24 @@ instead of presenting the operation as side-effect free.
 Likewise, snapshot deletion returns `SnapshotError::Destroyed` if the tree was
 removed but the parent-directory durability barrier could not be confirmed.
 
+Snapshot-to-snapshot diff first compares the root Merkle hashes. Equal trees
+return without walking either materialized directory. Unequal trees compare
+the bounded persistent file index, so regular-file content is not reread merely
+to discover changed paths. Comparisons against a live directory still read the
+declared live paths because no immutable index exists for that side.
+
 ## Typed derivation
 
 `FsSnapshot::derive` applies an ordered, bounded `SnapshotMutation` batch to a
 private copy of the immutable base and publishes a new snapshot through the
 same durability boundary as capture/checkpoint. The base never changes.
+
+Derivation and snapshot-backed branch checkpoints reuse the base index. They
+hash only replacement files and new upper-layer files, then recompute directory
+Merkle nodes. Hashing is deliberately outside the live branch syscall path:
+commands that create large trees, such as `npm install`, continue to write only
+to the existing upper/whiteout representation. Their new files are indexed when
+the controller requests a checkpoint.
 
 Supported mutations are regular-file put/remove and directory make/remove.
 Regular-file payloads are trusted controller files opened without following

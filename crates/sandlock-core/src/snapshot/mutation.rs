@@ -2,7 +2,7 @@
 
 use super::{
     capture_with_overlay, contained_final_path, copy_regular_file, normalize_relative, operation,
-    FsSnapshot,
+    FsSnapshot, SnapshotIndexUpdate,
 };
 use crate::error::SnapshotError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,12 +72,22 @@ impl FsSnapshot {
     ) -> Result<FsSnapshot, SnapshotError> {
         self.ensure_live()?;
         let prepared = prepare_mutations(mutations, limits)?;
+        let changed_paths = prepared
+            .iter()
+            .map(PreparedMutation::path)
+            .cloned()
+            .collect();
         let base_modes = self.directory_modes()?;
+        let base_index = self.index()?;
         capture_with_overlay(
             &self.tree_dir,
             storage.as_ref(),
             Some(&base_modes),
-            move |tree, directory_modes| apply_mutations(tree, directory_modes, &prepared),
+            Some(&base_index),
+            move |tree, directory_modes| {
+                apply_mutations(tree, directory_modes, &prepared)?;
+                Ok(SnapshotIndexUpdate::RefreshPaths(changed_paths))
+            },
         )
     }
 }
@@ -99,6 +109,17 @@ enum PreparedMutation {
     RemoveDirectory {
         path: PathBuf,
     },
+}
+
+impl PreparedMutation {
+    fn path(&self) -> &PathBuf {
+        match self {
+            Self::PutFile { path, .. }
+            | Self::RemoveFile { path }
+            | Self::MakeDirectory { path, .. }
+            | Self::RemoveDirectory { path } => path,
+        }
+    }
 }
 
 fn prepare_mutations(

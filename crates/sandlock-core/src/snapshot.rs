@@ -1,10 +1,10 @@
 //! Durable immutable filesystem snapshots used as stable COW branch lowers.
 //!
 //! A snapshot is a complete materialized tree published through a staging
-//! directory and an atomic rename. Sandlock deliberately keeps this first
-//! implementation simple: callers get immutable snapshot semantics without a
-//! content-addressed store, multi-layer live COW, or application-specific
-//! revision metadata.
+//! directory and an atomic rename. Regular files use reflink cloning when the
+//! backing filesystem supports it and fall back to buffered copies otherwise.
+//! A persistent file hash and directory Merkle index accelerates immutable
+//! comparisons without adding a content-addressed store or live COW layer.
 
 use crate::error::SnapshotError;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,12 @@ use std::path::{Component, Path, PathBuf};
 mod compare;
 #[path = "snapshot/delta.rs"]
 mod delta;
+#[path = "snapshot/index.rs"]
+mod index;
 #[path = "snapshot/mutation.rs"]
 mod mutation;
+
+use index::{SnapshotIndex, SnapshotIndexEntry};
 
 pub use compare::{
     SnapshotCompareLimits, SnapshotCompareScope, SnapshotComparison, SnapshotRequirement,
@@ -32,9 +36,9 @@ pub use delta::{
 };
 pub use mutation::{SnapshotMutation, SnapshotMutationLimits};
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const SNAPSHOT_METADATA: &str = "SNAPSHOT.json";
 const SNAPSHOT_DIRECTORY_MODES: &str = "DIRECTORY_MODES.json";
+const SNAPSHOT_INDEX: &str = "INDEX.bin";
 const SNAPSHOT_TREE: &str = "tree";
 const SNAPSHOT_LEASES: &str = "leases";
 const SNAPSHOT_LEASE_LOCK: &str = "leases.lock";
@@ -74,8 +78,8 @@ impl FsSnapshotDescriptor {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SnapshotMetadata {
-    schema_version: u32,
     id: String,
+    root_hash: [u8; 32],
 }
 
 /// Type of one entry in a snapshot tree.
@@ -136,8 +140,19 @@ pub struct SnapshotDiff {
 pub struct FsSnapshot {
     descriptor: FsSnapshotDescriptor,
     tree_dir: PathBuf,
+    root_hash: [u8; 32],
     handle_lease: Option<SnapshotHandleLease>,
     destroyed: bool,
+}
+
+enum SnapshotIndexUpdate {
+    None,
+    RefreshPaths(Vec<PathBuf>),
+    Branch {
+        upper: PathBuf,
+        deleted: Vec<PathBuf>,
+        changed_directories: BTreeSet<PathBuf>,
+    },
 }
 
 impl std::fmt::Debug for FsSnapshot {
@@ -199,11 +214,12 @@ impl FsSnapshot {
                 ));
             }
             let metadata = read_metadata(&entry.path())?;
-            if metadata.schema_version != SNAPSHOT_SCHEMA_VERSION || metadata.id != id {
+            if metadata.id != id {
                 return Err(SnapshotError::InvalidDescriptor(
                     "snapshot storage entry does not match its metadata".to_string(),
                 ));
             }
+            let _ = read_index(&entry.path(), metadata.root_hash)?;
             descriptors.push(FsSnapshotDescriptor {
                 snapshot_dir: entry.path(),
                 id: id.to_string(),
@@ -222,7 +238,9 @@ impl FsSnapshot {
         source: impl AsRef<Path>,
         storage: impl AsRef<Path>,
     ) -> Result<Self, SnapshotError> {
-        capture_with_overlay(source.as_ref(), storage.as_ref(), None, |_, _| Ok(()))
+        capture_with_overlay(source.as_ref(), storage.as_ref(), None, None, |_, _| {
+            Ok(SnapshotIndexUpdate::None)
+        })
     }
 
     /// Reopen a snapshot that was previously published successfully.
@@ -254,21 +272,17 @@ impl FsSnapshot {
         )?;
 
         let metadata = read_metadata(&canonical)?;
-        if metadata.schema_version != SNAPSHOT_SCHEMA_VERSION {
-            return Err(SnapshotError::InvalidDescriptor(format!(
-                "unsupported snapshot schema {}",
-                metadata.schema_version
-            )));
-        }
         if metadata.id != descriptor.id {
             return Err(SnapshotError::InvalidDescriptor(
                 "snapshot id does not match its descriptor".to_string(),
             ));
         }
+        let _ = read_index(&canonical, metadata.root_hash)?;
         let handle_lease = acquire_handle_lease(&descriptor)?;
         Ok(Self {
             descriptor,
             tree_dir,
+            root_hash: metadata.root_hash,
             handle_lease: Some(handle_lease),
             destroyed: false,
         })
@@ -290,6 +304,10 @@ impl FsSnapshot {
     /// read-only workdir/lower through Sandlock's policy and COW APIs.
     pub fn root_dir(&self) -> &Path {
         &self.tree_dir
+    }
+
+    fn index(&self) -> Result<SnapshotIndex, SnapshotError> {
+        read_index(&self.descriptor.snapshot_dir, self.root_hash)
     }
 
     pub(crate) fn directory_modes(&self) -> Result<BTreeMap<PathBuf, u32>, SnapshotError> {
@@ -419,60 +437,54 @@ impl FsSnapshot {
         let cursor = after
             .map(|path| normalize_relative(path.as_ref()))
             .transpose()?;
-        let before_modes = self.directory_modes()?;
-        let before = inventory_bounded_with_modes(
-            &self.tree_dir,
-            DEFAULT_SCAN_ENTRY_BUDGET,
-            DEFAULT_SCAN_PATH_BYTE_BUDGET,
-            Some(&before_modes),
-        )?;
+        if self.root_hash == target.root_hash {
+            return Ok(SnapshotDiff {
+                changes: Vec::new(),
+                changed_paths: 0,
+                truncated: false,
+                next_path: None,
+            });
+        }
+        let before = self.index()?;
+        let after = target.index()?;
         let remaining = DEFAULT_SCAN_ENTRY_BUDGET
-            .checked_sub(before.len())
+            .checked_sub(before.entries.len())
             .ok_or_else(|| {
                 SnapshotError::LimitExceeded("snapshot diff entry budget was exceeded".to_string())
             })?;
-        let after_modes = target.directory_modes()?;
-        let after = inventory_bounded_with_modes(
-            &target.tree_dir,
-            remaining,
-            DEFAULT_SCAN_PATH_BYTE_BUDGET,
-            Some(&after_modes),
-        )?;
+        if after.entries.len() > remaining {
+            return Err(SnapshotError::LimitExceeded(
+                "snapshot diff entry budget was exceeded".to_string(),
+            ));
+        }
         let paths = before
+            .entries
             .keys()
-            .chain(after.keys())
+            .chain(after.entries.keys())
             .filter(|path| !path.as_os_str().is_empty())
             .cloned()
             .collect::<BTreeSet<_>>();
         let mut changes = Vec::new();
         let mut changed_paths = 0;
         let mut remaining_changed_paths = 0;
-        let mut content_budget = DEFAULT_DIFF_CONTENT_BYTE_BUDGET;
         for path in paths {
-            let kind = match (before.get(&path), after.get(&path)) {
+            let kind = match (before.entries.get(&path), after.entries.get(&path)) {
                 (None, Some(_)) => Some(SnapshotChangeKind::Added),
                 (Some(_), None) => Some(SnapshotChangeKind::Deleted),
-                (Some(left), Some(right)) => compare_entry(
-                    &self.tree_dir,
-                    &target.tree_dir,
-                    &path,
-                    left,
-                    right,
-                    &mut content_budget,
-                )?,
+                (Some(left), Some(right)) => indexed_change_kind(left, right),
                 (None, None) => None,
             };
             if let Some(kind) = kind {
                 changed_paths += 1;
                 if cursor
                     .as_ref()
-                    .map_or(true, |cursor| path.as_path() > cursor.as_path())
+                    .is_none_or(|cursor| path.as_path() > cursor.as_path())
                 {
                     remaining_changed_paths += 1;
                 }
                 if cursor
                     .as_ref()
-                    .map_or(true, |cursor| path.as_path() > cursor.as_path())
+                    .is_none_or(|cursor| path.as_path() > cursor.as_path())
                     && changes.len() < max_changes
                 {
                     changes.push(SnapshotChange { path, kind });
@@ -742,6 +754,13 @@ impl FsSnapshot {
                 message: format!("remove snapshot metadata: {error}"),
             });
         }
+        if let Err(error) = fs::remove_file(self.descriptor.snapshot_dir.join(SNAPSHOT_INDEX)) {
+            self.destroyed = true;
+            return Err(SnapshotError::Destroyed {
+                descriptor: Box::new(published_descriptor.clone()),
+                message: format!("remove snapshot index: {error}"),
+            });
+        }
         if let Err(error) =
             fs::remove_file(self.descriptor.snapshot_dir.join(SNAPSHOT_DIRECTORY_MODES))
         {
@@ -809,6 +828,7 @@ impl FsSnapshot {
 
     pub(crate) fn checkpoint_branch(
         source: &Path,
+        source_snapshot_dir: Option<&Path>,
         source_directory_modes: &BTreeMap<PathBuf, u32>,
         upper: &Path,
         deleted: impl IntoIterator<Item = String>,
@@ -831,13 +851,25 @@ impl FsSnapshot {
             .into_iter()
             .map(|(path, mode)| (PathBuf::from(path), mode))
             .collect::<BTreeMap<_, _>>();
+        let source_index = source_snapshot_dir
+            .map(|snapshot_dir| {
+                let metadata = read_metadata(snapshot_dir)?;
+                read_index(snapshot_dir, metadata.root_hash)
+            })
+            .transpose()?;
         capture_with_overlay(
             &canonical_source,
             storage,
             Some(source_directory_modes),
+            source_index.as_ref(),
             move |root, modes| {
                 apply_deletions(root, &deleted, modes)?;
-                apply_upper(root, &canonical_upper, &directory_modes, modes)
+                apply_upper(root, &canonical_upper, &directory_modes, modes)?;
+                Ok(SnapshotIndexUpdate::Branch {
+                    upper: canonical_upper,
+                    deleted: deleted.into_iter().map(PathBuf::from).collect(),
+                    changed_directories: directory_modes.into_keys().collect(),
+                })
             },
         )
     }
@@ -929,7 +961,7 @@ fn reap_destroy_tombstone(path: &Path, name: &std::ffi::OsStr) -> Result<(), Sna
     match fs::symlink_metadata(path.join(SNAPSHOT_METADATA)) {
         Ok(_) => {
             let metadata = read_metadata(path)?;
-            if metadata.schema_version != SNAPSHOT_SCHEMA_VERSION || metadata.id != id {
+            if metadata.id != id {
                 return Err(SnapshotError::InvalidDescriptor(
                     "snapshot tombstone does not match its metadata".to_string(),
                 ));
@@ -1030,6 +1062,10 @@ fn acquire_handle_lease(
 impl SnapshotLease {
     pub(crate) fn record(&self) -> &SnapshotLeaseRecord {
         &self.record
+    }
+
+    pub(crate) fn snapshot_dir(&self) -> &Path {
+        &self.record.snapshot_dir
     }
 
     pub(crate) fn from_record(record: SnapshotLeaseRecord) -> Result<Self, SnapshotError> {
@@ -1137,7 +1173,11 @@ fn capture_with_overlay(
     source: &Path,
     storage: &Path,
     source_directory_modes: Option<&BTreeMap<PathBuf, u32>>,
-    overlay: impl FnOnce(&Path, &mut BTreeMap<PathBuf, u32>) -> Result<(), SnapshotError>,
+    source_index: Option<&SnapshotIndex>,
+    overlay: impl FnOnce(
+        &Path,
+        &mut BTreeMap<PathBuf, u32>,
+    ) -> Result<SnapshotIndexUpdate, SnapshotError>,
 ) -> Result<FsSnapshot, SnapshotError> {
     let source = source
         .canonicalize()
@@ -1178,7 +1218,7 @@ fn capture_with_overlay(
     if before != after {
         return Err(SnapshotError::SourceChanged);
     }
-    overlay(&tree_dir, &mut directory_modes)?;
+    let index_update = overlay(&tree_dir, &mut directory_modes)?;
     let final_source = inventory(&source)?;
     if before != final_source {
         return Err(SnapshotError::SourceChanged);
@@ -1188,11 +1228,34 @@ fn capture_with_overlay(
     // while staged directories still have owner traversal rights; final modes
     // such as 0000 are applied only after all recursive validation is done.
     let _ = inventory(&tree_dir)?;
+    let index = match (source_index, index_update) {
+        (Some(index), SnapshotIndexUpdate::None) => index.clone(),
+        (Some(index), SnapshotIndexUpdate::RefreshPaths(paths)) => {
+            index.refresh_paths(&tree_dir, &directory_modes, paths)?
+        }
+        (
+            Some(index),
+            SnapshotIndexUpdate::Branch {
+                upper,
+                deleted,
+                changed_directories,
+            },
+        ) => index.apply_branch(
+            &tree_dir,
+            &directory_modes,
+            &upper,
+            &deleted,
+            &changed_directories,
+        )?,
+        (None, _) => SnapshotIndex::build(&tree_dir, &directory_modes)?,
+    };
+    let root_hash = index.root_hash()?;
+    index.write(&staging.join(SNAPSHOT_INDEX))?;
     write_json_new(&staging.join(SNAPSHOT_DIRECTORY_MODES), &directory_modes)?;
 
     let metadata = SnapshotMetadata {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
         id: id.clone(),
+        root_hash,
     };
     write_json_new(&staging.join(SNAPSHOT_METADATA), &metadata)?;
     sync_directory(&staging.join(SNAPSHOT_LEASES))?;
@@ -1226,6 +1289,7 @@ fn capture_with_overlay(
     Ok(FsSnapshot {
         descriptor,
         tree_dir: snapshot_dir.join(SNAPSHOT_TREE),
+        root_hash,
         handle_lease: Some(handle_lease),
         destroyed: false,
     })
@@ -1444,6 +1508,21 @@ pub(crate) fn copy_regular_file(
     destination: &Path,
     mode: u32,
 ) -> Result<(), SnapshotError> {
+    copy_regular_file_inner(source, destination, mode, true).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileCopyMethod {
+    Reflink,
+    Buffered,
+}
+
+fn copy_regular_file_inner(
+    source: &Path,
+    destination: &Path,
+    mode: u32,
+    try_reflink: bool,
+) -> Result<FileCopyMethod, SnapshotError> {
     let before = fs::symlink_metadata(source)
         .map_err(|error| operation("inspect source file before copy", error))?;
     let mut input = fs::OpenOptions::new()
@@ -1464,8 +1543,22 @@ pub(crate) fn copy_regular_file(
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(destination)
         .map_err(|error| operation("create snapshot file", error))?;
-    std::io::copy(&mut input, &mut output)
-        .map_err(|error| operation("copy snapshot file", error))?;
+    let method = if try_reflink && reflink_file(&input, &output)? {
+        FileCopyMethod::Reflink
+    } else {
+        input
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| operation("rewind snapshot source", error))?;
+        output
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| operation("rewind snapshot destination", error))?;
+        output
+            .set_len(0)
+            .map_err(|error| operation("reset snapshot destination", error))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|error| operation("copy snapshot file", error))?;
+        FileCopyMethod::Buffered
+    };
     let opened_after = input
         .metadata()
         .map_err(|error| operation("inspect copied source file", error))?;
@@ -1481,7 +1574,41 @@ pub(crate) fn copy_regular_file(
         .map_err(|error| operation("set snapshot file mode", error))?;
     output
         .sync_all()
-        .map_err(|error| operation("sync snapshot file", error))
+        .map_err(|error| operation("sync snapshot file", error))?;
+    Ok(method)
+}
+
+#[cfg(target_os = "linux")]
+fn reflink_file(source: &fs::File, destination: &fs::File) -> Result<bool, SnapshotError> {
+    const FICLONE_IOCTL: libc::c_ulong = 0x4004_9409;
+    let result = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE_IOCTL, source.as_raw_fd()) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(errno)
+            if matches!(
+                errno,
+                libc::EOPNOTSUPP
+                    | libc::ENOTTY
+                    | libc::EXDEV
+                    | libc::EINVAL
+                    | libc::ENOSYS
+                    | libc::EPERM
+                    | libc::EACCES
+            )
+    ) {
+        Ok(false)
+    } else {
+        Err(operation("reflink snapshot file", error))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reflink_file(_source: &fs::File, _destination: &fs::File) -> Result<bool, SnapshotError> {
+    Ok(false)
 }
 
 fn file_identity(metadata: &fs::Metadata) -> (u64, u64, u32, u64, i64, i64, i64, i64) {
@@ -1788,6 +1915,25 @@ fn snapshot_entry(root: &Path, path: &Path) -> Result<SnapshotEntry, SnapshotErr
     })
 }
 
+fn indexed_change_kind(
+    before: &SnapshotIndexEntry,
+    after: &SnapshotIndexEntry,
+) -> Option<SnapshotChangeKind> {
+    if before.kind != after.kind {
+        return Some(SnapshotChangeKind::TypeChanged);
+    }
+    match before.kind {
+        SnapshotEntryKind::File if before.len != after.len || before.hash != after.hash => {
+            return Some(SnapshotChangeKind::Modified);
+        }
+        SnapshotEntryKind::Symlink if before.hash != after.hash => {
+            return Some(SnapshotChangeKind::SymlinkTargetChanged);
+        }
+        SnapshotEntryKind::Directory | SnapshotEntryKind::File | SnapshotEntryKind::Symlink => {}
+    }
+    (before.mode != after.mode).then_some(SnapshotChangeKind::ModeChanged)
+}
+
 fn compare_entry(
     before_root: &Path,
     after_root: &Path,
@@ -1906,6 +2052,21 @@ fn read_metadata(snapshot_dir: &Path) -> Result<SnapshotMetadata, SnapshotError>
     })
 }
 
+fn read_index(
+    snapshot_dir: &Path,
+    expected_root_hash: [u8; 32],
+) -> Result<SnapshotIndex, SnapshotError> {
+    let path = snapshot_dir.join(SNAPSHOT_INDEX);
+    validate_plain_file(&path, "snapshot index")?;
+    let index = SnapshotIndex::load(&path)?;
+    if index.root_hash()? != expected_root_hash {
+        return Err(SnapshotError::InvalidDescriptor(
+            "snapshot index root does not match snapshot metadata".to_string(),
+        ));
+    }
+    Ok(index)
+}
+
 fn write_json_new(path: &Path, value: &impl Serialize) -> Result<(), SnapshotError> {
     let bytes = serde_json::to_vec(value).map_err(|error| {
         SnapshotError::Operation(format!("serialize snapshot metadata: {error}"))
@@ -1986,6 +2147,80 @@ pub(crate) fn make_tree_removable(root: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_metadata_has_no_storage_format_version() {
+        let source = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("file"), b"content").unwrap();
+        let snapshot = FsSnapshot::capture(source.path(), storage.path()).unwrap();
+
+        let metadata =
+            fs::read_to_string(snapshot.descriptor().snapshot_dir.join(SNAPSHOT_METADATA)).unwrap();
+        assert!(!metadata.contains("version"));
+        assert!(snapshot
+            .descriptor()
+            .snapshot_dir
+            .join(SNAPSHOT_INDEX)
+            .is_file());
+    }
+
+    #[test]
+    fn equivalent_snapshots_have_the_same_merkle_root() {
+        let source = tempfile::tempdir().unwrap();
+        let first_storage = tempfile::tempdir().unwrap();
+        let second_storage = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("directory")).unwrap();
+        fs::write(source.path().join("directory/file"), b"content").unwrap();
+
+        let first = FsSnapshot::capture(source.path(), first_storage.path()).unwrap();
+        let second = FsSnapshot::capture(source.path(), second_storage.path()).unwrap();
+
+        assert_eq!(first.root_hash, second.root_hash);
+        assert_eq!(first.diff(&second, 1).unwrap().changed_paths, 0);
+    }
+
+    #[test]
+    fn regular_file_clone_keeps_source_and_destination_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::write(&source, b"source content").unwrap();
+
+        let method = copy_regular_file_inner(&source, &destination, 0o640, true).unwrap();
+        assert!(matches!(
+            method,
+            FileCopyMethod::Reflink | FileCopyMethod::Buffered
+        ));
+        fs::write(&destination, b"changed").unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"source content");
+        assert_eq!(
+            fs::symlink_metadata(&destination).unwrap().mode() & 0o7777,
+            0o640
+        );
+
+        let forced_copy = directory.path().join("forced-copy");
+        assert_eq!(
+            copy_regular_file_inner(&source, &forced_copy, 0o600, false).unwrap(),
+            FileCopyMethod::Buffered
+        );
+        assert_eq!(fs::read(forced_copy).unwrap(), b"source content");
+    }
+
+    #[test]
+    fn reopen_rejects_a_missing_snapshot_index() {
+        let source = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("file"), b"content").unwrap();
+        let snapshot = FsSnapshot::capture(source.path(), storage.path()).unwrap();
+        let descriptor = snapshot.descriptor().clone();
+        fs::remove_file(descriptor.snapshot_dir.join(SNAPSHOT_INDEX)).unwrap();
+
+        assert!(matches!(
+            FsSnapshot::reopen(descriptor),
+            Err(SnapshotError::InvalidDescriptor(_))
+        ));
+    }
 
     #[test]
     fn capture_is_immutable_reopenable_and_materializable() {

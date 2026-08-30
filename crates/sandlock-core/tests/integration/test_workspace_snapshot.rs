@@ -329,6 +329,82 @@ async fn snapshot_branch_checkpoint_can_seed_an_independent_child() {
 }
 
 #[tokio::test]
+async fn package_manager_style_branch_workload_survives_checkpoint() {
+    let source = tempfile::tempdir().unwrap();
+    let snapshot_storage = tempfile::tempdir().unwrap();
+    let branch_storage = tempfile::tempdir().unwrap();
+    let checkpoint_storage = tempfile::tempdir().unwrap();
+    fs::create_dir_all(source.path().join("node_modules/old")).unwrap();
+    fs::write(source.path().join("package.json"), br#"{"name":"fixture"}"#).unwrap();
+    fs::write(source.path().join("package-lock.json"), b"old lock").unwrap();
+    fs::write(source.path().join("node_modules/old/index.js"), b"old").unwrap();
+    let mut base = FsSnapshot::capture(source.path(), snapshot_storage.path()).unwrap();
+    let mut sandbox = snapshot_sandbox(base.root_dir(), branch_storage.path(), None);
+    let mut branch = sandbox.create_fs_branch_from_snapshot(&base).unwrap();
+
+    let command = "set -eu; \
+        mkdir -p node_modules/.staging/pkg/lib node_modules/.bin; \
+        i=0; while [ \"$i\" -lt 128 ]; do \
+          printf 'module.exports=%s\\n' \"$i\" > \"node_modules/.staging/pkg/lib/f$i.js\"; \
+          i=$((i + 1)); \
+        done; \
+        printf '#!/bin/sh\\nprintf package-ok\\n' > node_modules/.staging/pkg/bin.js; \
+        chmod 755 node_modules/.staging/pkg/bin.js; \
+        mv node_modules/.staging/pkg node_modules/pkg; \
+        rmdir node_modules/.staging; \
+        ln -s ../pkg/bin.js node_modules/.bin/pkg; \
+        printf 'new lock\\n' > package-lock.json.tmp; \
+        mv package-lock.json.tmp package-lock.json; \
+        rm -rf node_modules/old; \
+        test \"$(node_modules/.bin/pkg)\" = package-ok; \
+        test \"$(cat node_modules/pkg/lib/f127.js)\" = module.exports=127";
+    let result = sandbox
+        .run_in_branch(&mut branch, &["sh", "-c", command])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "{}",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+
+    let mut checkpoint = branch.checkpoint(checkpoint_storage.path()).unwrap();
+    assert_eq!(
+        checkpoint
+            .read_range("node_modules/pkg/lib/f127.js", 0, 64)
+            .unwrap(),
+        b"module.exports=127\n"
+    );
+    assert_eq!(
+        checkpoint
+            .stat("node_modules/.bin/pkg")
+            .unwrap()
+            .symlink_target,
+        Some("../pkg/bin.js".into())
+    );
+    assert!(checkpoint.stat("node_modules/old").is_err());
+    assert_eq!(
+        checkpoint.read_range("package-lock.json", 0, 64).unwrap(),
+        b"new lock\n"
+    );
+    let diff = base.diff(&checkpoint, 512).unwrap();
+    assert!(diff.changed_paths >= 130);
+    assert!(!diff.truncated);
+
+    assert!(sandbox
+        .run_in_branch(
+            &mut branch,
+            &["sh", "-c", "test -f node_modules/pkg/lib/f64.js"],
+        )
+        .await
+        .unwrap()
+        .success());
+    branch.abort().unwrap();
+    checkpoint.destroy().unwrap();
+    base.destroy().unwrap();
+}
+
+#[tokio::test]
 async fn snapshot_fd_metadata_stays_bound_to_the_open_inode() {
     let source = tempfile::tempdir().unwrap();
     let base_storage = tempfile::tempdir().unwrap();

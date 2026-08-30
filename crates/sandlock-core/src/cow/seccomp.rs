@@ -1378,6 +1378,9 @@ impl SeccompCowBranch {
             .collect();
         let result = crate::snapshot::FsSnapshot::checkpoint_branch(
             &self.workdir,
+            self.snapshot_lease
+                .as_ref()
+                .map(crate::snapshot::SnapshotLease::snapshot_dir),
             &lower_directory_modes,
             &self.upper,
             self.deleted.iter().map(str::to_owned),

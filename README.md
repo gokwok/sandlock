@@ -608,6 +608,9 @@ after a fixed stage list.
 Controllers that need stable branch baselines can capture an immutable
 `FsSnapshot`, create one or more snapshot-backed `FsBranch` values, and make
 non-terminal checkpoints without changing the lower or consuming the branch.
+Snapshots remain fully materialized while using per-file reflinks when the
+backing filesystem supports them, plus a persistent file/Merkle index for
+content-aware diff and incremental checkpoint indexing.
 See [`docs/filesystem-snapshots.md`](docs/filesystem-snapshots.md) for the Rust
 API, consistency boundary, persistence model, and supported filesystem types.
 
