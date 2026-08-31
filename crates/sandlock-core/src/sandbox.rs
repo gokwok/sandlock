@@ -3197,9 +3197,10 @@ impl Sandbox {
         let mut payload_pid = pid;
         let mut supervised_pidfd = None;
         let mut killable_recv = false;
+        let mut read_devices = Vec::new();
         let (notif_fd, _is_nested_mode) = if let Some(launch) = bubblewrap_launch.as_mut() {
             launch.parent_after_fork();
-            let (listener, actual_payload_pid, actual_killable_recv) = match launch.receive_listener() {
+            let (listener, actual_payload_pid, actual_killable_recv, devices) = match launch.receive_listener() {
                 Ok(listener) => listener,
                 Err(error) => {
                     // The bootstrap publishes its bounded errno/stage record
@@ -3212,6 +3213,7 @@ impl Sandbox {
                 }
             };
             payload_pid = actual_payload_pid;
+            read_devices = devices;
             killable_recv = actual_killable_recv;
             supervised_pidfd = syscall::pidfd_open(actual_payload_pid as u32, 0).ok();
             (Some(listener), false)
@@ -3386,6 +3388,7 @@ impl Sandbox {
 
             let rt_name = self.rt().name.clone();
             let notif_policy = NotifPolicy {
+                read_devices,
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 max_processes: self.max_processes,
                 has_memory_limit: resolved.features.memory_limit,

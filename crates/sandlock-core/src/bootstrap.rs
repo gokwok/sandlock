@@ -10,8 +10,10 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::sys::structs::SockFilter;
 
-pub(crate) const FILTER_MAGIC: [u8; 8] = *b"SLBP0002";
-pub(crate) const LISTENER_MAGIC: [u8; 4] = *b"SLN2";
+pub(crate) const FILTER_MAGIC: [u8; 8] = *b"SLBP0003";
+pub(crate) const LISTENER_MAGIC: [u8; 4] = *b"SLN3";
+pub(crate) const MAX_READ_DEVICES: usize = 64;
+pub(crate) const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
 const MAX_FILTER_INSTRUCTIONS: usize = 4096;
 const EXEC_FAILURE_MAGIC: [u8; 4] = *b"SLXF";
 
@@ -132,7 +134,7 @@ fn write_exact_fd(fd: RawFd, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn read_filter(fd: RawFd) -> io::Result<Vec<SockFilter>> {
+fn read_filter(fd: RawFd) -> io::Result<(Vec<SockFilter>, Vec<OsString>, Vec<OsString>)> {
     if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -156,13 +158,45 @@ fn read_filter(fd: RawFd) -> io::Result<Vec<SockFilter>> {
             k: u32::from_le_bytes(instruction[4..8].try_into().unwrap()),
         });
     }
-    Ok(filter)
+    let environment = read_strings(fd, 16384, MAX_ENVIRONMENT_BYTES)?;
+    let devices = read_strings(fd, MAX_READ_DEVICES, MAX_READ_DEVICES * 4096)?;
+    Ok((filter, environment, devices))
+}
+
+fn read_strings(fd: RawFd, max_count: usize, max_bytes: usize) -> io::Result<Vec<OsString>> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut word = [0; 4];
+    read_exact_fd(fd, &mut word)?;
+    let count = u32::from_le_bytes(word) as usize;
+    if count > max_count {
+        return Err(invalid("bootstrap string count exceeds limit"));
+    }
+    let mut total = 0usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        read_exact_fd(fd, &mut word)?;
+        let length = u32::from_le_bytes(word) as usize;
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| invalid("bootstrap size overflow"))?;
+        if total > max_bytes {
+            return Err(invalid("bootstrap strings exceed limit"));
+        }
+        let mut bytes = vec![0; length];
+        read_exact_fd(fd, &mut bytes)?;
+        if bytes.contains(&0) {
+            return Err(invalid("bootstrap string contains NUL"));
+        }
+        values.push(OsString::from_vec(bytes));
+    }
+    Ok(values)
 }
 
 struct RelayArgs {
     pipe_r: RawFd,
     control_fd: RawFd,
     payload_pid: libc::pid_t,
+    read_devices: Vec<RawFd>,
 }
 
 extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
@@ -172,15 +206,19 @@ extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
         return 126;
     }
     let listener_fd = i32::from_le_bytes(listener_bytes[..4].try_into().unwrap());
-    let mut payload = [0u8; 12];
+    let mut payload = [0u8; 16];
     payload[..4].copy_from_slice(&LISTENER_MAGIC);
     payload[4..8].copy_from_slice(&(args.payload_pid as i32).to_le_bytes());
-    payload[8..].copy_from_slice(&listener_bytes[4..]);
+    payload[8..12].copy_from_slice(&listener_bytes[4..]);
+    payload[12..].copy_from_slice(&(args.read_devices.len() as u32).to_le_bytes());
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
         iov_len: payload.len(),
     };
-    let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+    let mut fds = vec![listener_fd];
+    fds.extend_from_slice(&args.read_devices);
+    let fd_bytes = fds.len() * std::mem::size_of::<RawFd>();
+    let control_len = unsafe { libc::CMSG_SPACE(fd_bytes as _) } as usize;
     let mut control = vec![0u8; control_len];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
@@ -195,8 +233,12 @@ extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
         }
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as _;
-        std::ptr::write(libc::CMSG_DATA(cmsg).cast::<RawFd>(), listener_fd);
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as _) as _;
+        std::ptr::copy_nonoverlapping(
+            fds.as_ptr(),
+            libc::CMSG_DATA(cmsg).cast::<RawFd>(),
+            fds.len(),
+        );
         message.msg_controllen = (*cmsg).cmsg_len;
         if libc::sendmsg(args.control_fd, &message, 0) < 0 {
             return 126;
@@ -205,7 +247,12 @@ extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
     0
 }
 
-fn relay_listener(control_fd: RawFd, filter: &[SockFilter], session_domain: bool) -> io::Result<()> {
+fn relay_listener(
+    control_fd: RawFd,
+    filter: &[SockFilter],
+    session_domain: bool,
+    devices: &[OwnedFd],
+) -> io::Result<()> {
     let mut pipe = [0i32; 2];
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
@@ -218,6 +265,7 @@ fn relay_listener(control_fd: RawFd, filter: &[SockFilter], session_domain: bool
         pipe_r: pipe_r.as_raw_fd(),
         control_fd,
         payload_pid: unsafe { libc::getpid() },
+        read_devices: devices.iter().map(AsRawFd::as_raw_fd).collect(),
     });
     let relay_args_raw = Box::into_raw(relay_args);
     let relay_pid = unsafe {
@@ -308,14 +356,16 @@ fn run_inner() -> io::Result<()> {
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
         }
     }
-    let filter = read_filter(args.filter_fd)?;
+    let (filter, environment, device_paths) = read_filter(args.filter_fd)?;
+    let devices = crate::bootstrap_devices::prepare(&device_paths)?;
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    relay_listener(args.control_fd, &filter, args.session_domain)?;
+    relay_listener(args.control_fd, &filter, args.session_domain, &devices)?;
 
     let mut ready = [0u8; 4];
     read_exact_fd(args.ready_fd, &mut ready)?;
+    drop(devices);
 
     let flags = unsafe { libc::fcntl(args.exec_status_fd, libc::F_GETFD) };
     if flags < 0
@@ -327,6 +377,23 @@ fn run_inner() -> io::Result<()> {
     let mut keep = args.keep_fds.clone();
     keep.push(args.exec_status_fd);
     close_fds_above(2, &keep);
+
+    // This bootstrap is single-threaded again after the listener relay exited.
+    // Workload environment (including loader settings) is restored only after
+    // device mounts, capability removal, confinement and inherited-fd closure.
+    for entry in environment {
+        let bytes = entry.as_bytes();
+        let equal = bytes
+            .iter()
+            .position(|b| *b == b'=')
+            .ok_or_else(|| invalid("invalid bootstrap environment entry"))?;
+        if equal == 0 {
+            return Err(invalid("empty bootstrap environment key"));
+        }
+        let key = std::ffi::OsStr::from_bytes(&bytes[..equal]);
+        let value = std::ffi::OsStr::from_bytes(&bytes[equal + 1..]);
+        std::env::set_var(key, value);
+    }
 
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let command = args

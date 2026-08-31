@@ -1,10 +1,16 @@
 use sandlock_core::{FilesystemBackend, Protection, ProtectionProvider, ProtectionStatus, Sandbox};
 
+fn test_helper() -> std::path::PathBuf {
+    std::env::var_os("SANDLOCK_TEST_BWRAP")
+        .map(Into::into).unwrap_or_else(|| "/usr/bin/bwrap".into())
+}
+
 fn bubblewrap_builder() -> sandlock_core::SandboxBuilder {
     let mut builder = Sandbox::builder()
         .filesystem_backend(FilesystemBackend::Bubblewrap)
-        .bubblewrap_path("/usr/bin/bwrap")
-        .bubblewrap_bootstrap_path(env!("CARGO_BIN_EXE_sandlock-bootstrap"))
+        .bubblewrap_path(test_helper())
+        .bubblewrap_bootstrap_path(std::env::var_os("SANDLOCK_TEST_BOOTSTRAP")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_sandlock-bootstrap").into()))
         .control_socket(false)
         .fs_read("/usr")
         .fs_read("/lib")
@@ -28,10 +34,10 @@ fn bubblewrap_reports_provider_aware_identity() {
     let report = sandbox.filesystem_backend_report().unwrap();
     assert!(report
         .implementation_id
-        .starts_with("bubblewrap-fs-v1:bwrap-"));
+        .starts_with("bubblewrap-fs-v2:bwrap-"));
     assert_eq!(
         report.executable.as_deref(),
-        Some(std::path::Path::new("/usr/bin/bwrap"))
+        Some(test_helper().as_path())
     );
     let protections = sandbox.active_protection_reports().unwrap();
     for protection in [Protection::FsRefer, Protection::FsTruncate] {
@@ -71,6 +77,111 @@ async fn bubblewrap_runs_with_an_empty_root_and_explicit_grants() {
         String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
     );
     assert_eq!(result.stdout.as_deref(), Some(b"bubblewrap-ok".as_slice()));
+}
+
+#[tokio::test]
+async fn bubblewrap_read_only_random_device_preserves_mount_and_fd_restrictions() {
+    let result = bubblewrap_builder()
+        .fs_read("/dev/urandom")
+        .fs_read("/proc")
+        .env_var("DEVICE_TEST_VALUE", "delivered-after-bootstrap")
+        .build().unwrap()
+        .run(&["python3", "-c", r#"
+import errno, os, fcntl
+assert os.environ['DEVICE_TEST_VALUE'] == 'delivered-after-bootstrap'
+for line in open('/proc/self/status'):
+    if line.startswith(('CapEff:', 'CapPrm:', 'CapInh:', 'CapAmb:', 'CapBnd:')):
+        assert int(line.split()[1], 16) == 0, line
+for path in ('/dev/urandom', '/dev/../dev/urandom'):
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    assert os.fstatvfs(fd).f_flag & os.ST_RDONLY
+    assert os.fstatvfs(fd).f_flag & os.ST_NODEV
+    assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+    assert len(os.read(fd, 32)) == 32
+    for action in (
+        lambda: os.write(fd, b'x'),
+        lambda: os.open(path, os.O_WRONLY),
+        lambda: os.open('/proc/self/fd/%d' % fd, os.O_RDWR),
+        lambda: os.fchmod(fd, 0o600),
+    ):
+        try:
+            action()
+        except OSError as error:
+            assert error.errno in (errno.EBADF, errno.EACCES, errno.EPERM, errno.EROFS), error
+        else:
+            raise AssertionError('read-only device mutation was allowed')
+    os.close(fd)
+directory = os.open('/dev', os.O_RDONLY | os.O_DIRECTORY)
+fd = os.open('urandom', os.O_RDONLY, dir_fd=directory)
+assert len(os.read(fd, 16)) == 16
+os.close(fd)
+os.close(directory)
+for _ in range(40):
+    pid = os.fork()
+    if pid == 0:
+        with open('/dev/urandom', 'rb', buffering=0) as stream:
+            assert len(stream.read(16)) == 16
+        os._exit(0)
+    assert os.waitpid(pid, 0)[1] == 0
+print('read-only-device-ok')
+"#]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or_default());
+    assert_eq!(result.stdout_str(), Some("read-only-device-ok"));
+}
+
+#[tokio::test]
+async fn bubblewrap_read_only_devices_respect_denials_and_random_seed() {
+    let denied = bubblewrap_builder()
+        .fs_read("/dev/urandom")
+        .fs_read("/proc")
+        .policy_fn(|event, ctx| {
+            if event.syscall == "execve" { ctx.deny_path("/dev/urandom"); }
+            sandlock_core::policy_fn::Verdict::Allow
+        })
+        .build().unwrap()
+        .run(&["sh", "-c", "if head -c 16 /dev/../dev/urandom; then exit 1; fi; printf denied"])
+        .await.unwrap();
+    assert!(denied.success(), "{}", denied.stderr_str().unwrap_or_default());
+    assert_eq!(denied.stdout_str(), Some("denied"));
+    let mut seeded = bubblewrap_builder().fs_read("/dev/urandom").random_seed(42).build().unwrap();
+    let command = ["sh", "-c", "od -A n -N 16 -t x1 /dev/urandom"];
+    let first = seeded.clone().run(&command).await.unwrap();
+    let second = seeded.run(&command).await.unwrap();
+    assert!(first.success() && second.success());
+    assert!(!first.stdout.as_deref().unwrap().is_empty());
+    assert_eq!(first.stdout, second.stdout);
+}
+
+#[tokio::test]
+async fn bubblewrap_loader_environment_only_reaches_confined_workload() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("constructor.c");
+    let library = dir.path().join("constructor.so");
+    std::fs::write(&source, r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+__attribute__((constructor)) static void check_confinement(void) {
+    FILE *status = fopen("/proc/self/status", "r");
+    if (!status) _exit(91);
+    char line[256];
+    while (fgets(line, sizeof(line), status)) {
+        if (!strncmp(line, "Cap", 3) && strtoull(strchr(line, ':') + 1, NULL, 16)) _exit(92);
+    }
+    fclose(status);
+    setenv("CONFINED_PRELOAD_RAN", "yes", 1);
+}
+"#).unwrap();
+    assert!(std::process::Command::new("cc").args(["-shared", "-fPIC"])
+        .arg(&source).arg("-o").arg(&library).status().unwrap().success());
+    let result = bubblewrap_builder()
+        .fs_read(&library).fs_read("/proc").fs_read("/dev/urandom")
+        .env_var("LD_PRELOAD", library.to_string_lossy())
+        .build().unwrap()
+        .run(&["sh", "-c", "test \"$CONFINED_PRELOAD_RAN\" = yes"])
+        .await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or_default());
 }
 
 #[tokio::test]

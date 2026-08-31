@@ -3,5 +3,6 @@ pub(crate) mod ctx;
 pub mod dispatch;
 pub mod notif;
 pub(crate) mod notif_metadata;
+pub(crate) mod read_devices;
 pub(crate) mod state;
 pub mod syscall;

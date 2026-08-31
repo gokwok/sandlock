@@ -120,14 +120,22 @@ fn open_path(path: &Path) -> io::Result<OwnedFd> {
 fn open_entry(entry: &FilesystemEntry) -> io::Result<Option<OwnedFd>> {
     match open_path(&entry.host_source) {
         Ok(fd) => Ok(Some(fd)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-            && entry.purpose == EntryPurpose::PolicyGrant
-            && entry.access == MountAccess::ReadOnly => Ok(None),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && entry.purpose == EntryPurpose::PolicyGrant
+                && entry.access == MountAccess::ReadOnly =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
 
-fn make_filter_memfd(filter: &[SockFilter]) -> io::Result<OwnedFd> {
+fn make_filter_memfd(
+    filter: &[SockFilter],
+    environment: &[CString],
+    devices: &[OsString],
+) -> io::Result<OwnedFd> {
     let name = CString::new("sandlock-seccomp").unwrap();
     let fd = unsafe {
         libc::syscall(
@@ -148,6 +156,18 @@ fn make_filter_memfd(filter: &[SockFilter]) -> io::Result<OwnedFd> {
         file.write_all(&[instruction.jt, instruction.jf])?;
         file.write_all(&instruction.k.to_le_bytes())?;
     }
+    write_strings(
+        &mut file,
+        environment.iter().map(|value| value.as_bytes()),
+        16384,
+        crate::bootstrap::MAX_ENVIRONMENT_BYTES,
+    )?;
+    write_strings(
+        &mut file,
+        devices.iter().map(|value| value.as_bytes()),
+        crate::bootstrap::MAX_READ_DEVICES,
+        crate::bootstrap::MAX_READ_DEVICES * 4096,
+    )?;
     file.flush()?;
     let owned: OwnedFd = file.into();
     if unsafe {
@@ -161,6 +181,25 @@ fn make_filter_memfd(filter: &[SockFilter]) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(owned)
+}
+
+fn write_strings<'a>(
+    file: &mut std::fs::File,
+    values: impl Iterator<Item = &'a [u8]>,
+    max_count: usize,
+    max_bytes: usize,
+) -> io::Result<()> {
+    let values = values.collect::<Vec<_>>();
+    if values.len() > max_count || values.iter().map(|value| value.len()).sum::<usize>() > max_bytes
+    {
+        return Err(io::Error::other("bootstrap strings exceed limit"));
+    }
+    file.write_all(&(values.len() as u32).to_le_bytes())?;
+    for value in values {
+        file.write_all(&(value.len() as u32).to_le_bytes())?;
+        file.write_all(value)?;
+    }
+    Ok(())
 }
 
 fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
@@ -296,6 +335,7 @@ impl PreparedBubblewrap {
         let mut argv = vec![cstring("bwrap")?];
         let mut inherited = Vec::new();
         let mut cleanup_paths = Vec::new();
+        let mut read_devices = Vec::new();
 
         for option in ["--unshare-user", "--die-with-parent", "--tmpfs", "/"] {
             push_arg(&mut argv, option)?;
@@ -310,7 +350,9 @@ impl PreparedBubblewrap {
         for entry in &plan.entries {
             // Same absent read-grant semantics as Landlock. Explicit mounts
             // and writable grants remain mandatory; never mount an ancestor.
-            let Some(source) = open_entry(entry)? else { continue; };
+            let Some(source) = open_entry(entry)? else {
+                continue;
+            };
             let source_path = proc_fd(source.as_raw_fd());
             let bind_option = match entry.access {
                 MountAccess::ReadOnly => "--ro-bind",
@@ -321,8 +363,10 @@ impl PreparedBubblewrap {
             push_arg(&mut argv, &source_path)?;
             push_arg(&mut argv, entry.guest_path.as_os_str())?;
             if entry.access == MountAccess::DeviceReadOnly {
-                push_arg(&mut argv, "--remount-ro")?;
-                push_arg(&mut argv, entry.guest_path.as_os_str())?;
+                if !crate::bootstrap_devices::supported(&std::fs::metadata(&entry.host_source)?) {
+                    return Err(io::Error::other("unsupported read-only device kind"));
+                }
+                read_devices.push(entry.guest_path.as_os_str().to_owned());
             }
             inherited.push(source);
         }
@@ -368,7 +412,23 @@ impl PreparedBubblewrap {
         push_arg(&mut argv, "--chdir")?;
         push_arg(&mut argv, cwd.as_os_str())?;
 
-        let filter_fd = make_filter_memfd(filter)?;
+        if !read_devices.is_empty() {
+            // Only the trusted bootstrap receives these user-namespace caps.
+            // It preopens byte streams, remounts them readonly/nodev and drops
+            // every capability before restoring the workload environment.
+            for option in [
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CAP_SYS_ADMIN",
+                "--cap-add",
+                "CAP_SETPCAP",
+            ] {
+                push_arg(&mut argv, option)?;
+            }
+        }
+        let workload_environment = child_environment(sandbox)?;
+        let filter_fd = make_filter_memfd(filter, &workload_environment, &read_devices)?;
         let (control_parent, control_child) = socket_pair()?;
         push_arg(&mut argv, BOOTSTRAP_DESTINATION)?;
         for (flag, fd) in [
@@ -404,7 +464,9 @@ impl PreparedBubblewrap {
             .map(|argument| argument.as_ptr() as usize)
             .chain(std::iter::once(0))
             .collect();
-        let environment = child_environment(sandbox)?;
+        // Untrusted loader/environment settings must not run in the mount
+        // setup or bootstrap. The sealed payload restores them after setup.
+        let environment: Vec<CString> = Vec::new();
         let environment_pointers = environment
             .iter()
             .map(|entry| entry.as_ptr() as usize)
@@ -435,34 +497,31 @@ impl PreparedBubblewrap {
         self.inherited.clear();
     }
 
-    pub(crate) fn receive_listener(&mut self) -> io::Result<(OwnedFd, libc::pid_t, bool)> {
+    pub(crate) fn receive_listener(
+        &mut self,
+    ) -> io::Result<(OwnedFd, libc::pid_t, bool, Vec<crate::seccomp::read_devices::ReadDevice>)> {
         let socket = self
             .control_parent
             .take()
             .ok_or_else(|| io::Error::other("Bubblewrap listener socket already consumed"))?;
-        let mut payload = [0u8; 12];
+        let mut payload = [0u8; 16];
         let mut iov = libc::iovec {
             iov_base: payload.as_mut_ptr().cast(),
             iov_len: payload.len(),
         };
-        let control_len = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+        let max_fd_bytes = (1 + crate::bootstrap::MAX_READ_DEVICES) * std::mem::size_of::<RawFd>();
+        let control_len = unsafe { libc::CMSG_SPACE(max_fd_bytes as _) } as usize;
         let mut control = vec![0u8; control_len];
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
         message.msg_control = control.as_mut_ptr().cast();
-        // One fd's ancillary data fits both the GNU size_t and musl socklen_t fields.
+        // The bounded descriptor array fits GNU size_t and musl socklen_t fields.
         message.msg_controllen = control.len() as _;
         let received =
             unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
         if received < 0 {
             return Err(io::Error::last_os_error());
-        }
-        if received as usize != payload.len() || payload[..4] != LISTENER_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Bubblewrap listener frame",
-            ));
         }
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&message) };
         if cmsg.is_null()
@@ -475,9 +534,32 @@ impl PreparedBubblewrap {
                 "Bubblewrap listener frame has no fd",
             ));
         }
-        let listener_fd = unsafe { std::ptr::read(libc::CMSG_DATA(cmsg).cast::<RawFd>()) };
-        // SAFETY: SCM_RIGHTS above supplied one owned descriptor.
-        let listener_fd = unsafe { OwnedFd::from_raw_fd(listener_fd) };
+        let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
+        let fd_bytes = (unsafe { (*cmsg).cmsg_len } as usize).saturating_sub(header_len);
+        if fd_bytes == 0 || fd_bytes > max_fd_bytes || fd_bytes % std::mem::size_of::<RawFd>() != 0
+        {
+            return Err(io::Error::other("invalid bootstrap descriptor array"));
+        }
+        let mut received_fds = Vec::new();
+        for index in 0..fd_bytes / std::mem::size_of::<RawFd>() {
+            // SAFETY: the checked ancillary length contains this owned SCM_RIGHTS fd.
+            received_fds.push(unsafe {
+                OwnedFd::from_raw_fd(*libc::CMSG_DATA(cmsg).cast::<RawFd>().add(index))
+            });
+        }
+        let device_count = u32::from_le_bytes(payload[12..].try_into().unwrap()) as usize;
+        if received as usize != payload.len()
+            || payload[..4] != LISTENER_MAGIC
+            || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+            || device_count > crate::bootstrap::MAX_READ_DEVICES
+            || received_fds.len() != 1 + device_count
+        {
+            return Err(io::Error::other("invalid Bubblewrap listener frame"));
+        }
+        let listener_fd = received_fds.remove(0);
+        let read_devices = received_fds.into_iter()
+            .map(crate::seccomp::read_devices::ReadDevice::new)
+            .collect::<io::Result<Vec<_>>>()?;
         let payload_pid = i32::from_le_bytes(payload[4..8].try_into().unwrap());
         if payload_pid <= 0 {
             return Err(io::Error::new(
@@ -488,9 +570,14 @@ impl PreparedBubblewrap {
         let killable_recv = match u32::from_le_bytes(payload[8..12].try_into().unwrap()) {
             0 => false,
             1 => true,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid notification wait mode")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid notification wait mode",
+                ))
+            }
         };
-        Ok((listener_fd, payload_pid, killable_recv))
+        Ok((listener_fd, payload_pid, killable_recv, read_devices))
     }
 
     pub(crate) fn exec_child(

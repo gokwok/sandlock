@@ -1,6 +1,7 @@
 pub(crate) mod arch;
 #[doc(hidden)]
 pub mod bootstrap;
+mod bootstrap_devices;
 pub mod branch;
 pub(crate) mod bubblewrap;
 pub(crate) mod ca_inject;

@@ -64,7 +64,7 @@ impl ResolvedFilesystemBackend {
     pub fn implementation_id(&self) -> String {
         match self {
             Self::Landlock { abi } => format!("landlock-v{abi}"),
-            Self::Bubblewrap { version } => format!("bubblewrap-fs-v1:{version}"),
+            Self::Bubblewrap { version } => format!("bubblewrap-fs-v2:{version}"),
         }
     }
 }

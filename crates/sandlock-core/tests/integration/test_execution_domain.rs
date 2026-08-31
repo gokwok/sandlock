@@ -20,6 +20,7 @@ fn sandbox_builder(path: &Path) -> sandlock_core::SandboxBuilder {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
+        .fs_read("/dev/urandom")
         .fs_read("/dev/null")
         .fs_write("/dev/null")
         .fs_write(path);
@@ -79,6 +80,8 @@ for i in range(40):
     pid = os.fork()
     if pid == 0:
         os.setpgid(0, 0)
+        with open('/dev/urandom', 'rb', buffering=0) as entropy:
+            assert len(entropy.read(16)) == 16
         pathlib.Path(f'/workspace/child-{i}').write_text(str(i))
         os._exit(0)
     children.append(pid)

@@ -113,6 +113,14 @@ sandlock-bootstrap`) and configure its trusted path or place it beside the
 application/on the service's trusted `PATH`. `bubblewrap_path` and
 `bubblewrap_bootstrap_path` are deployment settings, not serialized policy.
 
+Read-only grants for Linux byte-stream devices (`null`, `zero`, `random`, and
+`urandom`) use preopened read-only descriptors. The trusted bootstrap then
+remounts those device binds read-only with `nodev`, removes all capabilities,
+and only then restores the workload environment. Reads remain available;
+write opens, writable descriptor aliases, and metadata mutation remain denied.
+Other read-only device kinds fail closed. The bootstrap protocol is versioned;
+deploy the library and bootstrap from the same revision.
+
 COW remains supervisor-managed: `workdir` identifies the host lower and
 `workdir_virtual` optionally gives its guest path. The lower is mounted
 read-only; writes remain in private COW storage. `create`/`start`, resource

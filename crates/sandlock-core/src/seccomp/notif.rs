@@ -753,6 +753,7 @@ pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> io::Result<OwnedFd> {
 
 /// Policy for the notification supervisor.
 pub struct NotifPolicy {
+    pub(crate) read_devices: Vec<super::read_devices::ReadDevice>,
     pub max_memory_bytes: u64,
     pub max_processes: u32,
     pub has_memory_limit: bool,

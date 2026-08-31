@@ -401,6 +401,28 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // Preopened read-only devices. Dynamic denials are checked before dispatch;
+    // deterministic random opens above must win over real entropy delivery.
+    // ------------------------------------------------------------------
+    if !policy.read_devices.is_empty() {
+        for nr in open_family_syscalls() {
+            let devices_policy = Arc::clone(policy);
+            let devices_ctx = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let policy = Arc::clone(&devices_policy);
+                let ctx = Arc::clone(&devices_ctx);
+                async move {
+                    let pfs = ctx.policy_fn.lock().await;
+                    super::read_devices::open(&notif, notif_fd, &policy.read_devices, &pfs)
+                        .unwrap_or(NotifAction::Continue)
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Timer adjustment (conditional on has_time_start)
     // ------------------------------------------------------------------
     if policy.has_time_start {
@@ -1120,6 +1142,7 @@ mod handler_tests {
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
             policy: Arc::new(NotifPolicy {
+                read_devices: Vec::new(),
                 max_memory_bytes: 0,
                 max_processes: 0,
                 has_memory_limit: false,

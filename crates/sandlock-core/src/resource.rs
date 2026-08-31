@@ -1315,6 +1315,7 @@ mod tests {
 
     fn fake_policy(argv_safety_required: bool) -> NotifPolicy {
         NotifPolicy {
+            read_devices: Vec::new(),
             max_memory_bytes: 0,
             max_processes: 0,
             has_memory_limit: false,
