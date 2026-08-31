@@ -1120,6 +1120,7 @@ mod handler_tests {
     /// can call `dispatch()`.
     fn fake_supervisor_ctx() -> Arc<SupervisorCtx> {
         Arc::new(SupervisorCtx {
+            domain: None,
             resource: Arc::new(Mutex::new(ResourceState::new(0, 0))),
             cow: Arc::new(Mutex::new(CowState::new())),
             procfs: Arc::new(Mutex::new(ProcfsState::new())),

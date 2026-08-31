@@ -356,6 +356,9 @@ pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Ve
 pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     let features = &resolved.features;
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
+    if features.session_domain {
+        nrs.extend(&[libc::SYS_execve, libc::SYS_execveat]);
+    }
     nrs.push_optional(arch::sys_vfork());
     // Every process-creation spelling is intercepted so its successful child
     // can be captured with ptrace and paired with a pidfd exit watcher. Quota
@@ -452,11 +455,11 @@ fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
             None => vec![name.as_str()],
         }
     });
-    let execution_denies = policy
-        .has_attached_execution()
-        .then_some(["setsid", "setpgid"])
-        .into_iter()
-        .flatten();
+    let execution_denies = if policy.session_domain_required {
+        vec!["setsid"]
+    } else if policy.has_attached_execution() {
+        vec!["setsid", "setpgid"]
+    } else { Vec::new() };
     let mut set: SysnoSet = base
         .iter()
         .copied()
@@ -511,6 +514,19 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     let nr_socket = libc::SYS_socket as u32;
 
     let mut insns: Vec<SockFilter> = Vec::new();
+
+    if features.session_domain {
+        // clone3 flags live in mutable user memory. Force the libc clone
+        // fallback, and prevent bypassing the one-shot birth tracer.
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone3 as u32, 0, 1));
+        insns.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_clone, 0, 3));
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_ARGS0_LO));
+        insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, libc::CLONE_UNTRACED as u32, 0, 1));
+        insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+    }
 
     // --- clone: block namespace creation flags ---
     // 5 instructions:

@@ -383,6 +383,7 @@ struct Runtime {
     payload_pid: Option<i32>,
     /// Workload process group controlled by pause/resume/kill.
     process_group: Option<i32>,
+    domain: Option<Arc<crate::execution_domain::ExecutionDomain>>,
     pidfd: Option<std::os::fd::OwnedFd>,
     supervised_pidfd: Option<std::os::fd::OwnedFd>,
     notif_handle: Option<JoinHandle<()>>,
@@ -790,6 +791,10 @@ pub struct Sandbox {
     #[serde(skip)]
     runtime: Option<Box<Runtime>>,
 
+    /// Hosted execution ownership requirement; not a persisted policy field.
+    #[serde(skip)]
+    pub(crate) session_domain_required: bool,
+
     // Fds the last `restore_interactive` could not transparently recreate.
     // Runtime state: not serialized, not cloned.
     #[serde(skip)]
@@ -889,6 +894,7 @@ impl Clone for Sandbox {
             keep_branch_if_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Runtime is NOT cloned — the clone starts with no runtime.
             runtime: None,
+            session_domain_required: self.session_domain_required,
             // Restore diagnostics belong to the original's run, not the clone.
             restore_skipped: Vec::new(),
         }
@@ -1018,6 +1024,29 @@ impl Drop for PauseGuard<'_> {
 }
 
 impl Sandbox {
+    /// Require a private, supervisor-managed session for the next execution.
+    /// Call before create. This does not change serialized policy or enable a
+    /// supervisor implicitly, and is incompatible with inherited terminal job control.
+    pub fn enable_session_domain(&mut self) -> Result<(), crate::error::SandlockError> {
+        if self.no_supervisor || self.init_fn.is_some() || self.work_fn.is_some() {
+            return Err(crate::error::SandboxRuntimeError::Child(
+                "session domains require a supervised command execution".into(),
+            ).into());
+        }
+        if self.runtime.as_ref().is_some_and(|rt| rt.child_pid.is_some()) {
+            return Err(crate::error::SandboxRuntimeError::Child(
+                "session domain must be enabled before create".into(),
+            ).into());
+        }
+        self.session_domain_required = true;
+        Ok(())
+    }
+
+    /// Live complete-domain controller, available after managed create.
+    pub fn execution_domain(&self) -> Option<Arc<crate::execution_domain::ExecutionDomain>> {
+        self.runtime.as_ref().and_then(|rt| rt.domain.clone())
+    }
+
     pub fn builder() -> SandboxBuilder {
         SandboxBuilder::default()
     }
@@ -1216,6 +1245,11 @@ impl Sandbox {
     /// Send SIGSTOP to the child's process group.
     pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
+        if let Some(domain) = self.execution_domain() {
+            domain.signal(libc::SIGSTOP).map_err(SandboxRuntimeError::Io)?;
+            self.rt_mut().state = RuntimeState::Paused;
+            return Ok(());
+        }
         let pid = self
             .runtime
             .as_ref()
@@ -1232,6 +1266,11 @@ impl Sandbox {
     /// Send SIGCONT to the child's process group.
     pub fn resume(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
+        if let Some(domain) = self.execution_domain() {
+            domain.resume().map_err(SandboxRuntimeError::Io)?;
+            self.rt_mut().state = RuntimeState::Running;
+            return Ok(());
+        }
         let pid = self
             .runtime
             .as_ref()
@@ -1254,6 +1293,23 @@ impl Sandbox {
         timeout: std::time::Duration,
     ) -> Result<PauseGuard<'_>, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
+
+        if let Some(domain) = self.execution_domain() {
+            let restart_throttle = self.stop_cpu_throttle().await;
+            if let Err(error) = domain.pause_and_wait(timeout).await {
+                domain.resume().map_err(SandboxRuntimeError::Io)?;
+                if restart_throttle {
+                    self.restart_cpu_throttle();
+                }
+                return Err(SandboxRuntimeError::Io(error).into());
+            }
+            self.rt_mut().state = RuntimeState::Paused;
+            return Ok(PauseGuard {
+                sandbox: self,
+                active: true,
+                restart_throttle,
+            });
+        }
 
         let pid = self
             .runtime
@@ -1333,12 +1389,16 @@ impl Sandbox {
         let Some(child_pid) = runtime.process_group else {
             return;
         };
-        runtime.throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
+        runtime.throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct, runtime.domain.clone())));
     }
 
     /// Send SIGKILL to the child's process group.
     pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
+        if let Some(domain) = self.execution_domain() {
+            domain.signal(libc::SIGKILL).map_err(SandboxRuntimeError::Io)?;
+            return Ok(());
+        }
         let pid = self
             .runtime
             .as_ref()
@@ -1468,6 +1528,23 @@ impl Sandbox {
         // process group and retry this path without falling back to waitpid,
         // which can steal a ptrace fork/exec stop from the notification
         // supervisor and mistake that stop for terminal child exit.
+        if let Some(domain) = self.execution_domain() {
+            if domain.is_terminating() {
+                self.stop_cpu_throttle().await;
+                domain.terminate_and_wait(std::time::Duration::from_secs(5))
+                    .await.map_err(SandboxRuntimeError::Io)?;
+            }
+            let pidfd = self.rt().pidfd.as_ref().ok_or_else(|| {
+                SandboxRuntimeError::Child("managed session has no anchor pidfd".into())
+            })?;
+            let observer = tokio::io::unix::AsyncFd::new(
+                pidfd.try_clone().map_err(SandboxRuntimeError::Io)?
+            ).map_err(SandboxRuntimeError::Io)?;
+            let _ready = observer.readable().await.map_err(SandboxRuntimeError::Io)?;
+            self.stop_cpu_throttle().await;
+            domain.terminate_and_wait(std::time::Duration::from_secs(5))
+                .await.map_err(SandboxRuntimeError::Io)?;
+        }
         let exit_status = match self.rt().pidfd.as_ref() {
             Some(pidfd) => {
                 let duplicate = pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
@@ -1878,6 +1955,9 @@ impl Sandbox {
     /// Freeze the sandbox: hold fork notifications + SIGSTOP the process group.
     pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
+        if let Some(domain) = self.execution_domain() {
+            return domain.pause_and_wait(std::time::Duration::from_secs(5)).await.map_err(SandboxRuntimeError::Io).map_err(Into::into);
+        }
         let rt = self
             .runtime
             .as_ref()
@@ -1898,6 +1978,9 @@ impl Sandbox {
     /// Thaw the sandbox: release held fork notifications + SIGCONT.
     pub(crate) async fn thaw(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
+        if let Some(domain) = self.execution_domain() {
+            return domain.resume().map_err(SandboxRuntimeError::Io).map_err(Into::into);
+        }
         let rt = self
             .runtime
             .as_ref()
@@ -2138,7 +2221,9 @@ impl Sandbox {
         {
             return Err(SandboxRuntimeError::Branch(BranchError::NotReady).into());
         }
-        if let Some(pid) = runtime.process_group {
+        if let Some(domain) = runtime.domain.as_ref() {
+            domain.terminate_and_wait(std::time::Duration::from_secs(5)).await.map_err(SandboxRuntimeError::Io)?;
+        } else if let Some(pid) = runtime.process_group {
             quiesce_process_group(pid, runtime.supervisor_resource.as_ref())
                 .await
                 .map_err(SandboxRuntimeError::Io)?;
@@ -2335,6 +2420,12 @@ impl Sandbox {
         use crate::error::SandboxRuntimeError;
         use std::os::fd::{FromRawFd, OwnedFd};
 
+        if self.session_domain_required {
+            return Err(SandboxRuntimeError::Child(
+                "managed session domains support command execution, not callback fork".into(),
+            ).into());
+        }
+
         // Pull init_fn / work_fn directly from self (they live on Sandbox, not
         // Runtime, so ensure_runtime hasn't consumed them yet).
         let init_fn = self.init_fn.take()
@@ -2455,6 +2546,7 @@ impl Sandbox {
                 child_pid: Some(clone_pid),
                 payload_pid: Some(clone_pid),
                 process_group: Some(clone_pid),
+                domain: None,
                 pidfd: None,
                 supervised_pidfd: None,
                 notif_handle: None,
@@ -2576,6 +2668,7 @@ impl Sandbox {
             child_pid: None,
             payload_pid: None,
             process_group: None,
+            domain: None,
             pidfd: None,
             supervised_pidfd: None,
             notif_handle: None,
@@ -2686,6 +2779,14 @@ impl Sandbox {
 
         if !matches!(self.rt().state, RuntimeState::Created) {
             return Err(SandboxRuntimeError::Child("sandbox already spawned".into()).into());
+        }
+
+        // SAFETY: isatty only inspects the inherited stdin descriptor.
+        let inherited_terminal = stdio.all_inherit()
+            && self.rt().pty_slave.is_none()
+            && unsafe { libc::isatty(0) } == 1;
+        if self.session_domain_required && (self.no_supervisor || inherited_terminal) {
+            return Err(SandboxRuntimeError::Child("managed sessions require a supervisor and a dedicated PTY or non-terminal stdio".into()).into());
         }
 
         if cmd.is_empty() {
@@ -2972,6 +3073,14 @@ impl Sandbox {
                     unsafe { libc::_exit(127) };
                 }
                 true
+            } else if self.session_domain_required {
+                // SAFETY: only the just-forked child changes its own session.
+                if unsafe { libc::setsid() } < 0 {
+                    crate::context::report_exec_failure(pipes.exec_status_w.as_raw_fd(), "session setup", std::io::Error::last_os_error().raw_os_error());
+                    // SAFETY: stop the failed fork child without running parent destructors.
+                    unsafe { libc::_exit(127) };
+                }
+                true
             } else {
                 false
             };
@@ -3127,6 +3236,17 @@ impl Sandbox {
         };
         self.rt_mut().payload_pid = Some(payload_pid);
         self.rt_mut().process_group = Some(payload_pid);
+        if self.session_domain_required {
+            if notif_fd.is_none() {
+                return Err(SandboxRuntimeError::Child(
+                    "managed session has no notification supervisor".into(),
+                ).into());
+            }
+            self.rt_mut().domain = Some(
+                crate::execution_domain::ExecutionDomain::capture(pid)
+                    .map_err(SandboxRuntimeError::Io)?
+            );
+        }
 
         // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
         // can discover and list them.  The control socket is only created when
@@ -3449,6 +3569,7 @@ impl Sandbox {
                 chroot: Arc::clone(&chroot_state),
                 netlink: Arc::new(crate::netlink::NetlinkState::new()),
                 processes: Arc::clone(&processes),
+                domain: self.execution_domain(),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
                 notif_fd: notif_raw_fd,
@@ -3517,7 +3638,7 @@ impl Sandbox {
             if cpu_pct < 100 {
                 let child_pid = payload_pid;
                 self.rt_mut().throttle_handle =
-                    Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
+                    Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct, self.execution_domain())));
             }
         }
 
@@ -3650,6 +3771,17 @@ fn sandbox_restore_tty_foreground(child_pid: i32) {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        if let Some(domain) = self.execution_domain() {
+            if let Err(error) = domain.terminate_blocking(std::time::Duration::from_secs(2)) {
+                // Drop cannot await outstanding syscall handlers. Retain the
+                // anchor, listener and branch instead of freeing a live writer's
+                // storage or reaping its identity. Explicit wait is the normal path.
+                self.keep_branch_if_abandoned.store(true, std::sync::atomic::Ordering::Release);
+                eprintln!("sandlock: retaining indeterminate execution domain: {error}");
+                if let Some(runtime) = self.runtime.take() { let _ = Box::leak(runtime); }
+                return;
+            }
+        }
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
                 let process_group = rt.process_group.unwrap_or(pid);
@@ -3657,14 +3789,14 @@ impl Drop for Sandbox {
                 // remaining descendants even when the top-level child was
                 // already reaped; the Attached marker remains non-actionable
                 // if teardown cannot prove the complete group is gone.
-                if rt.attached_execution {
+                if rt.attached_execution && rt.domain.is_none() {
                     unsafe { libc::killpg(process_group, libc::SIGKILL) };
                 }
                 if matches!(
                     rt.state,
                     RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused
                 ) {
-                    unsafe { libc::killpg(process_group, libc::SIGKILL) };
+                    if rt.domain.is_none() { unsafe { libc::killpg(process_group, libc::SIGKILL) }; }
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
                 }
@@ -3738,13 +3870,23 @@ impl Drop for Sandbox {
 // CPU throttle
 // ================================================================
 
-async fn sandbox_throttle_cpu(pid: i32, cpu_pct: u8) {
+async fn sandbox_throttle_cpu(pid: i32, cpu_pct: u8, domain: Option<Arc<crate::execution_domain::ExecutionDomain>>) {
     use std::time::Duration;
     let period = Duration::from_millis(100);
     let run_time = period * cpu_pct as u32 / 100;
     let stop_time = period - run_time;
+    let _throttle_guard = domain.as_ref().map(|domain| domain.throttle_guard());
     loop {
         tokio::time::sleep(run_time).await;
+        if let Some(domain) = &domain {
+            if domain.throttle_pause(Duration::from_secs(2)).await.is_err() {
+                let _ = domain.signal(libc::SIGKILL);
+                break;
+            }
+            tokio::time::sleep(stop_time).await;
+            if domain.throttle_resume().is_err() { break; }
+            continue;
+        }
         if unsafe { libc::killpg(pid, libc::SIGSTOP) } < 0 {
             break;
         }

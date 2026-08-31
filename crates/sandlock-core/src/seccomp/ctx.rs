@@ -33,6 +33,8 @@ pub struct SupervisorCtx {
     /// populated lazily from notifications. Wraps an internal RwLock, so
     /// handlers can query it synchronously without `.await`.
     pub processes: Arc<ProcessIndex>,
+    /// Hosted session lifecycle (not part of serialized syscall policy).
+    pub domain: Option<Arc<crate::execution_domain::ExecutionDomain>>,
     /// Immutable policy — no lock needed.
     pub policy: Arc<NotifPolicy>,
     /// pidfd for the child process (immutable after spawn).

@@ -433,7 +433,24 @@ pub(crate) async fn prepare_process_creation_tracking(
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<TraceCmd>(1);
 
     let join = tokio::task::spawn_blocking(move || {
-        process_creation_worker(caller_tid, worker_ctx, process_slot, attached_tx, cmd_rx)
+        if worker_ctx.domain.is_some() {
+            let runtime = tokio::runtime::Handle::current();
+            // A killed tracee may become a ptrace zombie before DETACH. A
+            // reusable blocking-pool thread would retain that attachment and
+            // prevent thread-group exit forever. This bounded, one-shot owner
+            // exits before completion is acknowledged, so kernel ptrace
+            // cleanup also finishes before the domain gate admits a freeze.
+            std::thread::Builder::new()
+                .name("sandlock-domain-birth".into())
+                .spawn(move || {
+                    let _entered = runtime.enter();
+                    process_creation_worker(caller_tid, worker_ctx, process_slot, attached_tx, cmd_rx)
+                })?
+                .join()
+                .map_err(|_| io::Error::other("managed birth tracker panicked"))?
+        } else {
+            process_creation_worker(caller_tid, worker_ctx, process_slot, attached_tx, cmd_rx)
+        }
     });
 
     match attached_rx.await {
@@ -474,10 +491,13 @@ fn process_creation_worker(
     // SEIZE (does NOT stop the tracee) before `Continue`, so the child is born
     // traced/stopped once the fork runs. Because SEIZE itself never blocks on
     // a stop, it is safe against the seccomp-notify wait the tracee sits in.
-    let opts = (libc::PTRACE_O_TRACEFORK
+    let mut opts = (libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACEVFORK
         | libc::PTRACE_O_TRACECLONE
         | libc::PTRACE_O_TRACESYSGOOD) as libc::c_ulong;
+    if ctx.domain.is_some() {
+        opts |= libc::PTRACE_O_EXITKILL as libc::c_ulong;
+    }
     let ret = unsafe { libc::ptrace(libc::PTRACE_SEIZE as _, caller_tid, 0, opts) };
     if ret < 0 {
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
@@ -708,7 +728,15 @@ fn run_creation_event_loop(
 ) -> io::Result<bool> {
     loop {
         let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(caller_tid, &mut status, libc::__WALL) };
+        let r = if ctx.domain.as_ref().is_some_and(|domain| domain.descriptor().session_id == caller_tid) {
+            match wait_managed_trace_stop(caller_tid) {
+                Ok(Some(stop)) => { status = stop; caller_tid },
+                Ok(None) => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        } else {
+            unsafe { libc::waitpid(caller_tid, &mut status, libc::__WALL) }
+        };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -764,6 +792,23 @@ fn ptrace_resume(tid: i32, request: libc::c_uint, data: libc::c_ulong) -> io::Re
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Consume ptrace stops, but never reap a managed session's identity anchor.
+fn wait_managed_trace_stop(tid: i32) -> io::Result<Option<i32>> {
+    loop {
+        // SAFETY: waitid initializes this siginfo; tid is the trace worker's tracee.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::waitid(libc::P_PID, tid as libc::id_t, &mut info, libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT | libc::__WALL) };
+        if rc < 0 { return Err(io::Error::last_os_error()); }
+        if matches!(info.si_code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED) { return Ok(None); }
+        // WSTOPPED-only consumption cannot steal terminal status if SIGKILL
+        // races the preceding peek. WNOHANG avoids waiting on a vanished stop.
+        let rc = unsafe { libc::waitid(libc::P_PID, tid as libc::id_t, &mut info, libc::WSTOPPED | libc::WNOHANG | libc::__WALL) };
+        if rc < 0 { return Err(io::Error::last_os_error()); }
+        // SAFETY: successful waitid supplies the SIGCHLD variant of siginfo.
+        if unsafe { info.si_pid() } != 0 { return Ok(Some((unsafe { info.si_status() } << 8) | 0x7f)); }
+    }
 }
 
 /// On a `PTRACE_EVENT_{FORK,VFORK,CLONE}`: read the new child's pid, register
@@ -857,7 +902,9 @@ pub(crate) async fn finish_process_creation_tracking(
                     // the notification loop or a tracee forever. Kill the
                     // complete process group before abandoning the worker so a
                     // late fork cannot escape accounting.
-                    caller.kill_execution();
+                    if let Some(domain) = &diagnostic_ctx.domain {
+                        let _ = domain.signal(libc::SIGKILL);
+                    } else { caller.kill_execution(); }
                     let resource = diagnostic_ctx.resource.try_lock().ok();
                     emit_spawn_diagnostic(
                         &diagnostic_ctx,
@@ -1298,6 +1345,7 @@ mod tests {
 
     fn fake_supervisor_ctx(argv_safety_required: bool) -> Arc<SupervisorCtx> {
         Arc::new(SupervisorCtx {
+            domain: None,
             resource: Arc::new(Mutex::new(ResourceState::new(0, 0))),
             cow: Arc::new(Mutex::new(CowState::new())),
             procfs: Arc::new(Mutex::new(ProcfsState::new())),

@@ -168,13 +168,23 @@ pub fn install_deny_filter(prog: &[SockFilter]) -> std::io::Result<()> {
 ///
 /// Returns the seccomp notification file descriptor.
 pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<OwnedFd> {
+    install_filter_for_domain(prog, false)
+}
+
+/// Managed-domain freezing relies on received notifications remaining parked
+/// until a reply or fatal signal. Do not fall back without that kernel promise.
+pub(crate) fn install_filter_for_domain(
+    prog: &[SockFilter],
+    require_killable_recv: bool,
+) -> std::io::Result<OwnedFd> {
     let fprog = SockFprog {
         len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
-    let fd = install_with_einval_fallback(
+    let fd = install_with_required_flags(
         SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
         SECCOMP_FILTER_FLAG_NEW_LISTENER,
+        require_killable_recv,
         |flags| {
             seccomp(
                 SECCOMP_SET_MODE_FILTER,
@@ -185,6 +195,22 @@ pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<OwnedFd> {
     )?;
     // SAFETY: kernel returns a valid fd on success
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+fn install_with_required_flags<F>(
+    preferred: u64,
+    fallback: u64,
+    required: bool,
+    mut install: F,
+) -> std::io::Result<i64>
+where
+    F: FnMut(u64) -> std::io::Result<i64>,
+{
+    if required {
+        install(preferred)
+    } else {
+        install_with_einval_fallback(preferred, fallback, install)
+    }
 }
 
 /// Call `install` with `preferred_flags`; on `EINVAL`, retry with `fallback_flags`.
@@ -213,6 +239,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_filter_never_retries_without_killable_recv() {
+        let mut calls = Vec::new();
+        let result = install_with_required_flags(3, 1, true, |flags| {
+            calls.push(flags);
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(calls, vec![3]);
+    }
 
     #[test]
     fn test_empty_filter_has_arch_check_and_allow() {

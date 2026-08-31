@@ -1,6 +1,9 @@
 #[path = "integration/test_policy.rs"]
 mod test_policy;
 
+#[path = "integration/test_execution_domain.rs"]
+mod test_execution_domain;
+
 #[path = "integration/test_sandbox.rs"]
 mod test_sandbox;
 

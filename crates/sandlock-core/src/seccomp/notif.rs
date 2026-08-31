@@ -2183,9 +2183,11 @@ fn spawn_deferred(
     id: u64,
     deferred: Deferred,
     permit: tokio::sync::OwnedSemaphorePermit,
+    domain_permit: Option<crate::execution_domain::NotificationPermit>,
 ) {
     tokio::spawn(async move {
         let _permit = permit; // released when the worker finishes
+        let _domain_permit = domain_permit;
         let action = run_deferred_within(deferred, DEFER_TIMEOUT).await;
         let _ = send_response(fd, id, action);
     });
@@ -2199,6 +2201,15 @@ async fn handle_notification(
     defer_sem: &Arc<tokio::sync::Semaphore>,
 ) {
     let policy = &ctx.policy;
+    let domain_permit = if let Some(domain) = &ctx.domain {
+        use crate::execution_domain::Admission;
+        match domain.gate.enter(notif) {
+            Admission::Run(permit) => Some(permit),
+            Admission::Held => return,
+            Admission::Full => { let _ = respond_errno(fd, notif.id, libc::EAGAIN); return; }
+        }
+    } else { None };
+    if id_valid(fd, notif.id).is_err() { return; }
 
     // Ensure every pid that produces a notification has per-process
     // supervisor state and an exit watcher. The fork handler runs on
@@ -2279,6 +2290,7 @@ async fn handle_notification(
         match crate::freeze::prepare_exec_freeze(
             Arc::clone(&ctx.processes),
             notif.pid as i32,
+            ctx.domain.clone(),
         )
         .await
         {
@@ -2329,7 +2341,8 @@ async fn handle_notification(
     // peer could exist without ever having produced a notification.
     let mut creation_trace = None;
     if matches!(action, NotifAction::Continue)
-        && crate::resource::requires_process_creation_tracking(&notif, fd)
+        && (crate::resource::requires_process_creation_tracking(&notif, fd)
+            || ctx.domain.is_some() && crate::arch::fork_like_syscalls().contains(&nr))
     {
         match crate::resource::prepare_process_creation_tracking(
             ctx,
@@ -2373,7 +2386,7 @@ async fn handle_notification(
             return;
         }
         match Arc::clone(defer_sem).try_acquire_owned() {
-            Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit),
+            Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit, domain_permit),
             // Too many deferrals in flight: fail fast with EAGAIN rather than
             // blocking the loop or letting unbounded workers accrete.
             Err(_) => {
@@ -2396,6 +2409,9 @@ async fn handle_notification(
                 }
                 Err(e) => {
                     crate::resource::rollback_fork_count(&ctx.resource, notif.id).await;
+                    if let Some(domain) = &ctx.domain {
+                        let _ = domain.signal(libc::SIGKILL);
+                    }
                     eprintln!(
                         "sandlock: process-creation tracking completion failed for pid {}: {}",
                         notif.pid, e
@@ -2415,6 +2431,9 @@ async fn handle_notification(
         )
         .await
         {
+            if let Some(domain) = &ctx.domain {
+                let _ = domain.signal(libc::SIGKILL);
+            }
             crate::freeze::emit_exec_freeze_diagnostic(
                 &ctx.processes,
                 notif.pid as i32,
@@ -2455,6 +2474,7 @@ pub async fn supervisor(
         }
     };
     let fd = async_fd.get_ref().as_raw_fd();
+    if let Some(domain) = &ctx.domain { domain.gate.attach(fd); }
 
     // Build the dispatch table once at startup.
     let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
@@ -2497,7 +2517,17 @@ pub async fn supervisor(
     // Notifications are processed sequentially (not spawned) to avoid
     // mutex contention between concurrent handlers.
     'outer: loop {
-        let mut ready = match async_fd.readable().await {
+        if let Some(notif) = ctx.domain.as_ref().and_then(|domain| domain.gate.pop()) {
+            handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
+            continue;
+        }
+        let readiness = if let Some(domain) = &ctx.domain {
+            tokio::select! {
+                ready = async_fd.readable() => ready,
+                () = domain.gate.changed.notified() => continue,
+            }
+        } else { async_fd.readable().await };
+        let mut ready = match readiness {
             Ok(r) => r,
             Err(_) => break 'outer,
         };

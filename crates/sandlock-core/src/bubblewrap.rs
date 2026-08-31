@@ -370,6 +370,10 @@ impl PreparedBubblewrap {
         }
         push_arg(&mut argv, "--foreground")?;
         push_arg(&mut argv, if foreground { "1" } else { "0" })?;
+        if sandbox.session_domain_required {
+            push_arg(&mut argv, "--session-domain")?;
+            push_arg(&mut argv, "1")?;
+        }
         for fd in extra_target_fds {
             push_arg(&mut argv, "--keep-fd")?;
             push_arg(&mut argv, fd.to_string())?;

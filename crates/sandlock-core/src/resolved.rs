@@ -29,6 +29,7 @@ impl ResolvedSandbox {
 /// the same `Option`/empty-list checks in several places.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SandboxFeatures {
+    pub(crate) session_domain: bool,
     pub(crate) memory_limit: bool,
     pub(crate) network_supervision: bool,
     pub(crate) network_destination_policy: bool,
@@ -69,6 +70,7 @@ impl SandboxFeatures {
 
         Self {
             memory_limit: sandbox.max_memory.is_some(),
+            session_domain: sandbox.session_domain_required,
             network_supervision: network_destination_policy || bind_denylist,
             network_destination_policy,
             bind_denylist,

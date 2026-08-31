@@ -12,6 +12,7 @@ pub(crate) mod cow;
 pub(crate) mod credential;
 pub mod dry_run;
 pub mod error;
+pub mod execution_domain;
 pub mod filesystem_backend;
 pub mod fork;
 pub(crate) mod freeze;

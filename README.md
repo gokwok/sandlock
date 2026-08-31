@@ -655,6 +655,12 @@ content-aware diff and incremental checkpoint indexing.
 See [`docs/filesystem-snapshots.md`](docs/filesystem-snapshots.md) for the Rust
 API, consistency boundary, persistence model, and supported filesystem types.
 
+Hosted Rust runtimes can explicitly enable a private, managed Linux session
+before launch. Native tools may create process groups while pause, kill and
+cleanup cover the complete session. See
+[`docs/execution-domains.md`](docs/execution-domains.md) for identity retention,
+freeze failure semantics and kernel requirements.
+
 Run the complete two-candidate example on Linux:
 
 ```sh

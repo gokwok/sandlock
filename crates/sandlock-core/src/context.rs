@@ -636,7 +636,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
         };
-        let notif_fd = match bpf::install_filter(&filter) {
+        let notif_fd = match bpf::install_filter_for_domain(&filter, sandbox.session_domain_required) {
             Ok(fd) => fd,
             Err(e) => {
                 // EBUSY here means another seccomp filter on this task already

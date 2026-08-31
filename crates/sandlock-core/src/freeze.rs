@@ -98,6 +98,35 @@ fn traced_by_this_supervisor(tid: i32) -> bool {
         == i32::try_from(std::process::id()).ok()
 }
 
+// Only the execution owner may reap its identity anchor. A ptrace worker may
+// observe a terminal event, but must consume stops only (including on errors).
+fn wait_trace_stop(tid: i32, status: &mut i32, anchor: Option<i32>) -> i32 {
+    if anchor != Some(tid) {
+        // SAFETY: owned non-anchor tracee; dead threads must be collected so
+        // they cannot retain the process's thread-group exit indefinitely.
+        return unsafe { libc::waitpid(tid, status, libc::__WALL | libc::WNOHANG) };
+    }
+    // SAFETY: waitid writes one initialized siginfo for this worker's tracee.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(libc::P_PID, tid as libc::id_t, &mut info,
+            libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG | libc::__WALL)
+    };
+    if result < 0 || unsafe { info.si_pid() } == 0 { return result; }
+    if matches!(info.si_code, libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED) {
+        *status = 0; // Terminal; exact exit status belongs to the execution owner.
+        return tid;
+    }
+    // SAFETY: WSTOPPED cannot consume terminal status if exit races the peek.
+    let result = unsafe {
+        libc::waitid(libc::P_PID, tid as libc::id_t, &mut info,
+            libc::WSTOPPED | libc::WNOHANG | libc::__WALL)
+    };
+    if result < 0 || unsafe { info.si_pid() } == 0 { return result; }
+    *status = (unsafe { info.si_status() } << 8) | 0x7f;
+    tid
+}
+
 /// What `seize_and_interrupt` did with one tid.
 #[derive(Debug, PartialEq, Eq)]
 enum SeizeOutcome {
@@ -136,7 +165,7 @@ enum SeizeOutcome {
 /// On a partial-progress failure (PTRACE_SEIZE succeeded but
 /// PTRACE_INTERRUPT did not), the function detaches itself before
 /// returning so the caller doesn't have to track partial state.
-fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
+fn seize_and_interrupt(tid: i32, anchor: Option<i32>) -> io::Result<SeizeOutcome> {
     // Fast path: the kernel is already holding this task; it cannot mutate
     // user memory and does not need an attachment.
     if let Some('D' | 'Z' | 'X') = read_task_state(tid) {
@@ -206,7 +235,7 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
         let mut status: i32 = 0;
-        let r = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+        let r = wait_trace_stop(tid, &mut status, anchor);
         if r == tid {
             if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
                 return Ok(SeizeOutcome::NotNeeded);
@@ -329,6 +358,7 @@ pub(crate) struct ExecFreezeTrace {
     join: Option<std::thread::JoinHandle<io::Result<()>>>,
     caller_tid: i32,
     processes: Arc<crate::seccomp::state::ProcessIndex>,
+    domain: Option<Arc<crate::execution_domain::ExecutionDomain>>,
     signaled: bool,
 }
 
@@ -363,8 +393,10 @@ impl Drop for ExecFreezeActivity {
 pub(crate) async fn prepare_exec_freeze(
     processes: Arc<crate::seccomp::state::ProcessIndex>,
     caller_tid: i32,
+    domain: Option<Arc<crate::execution_domain::ExecutionDomain>>,
 ) -> io::Result<ExecFreezePreparation> {
     let worker_processes = Arc::clone(&processes);
+    let anchor = domain.as_ref().map(|domain| domain.descriptor().session_id);
     let (prepared_tx, prepared_rx) = tokio::sync::oneshot::channel::<Option<String>>();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<ExecFreezeCommand>(1);
     let join = std::thread::Builder::new()
@@ -372,10 +404,10 @@ pub(crate) async fn prepare_exec_freeze(
         .spawn(move || {
             worker_processes.exec_freeze_started();
             let _activity = ExecFreezeActivity(Arc::clone(&worker_processes));
-            let freeze = freeze_sandbox_for_execve(&worker_processes, caller_tid);
+            let freeze = freeze_sandbox_for_execve(&worker_processes, caller_tid, anchor);
             let failure = freeze.as_ref().err().map(ToString::to_string);
             if prepared_tx.send(failure).is_err() {
-                cleanup_exec_freeze(freeze, false)?;
+                cleanup_exec_freeze(freeze, false, anchor)?;
                 return Ok(());
             }
             let exec_continued = matches!(
@@ -384,7 +416,7 @@ pub(crate) async fn prepare_exec_freeze(
                     exec_continued: true
                 })
             );
-            cleanup_exec_freeze(freeze, exec_continued)
+            cleanup_exec_freeze(freeze, exec_continued, anchor)
         })?;
 
     match prepared_rx.await {
@@ -394,6 +426,7 @@ pub(crate) async fn prepare_exec_freeze(
                 join: Some(join),
                 caller_tid,
                 processes,
+                domain,
                 signaled: false,
             },
             failure,
@@ -431,7 +464,11 @@ pub(crate) async fn finish_exec_freeze(
             io::Error::other(format!("exec freeze join task failed: {error}"))
         })?,
         Err(_) => {
-            kill_execution_group(caller_tid);
+            if let Some(domain) = &trace.domain {
+                let _ = domain.signal(libc::SIGKILL);
+            } else {
+                kill_execution_group(caller_tid);
+            }
             emit_exec_freeze_diagnostic(
                 &processes,
                 caller_tid,
@@ -475,6 +512,7 @@ fn join_exec_freeze_thread_blocking(
 fn cleanup_exec_freeze(
     freeze: Result<SandboxFreeze, FreezeError>,
     exec_continued: bool,
+    anchor: Option<i32>,
 ) -> io::Result<()> {
     let mut cleanup_error = None;
     let mut record = |result: io::Result<()>| {
@@ -492,9 +530,9 @@ fn cleanup_exec_freeze(
                 record(detach_tids_checked(&freeze.sibling_tids));
                 record(detach_tids_checked(&freeze.peer_tids));
             }
-            record(reap_pending_checked(&freeze.pending_tids));
+            record(reap_pending_checked(&freeze.pending_tids, anchor));
         }
-        Err(error) => record(reap_pending_checked(&error.pending_tids)),
+        Err(error) => record(reap_pending_checked(&error.pending_tids, anchor)),
     }
     cleanup_error.map_or(Ok(()), Err)
 }
@@ -516,12 +554,12 @@ fn detach_tids_checked(tids: &[i32]) -> io::Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-fn reap_pending_checked(pending: &[i32]) -> io::Result<()> {
+fn reap_pending_checked(pending: &[i32], anchor: Option<i32>) -> io::Result<()> {
     for &tid in pending {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let mut status: i32 = 0;
-            let result = unsafe { libc::waitpid(tid, &mut status, libc::__WALL | libc::WNOHANG) };
+            let result = wait_trace_stop(tid, &mut status, anchor);
             if result == tid {
                 if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
                     break;
@@ -625,6 +663,7 @@ pub(crate) fn emit_exec_freeze_diagnostic(
 pub(crate) fn freeze_sandbox_for_execve(
     processes: &crate::seccomp::state::ProcessIndex,
     caller_tid: i32,
+    anchor: Option<i32>,
 ) -> Result<SandboxFreeze, FreezeError> {
     let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
     let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
@@ -656,7 +695,7 @@ pub(crate) fn freeze_sandbox_for_execve(
             if tid == caller_tid {
                 continue;
             }
-            match seize_and_interrupt(tid) {
+            match seize_and_interrupt(tid, anchor) {
                 Ok(SeizeOutcome::Frozen) => {
                     if *tgid == caller_tgid {
                         sibling_tids.push(tid);
@@ -780,7 +819,7 @@ mod tests {
             .register(peer_pid)
             .expect("register peer in ProcessIndex");
 
-        let outcome = freeze_sandbox_for_execve(&processes, caller_tid)
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid, None)
             .expect("freeze_sandbox_for_execve");
 
         // Peer's TID is its own TGID (single-threaded sleep), and it's
@@ -868,7 +907,7 @@ mod tests {
             Err(errno) => panic!("first tracer failed with errno {errno}"),
         }
 
-        let outcome = seize_and_interrupt(peer_pid)
+        let outcome = seize_and_interrupt(peer_pid, None)
             .expect("exec freeze should wait for the supervisor-owned tracer to detach");
         assert_eq!(outcome, SeizeOutcome::Frozen);
         first_tracer.join().expect("join first tracer");
@@ -919,7 +958,7 @@ mod tests {
                 .register(*tid)
                 .unwrap_or_else(|| panic!("register peer tid {tid}"));
         }
-        let outcome = freeze_sandbox_for_execve(&processes, caller_tid)
+        let outcome = freeze_sandbox_for_execve(&processes, caller_tid, None)
             .expect("each peer thread must be seized exactly once");
         assert_eq!(
             outcome.peer_tids.iter().copied().collect::<HashSet<_>>().len(),
@@ -959,7 +998,7 @@ mod tests {
         processes
             .register(peer_pid)
             .expect("register peer in ProcessIndex");
-        let preparation = prepare_exec_freeze(Arc::clone(&processes), caller_tid)
+        let preparation = prepare_exec_freeze(Arc::clone(&processes), caller_tid, None)
             .await
             .expect("prepare pinned exec freeze");
         assert!(preparation.failure.is_none(), "{:?}", preparation.failure);

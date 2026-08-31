@@ -1135,6 +1135,7 @@ impl SandboxBuilder {
                 false,
             )),
             runtime: None,
+            session_domain_required: false,
             restore_skipped: Vec::new(),
         })
     }

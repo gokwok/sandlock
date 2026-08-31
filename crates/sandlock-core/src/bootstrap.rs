@@ -22,6 +22,7 @@ struct BootstrapArgs {
     ready_fd: RawFd,
     exec_status_fd: RawFd,
     foreground: bool,
+    session_domain: bool,
     keep_fds: Vec<RawFd>,
     command: Vec<OsString>,
 }
@@ -45,6 +46,7 @@ fn parse_args() -> io::Result<BootstrapArgs> {
     let mut ready_fd = None;
     let mut exec_status_fd = None;
     let mut foreground = false;
+    let mut session_domain = false;
     let mut keep_fds = Vec::new();
     let mut command = Vec::new();
     while let Some(arg) = args.next() {
@@ -62,6 +64,13 @@ fn parse_args() -> io::Result<BootstrapArgs> {
             Some("--exec-status-fd") => exec_status_fd = Some(parse_fd(value, "--exec-status-fd")?),
             Some("--foreground") => {
                 foreground = value == "1";
+            }
+            Some("--session-domain") => {
+                session_domain = match value.to_str() {
+                    Some("1") => true,
+                    Some("0") => false,
+                    _ => return Err(invalid("invalid --session-domain value")),
+                };
             }
             Some("--keep-fd") => keep_fds.push(parse_fd(value, "--keep-fd")?),
             _ => {
@@ -81,6 +90,7 @@ fn parse_args() -> io::Result<BootstrapArgs> {
         ready_fd: ready_fd.ok_or_else(|| invalid("missing --ready-fd"))?,
         exec_status_fd: exec_status_fd.ok_or_else(|| invalid("missing --exec-status-fd"))?,
         foreground,
+        session_domain,
         keep_fds,
         command,
     })
@@ -194,7 +204,7 @@ extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
     0
 }
 
-fn relay_listener(control_fd: RawFd, filter: &[SockFilter]) -> io::Result<()> {
+fn relay_listener(control_fd: RawFd, filter: &[SockFilter], session_domain: bool) -> io::Result<()> {
     let mut pipe = [0i32; 2];
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
@@ -225,7 +235,7 @@ fn relay_listener(control_fd: RawFd, filter: &[SockFilter]) -> io::Result<()> {
     // its copy of this allocation independently.
     unsafe { drop(Box::from_raw(relay_args_raw)) };
 
-    let listener = crate::seccomp::bpf::install_filter(filter)?;
+    let listener = crate::seccomp::bpf::install_filter_for_domain(filter, session_domain)?;
     write_exact_fd(pipe_w.as_raw_fd(), &listener.as_raw_fd().to_le_bytes())?;
     let mut status = 0;
     if unsafe { libc::waitpid(relay_pid, &mut status, 0) } < 0 {
@@ -298,7 +308,7 @@ fn run_inner() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    relay_listener(args.control_fd, &filter)?;
+    relay_listener(args.control_fd, &filter, args.session_domain)?;
 
     let mut ready = [0u8; 4];
     read_exact_fd(args.ready_fd, &mut ready)?;
