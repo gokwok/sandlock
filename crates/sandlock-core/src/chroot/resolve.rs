@@ -75,9 +75,12 @@ pub fn host_to_virtual(
 ///
 /// Self-referential symlinks (e.g. `rootfs/bin → /bin`) return `ELOOP` and
 /// are treated as resolution failures — such rootfs layouts are unsupported.
-pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
-    if let Some(result) = resolve_existing_in_root(chroot_root, child_path) {
-        return Some(result);
+pub fn resolve_in_root(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Result<(PathBuf, PathBuf), i32> {
+    if let Ok(result) = resolve_existing_in_root(chroot_root, child_path) {
+        return Ok(result);
     }
 
     // Full path doesn't exist — resolve the parent and append the missing
@@ -100,7 +103,7 @@ pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf,
 pub fn resolve_in_root_nofollow(
     chroot_root: &Path,
     child_path: &str,
-) -> Option<(PathBuf, PathBuf)> {
+) -> Result<(PathBuf, PathBuf), i32> {
     let confined = confine(child_path);
     // "/" has no final component to leave unresolved.
     let Some(file_name) = confined.file_name() else {
@@ -110,20 +113,21 @@ pub fn resolve_in_root_nofollow(
 
     match openat2_in_root(
         chroot_root,
-        parent.to_str()?,
+        parent.to_str().ok_or(libc::EINVAL)?,
         libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         0,
     ) {
         Ok(fd) => {
-            let parent_host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+            let parent_host = std::fs::read_link(format!("/proc/self/fd/{}", fd))
+                .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
             unsafe { libc::close(fd) };
             let parent_host = parent_host?;
             let host_path = parent_host.join(file_name);
-            let parent_virtual = to_virtual_path(chroot_root, &parent_host)?;
+            let parent_virtual = to_virtual_path(chroot_root, &parent_host).ok_or(libc::EACCES)?;
             let virtual_path = parent_virtual.join(file_name);
-            Some((host_path, virtual_path))
+            Ok((host_path, virtual_path))
         }
-        Err(_) => None,
+        Err(errno) => Err(errno),
     }
 }
 
@@ -136,7 +140,10 @@ pub fn resolve_in_root_nofollow(
 ///
 /// Use this for read-only lookups (stat, access, readlink) where the file
 /// must already exist.
-pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
+pub fn resolve_existing_in_root(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Result<(PathBuf, PathBuf), i32> {
     match openat2_in_root(
         chroot_root,
         child_path,
@@ -144,13 +151,14 @@ pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<
         0,
     ) {
         Ok(fd) => {
-            let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+            let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd))
+                .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
             unsafe { libc::close(fd) };
             let host_path = host_path?;
-            let virtual_path = to_virtual_path(chroot_root, &host_path)?;
-            Some((host_path, virtual_path))
+            let virtual_path = to_virtual_path(chroot_root, &host_path).ok_or(libc::EACCES)?;
+            Ok((host_path, virtual_path))
         }
-        Err(_) => None,
+        Err(errno) => Err(errno),
     }
 }
 
@@ -387,7 +395,7 @@ mod tests {
         std::fs::write(root.join("usr/bin/hello"), "").unwrap();
 
         let result = resolve_in_root(root, "/usr/bin/hello");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/usr/bin/hello"));
         assert!(host.starts_with(root));
@@ -402,7 +410,7 @@ mod tests {
         symlink("/usr/lib64", root.join("lib")).unwrap();
 
         let result = resolve_in_root(root, "/lib/foo");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/usr/lib64/foo"));
         assert!(host.starts_with(root));
@@ -416,7 +424,7 @@ mod tests {
 
         // File doesn't exist but parent does — should resolve via parent.
         let result = resolve_in_root(root, "/tmp/newfile");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/tmp/newfile"));
         assert!(host.ends_with("tmp/newfile"));
@@ -432,7 +440,7 @@ mod tests {
         symlink("/etc/shadow", root.join("evil")).unwrap();
 
         let result = resolve_in_root(root, "/evil");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/etc/shadow"));
         assert!(host.starts_with(root));
@@ -445,8 +453,8 @@ mod tests {
         std::fs::create_dir_all(root.join("a")).unwrap();
 
         let result = resolve_in_root(root, "/a/../../etc/group");
-        // Either resolves within root or returns None — never escapes.
-        if let Some((host, _)) = result {
+        // Either resolves within root or returns an error — never escapes.
+        if let Ok((host, _)) = result {
             assert!(host.starts_with(root));
         }
     }
@@ -457,7 +465,7 @@ mod tests {
         let root = tmp.path();
 
         let result = resolve_in_root(root, "/");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/"));
         assert_eq!(host, root);
@@ -475,15 +483,14 @@ mod tests {
         // the resolved target path, not the symlink itself.
         let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
         match result {
-            Some((host, virt)) => {
+            Ok((host, virt)) => {
                 assert!(host.starts_with(root));
                 assert!(host.ends_with("python3.12"),
                     "host path should be resolved through symlink: {:?}", host);
                 assert_eq!(virt, PathBuf::from("/usr/local/bin/python3.12"));
             }
-            None => {
-                // openat2 not available on this kernel — skip
-            }
+            Err(libc::ENOSYS) => {},
+            Err(errno) => panic!("unexpected resolution errno: {errno}"),
         }
     }
 
@@ -499,28 +506,27 @@ mod tests {
 
         let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
         match result {
-            Some((host, virt)) => {
+            Ok((host, virt)) => {
                 assert!(host.starts_with(root),
                     "absolute symlink must not escape chroot: {:?}", host);
                 assert!(host.ends_with("usr/bin/python3.12"));
                 assert_eq!(virt, PathBuf::from("/usr/bin/python3.12"));
             }
-            None => {
-                // openat2 not available — skip
-            }
+            Err(libc::ENOSYS) => {},
+            Err(errno) => panic!("unexpected resolution errno: {errno}"),
         }
     }
 
     #[test]
-    fn test_resolve_existing_returns_none_for_missing() {
+    fn test_resolve_existing_returns_enoent_for_missing() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("usr/bin")).unwrap();
 
         let result = resolve_existing_in_root(root, "/usr/bin/nonexistent");
-        // openat2 may not be available, but if it is, missing file → None
-        if resolve_existing_in_root(root, "/usr/bin").is_some() {
-            assert!(result.is_none());
+        // openat2 may not be available, but if it is, missing file → ENOENT
+        if resolve_existing_in_root(root, "/usr/bin").is_ok() {
+            assert_eq!(result, Err(libc::ENOENT));
         }
     }
 }

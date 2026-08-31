@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::context::PipePair;
-use crate::filesystem_backend::{FilesystemPlan, MountAccess};
+use crate::filesystem_backend::{EntryPurpose, FilesystemEntry, FilesystemPlan, MountAccess};
 use crate::sandbox::Sandbox;
 use crate::sys::structs::SockFilter;
 
@@ -115,6 +115,16 @@ fn open_path(path: &Path) -> io::Result<OwnedFd> {
         ));
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn open_entry(entry: &FilesystemEntry) -> io::Result<Option<OwnedFd>> {
+    match open_path(&entry.host_source) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+            && entry.purpose == EntryPurpose::PolicyGrant
+            && entry.access == MountAccess::ReadOnly => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn make_filter_memfd(filter: &[SockFilter]) -> io::Result<OwnedFd> {
@@ -298,7 +308,9 @@ impl PreparedBubblewrap {
         }
 
         for entry in &plan.entries {
-            let source = open_path(&entry.host_source)?;
+            // Same absent read-grant semantics as Landlock. Explicit mounts
+            // and writable grants remain mandatory; never mount an ancestor.
+            let Some(source) = open_entry(entry)? else { continue; };
             let source_path = proc_fd(source.as_raw_fd());
             let bind_option = match entry.access {
                 MountAccess::ReadOnly => "--ro-bind",
@@ -586,6 +598,36 @@ impl PreparedBubblewrap {
         std::hint::black_box(&self.environment);
         unsafe { libc::execve(self.executable.as_ptr(), argv, environment) };
         fail("exec Bubblewrap")
+    }
+}
+
+#[cfg(test)]
+mod optional_read_tests {
+    use super::*;
+
+    #[test]
+    fn only_absent_read_policy_sources_are_optional() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut entry = FilesystemEntry {
+            guest_path: PathBuf::from("/optional/config"),
+            host_source: tmp.path().join("missing/config"),
+            access: MountAccess::ReadOnly,
+            purpose: EntryPurpose::PolicyGrant,
+        };
+        assert!(open_entry(&entry).unwrap().is_none());
+        entry.purpose = EntryPurpose::ExplicitMount;
+        assert!(open_entry(&entry).is_err());
+        entry.purpose = EntryPurpose::CowLower;
+        assert!(open_entry(&entry).is_err());
+        entry.purpose = EntryPurpose::PolicyGrant;
+        entry.access = MountAccess::ReadWrite;
+        assert!(open_entry(&entry).is_err());
+        entry.access = MountAccess::ReadOnly;
+        std::fs::write(tmp.path().join("regular"), b"policy").unwrap();
+        entry.host_source = tmp.path().join("regular/child");
+        assert!(open_entry(&entry).is_err());
+        entry.host_source = tmp.path().join("regular");
+        assert!(open_entry(&entry).unwrap().is_some());
     }
 }
 

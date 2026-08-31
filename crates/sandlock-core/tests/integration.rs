@@ -58,6 +58,9 @@ mod test_chroot;
 #[path = "integration/test_readlink.rs"]
 mod test_readlink;
 
+#[path = "integration/test_open_missing.rs"]
+mod test_open_missing;
+
 #[path = "integration/test_dry_run.rs"]
 mod test_dry_run;
 

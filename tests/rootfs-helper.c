@@ -748,6 +748,32 @@ struct helper_open_how {
     unsigned long long resolve;
 };
 
+/* Exercise libc open, openat, openat2 and the legacy open entry directly. */
+static int cmd_open_errno(int argc, char **argv) {
+    if (argc != 3) return 2;
+    int expected = atoi(argv[1]);
+    int flags = atoi(argv[2]);
+    for (int variant = 0; variant < 4; variant++) {
+        struct helper_open_how how = { .flags = flags, .mode = 0, .resolve = 0 };
+        errno = 0;
+        long fd;
+        if (variant == 0) fd = open(argv[0], flags);
+        else if (variant == 1) fd = syscall(SYS_openat, AT_FDCWD, argv[0], flags, 0);
+#ifdef SYS_open
+        else if (variant == 2) fd = syscall(SYS_open, argv[0], flags, 0);
+#endif
+        else fd = syscall(__NR_openat2, AT_FDCWD, argv[0], &how, sizeof(how));
+        int observed = errno;
+        if (fd >= 0) close((int)fd);
+        if (fd != -1 || observed != expected) {
+            fprintf(stderr, "open variant %d: expected errno %d, got fd %ld errno %d\n",
+                    variant, expected, fd, observed);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int cmd_openat2(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "openat2: missing operand\n"); return 1; }
     /* Second operand, when present, is a RESOLVE_* mask (decimal). */
@@ -1034,6 +1060,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir") == 0)          return cmd_chdir(argc, argv);
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
+    if (strcmp(cmd, "open-errno") == 0)     return cmd_open_errno(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);

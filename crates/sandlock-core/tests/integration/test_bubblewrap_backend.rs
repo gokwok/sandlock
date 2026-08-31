@@ -74,6 +74,34 @@ async fn bubblewrap_runs_with_an_empty_root_and_explicit_grants() {
 }
 
 #[tokio::test]
+async fn bubblewrap_missing_read_grant_does_not_mount_its_parent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let missing = temporary.path().join("optional/config");
+    let secret = temporary.path().join("secret");
+    std::fs::write(&secret, b"private").unwrap();
+    let result = bubblewrap_builder()
+        .fs_read(&missing)
+        .build().unwrap()
+        .run(&["python3", "-c", r#"
+import errno, sys
+try:
+    open(sys.argv[1])
+except OSError as error:
+    assert error.errno == errno.ENOENT, error
+else:
+    raise AssertionError('missing path opened')
+try:
+    open(sys.argv[2])
+except OSError as error:
+    assert error.errno in (errno.ENOENT, errno.EACCES), error
+else:
+    raise AssertionError('sibling became readable')
+"#, missing.to_str().unwrap(), secret.to_str().unwrap()])
+        .await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or_default());
+}
+
+#[tokio::test]
 async fn bubblewrap_connects_to_an_explicitly_writable_named_unix_socket() {
     let runtime = tempfile::tempdir().unwrap();
     let socket = runtime.path().join("control.sock");

@@ -446,6 +446,9 @@ impl SandboxBuilder {
         self
     }
 
+    /// Add a read-only path. If absent at confinement time, no Landlock inode
+    /// rule is installed; the path remains in the policy for mediated lookups.
+    /// No ancestor grant is substituted. Errors other than ENOENT are fatal.
     pub fn fs_read(mut self, path: impl Into<PathBuf>) -> Self {
         self.fs_readable.push(path.into());
         self

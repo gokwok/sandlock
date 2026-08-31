@@ -278,6 +278,19 @@ filesystem isolation.
 
 Landlock rules are kernel-evaluated and TOCTOU-immune.
 
+Read-only paths may be absent when confinement is installed. An `ENOENT` from
+opening such a rule path installs no inode grant, without dropping the path
+from the policy or granting its parent. Other failures (including `EACCES`,
+`ENOTDIR` and `ELOOP`) remain fatal. A path created later is not automatically
+added to the running process's static Landlock rules; restart to install a
+new inode grant. Chroot-mediated lookups still enforce the declared path
+allowlist. Existing writable-path and chroot-root validation is unchanged.
+
+Mediated opens preserve path-resolution errors such as `ENOENT` (including
+missing intermediate directories), `ENOTDIR` and `ELOOP` for authorized paths.
+Unresolved ungranted or explicitly denied paths return `EACCES`. An error reply
+never falls through to the original host syscall or injects a file descriptor.
+
 Mediated `readlink`/`readlinkat` distinguish a non-link file or directory
 (`EINVAL`) from an absent entry (`ENOENT`); the chroot handler checks the resolved
 virtual path against its read/deny policy before returning any link target.

@@ -510,7 +510,24 @@ async fn resolve_merged_chroot_path(
     follow_final: bool,
     require_existing: bool,
 ) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_merged_virtual_path(notif, dirfd, path, ctx, cow_state).await?;
+    resolve_merged_chroot_path_result(
+        notif, dirfd, path, ctx, cow_state, follow_final, require_existing,
+    ).await.ok()
+}
+
+/// Fallible form for opens: a missing parent is not an authorization failure.
+/// Callers must authorize successful resolutions and any error-only response.
+async fn resolve_merged_chroot_path_result(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
+    follow_final: bool,
+    require_existing: bool,
+) -> Result<(PathBuf, PathBuf), i32> {
+    let full_path = build_merged_virtual_path(notif, dirfd, path, ctx, cow_state)
+        .await.ok_or(libc::EACCES)?;
     let confined = confine(&full_path);
     if let Some((mount_target, sub_path)) = ctx.mount_target(&confined) {
         let relative = sub_path.strip_prefix('/').unwrap_or(&sub_path);
@@ -521,17 +538,16 @@ async fn resolve_merged_chroot_path(
             .as_ref()
             .filter(|cow| cow.matches(logical_host.to_string_lossy().as_ref()))
         {
-            let valid = if require_existing {
+            if require_existing {
                 cow.handle_stat_with_follow(
                     logical_host.to_string_lossy().as_ref(),
                     follow_final,
                 )
-                .is_some()
+                .ok_or(libc::ENOENT)?;
             } else {
-                cow.check_merged_parent_path(logical_host.to_string_lossy().as_ref())
-                    .is_ok()
-            };
-            return valid.then_some((logical_host, confined));
+                cow.check_merged_parent_path(logical_host.to_string_lossy().as_ref())?;
+            }
+            return Ok((logical_host, confined));
         }
         drop(state);
         let resolver = if require_existing {
@@ -694,7 +710,8 @@ pub(crate) async fn handle_chroot_open(
     }
 
     // Resolve to get the virtual path for access control.
-    let (host_path, virtual_path) = match resolve_merged_chroot_path(
+    let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+    let (host_path, virtual_path) = match resolve_merged_chroot_path_result(
         notif,
         dirfd,
         &rel_path,
@@ -705,12 +722,22 @@ pub(crate) async fn handle_chroot_open(
     )
     .await
     {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+        Ok(r) => r,
+        Err(errno) => {
+            // Only an error reply: never retry a host open, inject an fd or
+            // Continue on a path that failed resolution. Authorize the virtual
+            // spelling so missing ungranted/denied paths still fail closed.
+            let allowed = build_merged_virtual_path(notif, dirfd, &rel_path, ctx, cow_state)
+                .await
+                .is_some_and(|path| {
+                    let path = confine(&path);
+                    if is_write { ctx.can_write(&path) } else { ctx.can_read(&path) }
+                });
+            return NotifAction::Errno(if allowed { errno } else { libc::EACCES });
+        }
     };
 
     // Access check: writes need can_write, reads need can_read
-    let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
     if is_write {
         if !ctx.can_write(&virtual_path) {
             return NotifAction::Errno(libc::EACCES);

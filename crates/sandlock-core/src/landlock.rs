@@ -150,6 +150,15 @@ pub fn abi_version() -> Result<u32, ConfinementError> {
 
 /// Open `path` and add a Landlock path-beneath rule to `ruleset_fd`.
 fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), ConfinementError> {
+    add_path_rule_inner(ruleset_fd, path, access, false)
+}
+
+fn add_path_rule_inner(
+    ruleset_fd: &OwnedFd,
+    path: &Path,
+    access: u64,
+    allow_missing: bool,
+) -> Result<(), ConfinementError> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     // Reference the path with O_PATH rather than opening it for I/O: O_PATH does
@@ -162,10 +171,18 @@ fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), C
     })?;
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        // An absent read path has no inode to grant. Keep the ruleset's
+        // handled-access mask and all other grants intact; never substitute an
+        // ancestor. Use this open's errno, not an exists()-then-open race.
+        // EACCES, ENOTDIR, ELOOP and malformed paths remain hard failures.
+        if allow_missing && error.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
         return Err(ConfinementError::Landlock(format!(
             "open path {:?} failed: {}",
             path,
-            std::io::Error::last_os_error()
+            error
         )));
     }
     // SAFETY: `libc::open` returned a fresh owned descriptor on success.
@@ -488,12 +505,11 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
         let host;
         let rule_path = if let Some(root) = chroot_root {
             host = root.join(path.strip_prefix("/").unwrap_or(path));
-            if !host.exists() { continue; }
             host.as_path()
         } else {
             path.as_path()
         };
-        add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
+        add_path_rule_inner(&ruleset_fd, rule_path, READ_ACCESS, true).map_err(|e| {
             SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
     }
