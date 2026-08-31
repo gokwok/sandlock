@@ -319,6 +319,77 @@ async fn bubblewrap_concurrent_launches_do_not_deadlock_after_fork() {
 }
 
 #[tokio::test]
+async fn bubblewrap_snapshot_cow_directory_mutations_stay_in_the_virtual_namespace() {
+    let source = tempfile::tempdir().unwrap();
+    let snapshots = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let sealed = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("base"), b"lower").unwrap();
+    let mut snapshot = sandlock_core::FsSnapshot::capture(source.path(), snapshots.path()).unwrap();
+    let mut sandbox = bubblewrap_builder()
+        .chroot("/")
+        .fs_mount("/workspace", snapshot.root_dir())
+        .fs_deny(snapshot.root_dir())
+        .fs_deny(storage.path())
+        .fs_read("/proc")
+        .workdir(snapshot.root_dir())
+        .workdir_virtual("/workspace")
+        .cwd("/workspace")
+        .fs_storage(storage.path())
+        .build()
+        .unwrap();
+    sandbox.enable_session_domain().unwrap();
+    let mut branch = sandbox.create_fs_branch_from_snapshot(&snapshot).unwrap();
+    sandbox.attach_fs_branch(&mut branch).unwrap();
+    let result = sandbox
+        .run(&[
+            "python3",
+            "-c",
+            r#"
+import os, pathlib, tempfile
+pathlib.Path('.tmp').mkdir()
+pathlib.Path('.tmp/verifier').mkdir()
+with tempfile.TemporaryDirectory(dir='.tmp/verifier') as scratch:
+    result = pathlib.Path(scratch) / 'result'
+    result.write_text('isolated')
+    assert result.read_text() == 'isolated'
+os.rename('base', 'renamed')
+os.chmod('renamed', 0o600)
+os.link('renamed', '.tmp/link')
+os.symlink('../renamed', '.tmp/alias')
+assert pathlib.Path('.tmp/alias').read_text() == 'lower'
+os.unlink('.tmp/link')
+os.unlink('.tmp/alias')
+os.rmdir('.tmp/verifier')
+print('mutations-ok')
+"#,
+        ])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "{}",
+        result.stderr_str().unwrap_or_default()
+    );
+    assert_eq!(result.stdout_str(), Some("mutations-ok"));
+    let mut branch = sandbox.take_attached_fs_branch().await.unwrap();
+    let mut changed = branch.checkpoint(sealed.path()).unwrap();
+    assert_eq!(
+        std::fs::read(changed.root_dir().join("renamed")).unwrap(),
+        b"lower"
+    );
+    assert!(!changed.root_dir().join("base").exists());
+    for lower in [source.path(), snapshot.root_dir()] {
+        assert_eq!(std::fs::read(lower.join("base")).unwrap(), b"lower");
+        assert!(!lower.join(".tmp").exists());
+        assert!(!lower.join("renamed").exists());
+    }
+    branch.abort().unwrap();
+    changed.destroy().unwrap();
+    snapshot.destroy().unwrap();
+}
+
+#[tokio::test]
 async fn bubblewrap_cow_virtual_root_survives_frequent_fork_without_touching_lower() {
     let lower = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();

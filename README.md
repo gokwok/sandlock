@@ -123,7 +123,9 @@ deploy the library and bootstrap from the same revision.
 
 COW remains supervisor-managed: `workdir` identifies the host lower and
 `workdir_virtual` optionally gives its guest path. The lower is mounted
-read-only; writes remain in private COW storage. `create`/`start`, resource
+read-only; writes remain in private COW storage. Directory mutations, bounded
+path resolution, and paths recovered from upper directory handles stay in
+the guest namespace. `create`/`start`, resource
 accounting, and process-group lifecycle stay Sandlock-owned. Bubblewrap does
 not support `no_supervisor` or in-process child entrypoints; OCI continues
 using the default Landlock path.

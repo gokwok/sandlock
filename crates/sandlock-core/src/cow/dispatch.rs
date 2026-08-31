@@ -319,7 +319,7 @@ fn resolve_openat2_lexical_path(
 pub(crate) fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
     let path = PathBuf::from(path);
     if let Ok(rel) = path.strip_prefix(cow.upper_dir()) {
-        return normalize_path(cow.workdir().join(rel)).to_string_lossy().into_owned();
+        return normalize_path(Path::new(cow.workdir_str()).join(rel)).to_string_lossy().into_owned();
     }
     normalize_path(path).to_string_lossy().into_owned()
 }

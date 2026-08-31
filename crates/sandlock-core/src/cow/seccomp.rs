@@ -2296,7 +2296,7 @@ impl SeccompCowBranch {
         let resolved = self
             .resolve_merged_rel(&rel, follow_final)
             .ok_or(libc::ENOENT)?;
-        Ok(self.workdir.join(resolved).to_string_lossy().into_owned())
+        Ok(self.virtual_root.join(resolved).to_string_lossy().into_owned())
     }
 
     /// Resolve below an openat2 caller-selected dirfd root. Absolute symlink
@@ -2393,7 +2393,7 @@ impl SeccompCowBranch {
             resolved.push(component);
         }
         Ok(self
-            .workdir
+            .virtual_root
             .join(resolved.join("/"))
             .to_string_lossy()
             .into_owned())
@@ -4062,6 +4062,50 @@ impl Drop for SeccompCowBranch {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn merged_syscall_paths_remain_in_the_virtual_namespace() {
+        let lower = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::create_dir(lower.path().join("nested")).unwrap();
+        std::os::unix::fs::symlink("nested", lower.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink("/", lower.path().join("nested/root")).unwrap();
+        let mut branch = SeccompCowBranch::create(lower.path(), Some(storage.path()), 0).unwrap();
+        branch.set_virtual_root(Path::new("/workspace")).unwrap();
+        assert_eq!(
+            branch
+                .resolve_merged_path("/workspace/alias/new", false)
+                .unwrap(),
+            "/workspace/nested/new"
+        );
+        assert_eq!(
+            branch
+                .resolve_merged_path_bounded(
+                    "/workspace/nested/root/new",
+                    "/workspace/nested",
+                    true,
+                    true,
+                    false,
+                )
+                .unwrap(),
+            "/workspace/nested/new"
+        );
+        assert_eq!(
+            branch.resolve_merged_path_bounded(
+                "/workspace/nested/root/new",
+                "/workspace/nested",
+                true,
+                false,
+                true,
+            ),
+            Err(libc::EXDEV)
+        );
+        assert_eq!(
+            branch.resolve_merged_path("/outside/new", false),
+            Err(libc::EACCES)
+        );
+        branch.abort().unwrap();
+    }
 
     #[test]
     fn snapshot_delta_apply_uses_the_workload_visible_virtual_root() {
