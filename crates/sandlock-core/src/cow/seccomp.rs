@@ -3055,26 +3055,27 @@ impl SeccompCowBranch {
 
     /// Handle readlink.
     pub fn handle_readlink(&self, path: &str) -> Option<String> {
-        let lexical_rel = self.safe_rel(path)?;
-        let rel = self.resolve_merged_rel(&lexical_rel, false)?;
-        if self.is_deleted(&rel) {
-            return None;
-        }
+        self.readlink_bytes(path).ok()
+            .map(|target| String::from_utf8_lossy(&target).into_owned())
+    }
+
+    /// Syscall-facing readlink preserves errno and raw link bytes. Keep the public
+    /// optional-string helper compatible, but never use it to answer a syscall.
+    pub(crate) fn readlink_bytes(&self, path: &str) -> Result<Vec<u8>, i32> {
+        let lexical_rel = self.safe_rel(path).ok_or(libc::EACCES)?;
+        let rel = self.resolve_merged_rel(&lexical_rel, false).ok_or(libc::ENOENT)?;
         // Read the link confined to each layer root so a symlinked parent
         // component cannot escape the tree (issue #112). A covered path only
         // consults the upper: falling through to the lower link would leak
         // the pre-delete target of a whiteouted-then-recreated entry.
-        let roots: &[&PathBuf] = if self.deleted.covers(&rel) {
-            &[&self.upper]
-        } else {
-            &[&self.upper, &self.workdir]
-        };
-        for root in roots {
-            if let Ok(target) = crate::sys::fs::readlink_in_root(root, &rel) {
-                return Some(String::from_utf8_lossy(&target).into_owned());
+        match crate::sys::fs::readlink_in_root(&self.upper, &rel) {
+            // Only a genuinely absent, non-whiteouted upper entry can reveal lower.
+            // EINVAL means an upper non-link shadows lower, not that it is absent.
+            Err(libc::ENOENT) if !self.deleted.covers(&rel) => {
+                crate::sys::fs::readlink_in_root(&self.workdir, &rel)
             }
+            result => result,
         }
-        None
     }
 
     /// List all filesystem changes in the COW layer.
@@ -7693,6 +7694,33 @@ mod tests {
             Some("sub/../../outside.txt"),
             "even one that lexically escapes: `safe_rel` is not the confinement boundary",
         );
+    }
+
+    #[test]
+    fn readlink_preserves_errno_and_never_reveals_a_shadowed_lower_link() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        for name in ["shadow-file", "shadow-dir", "deleted", "recreated", "dangling"] {
+            std::os::unix::fs::symlink("missing-target", workdir.path().join(name)).unwrap();
+        }
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let path = |name: &str| workdir.path().join(name).to_str().unwrap().to_owned();
+        fs::write(branch.upper_dir().join("shadow-file"), b"upper").unwrap();
+        fs::create_dir(branch.upper_dir().join("shadow-dir")).unwrap();
+        branch.mark_deleted("deleted");
+        branch.mark_deleted("recreated");
+        fs::write(branch.upper_dir().join("recreated"), b"new upper").unwrap();
+        for name in ["shadow-file", "shadow-dir", "recreated"] {
+            assert_eq!(branch.readlink_bytes(&path(name)), Err(libc::EINVAL));
+            assert_eq!(branch.handle_readlink(&path(name)), None);
+        }
+        assert_eq!(branch.readlink_bytes(&path("deleted")), Err(libc::ENOENT));
+        assert_eq!(branch.readlink_bytes(&path("missing")), Err(libc::ENOENT));
+        assert_eq!(branch.readlink_bytes(&path("dangling")), Ok(b"missing-target".to_vec()));
+        // readlink returns arbitrary target bytes without UTF-8 replacement at the syscall edge.
+        let target = std::ffi::OsString::from_vec(vec![b'x', 0xff]);
+        std::os::unix::fs::symlink(&target, branch.upper_dir().join("bytes")).unwrap();
+        assert_eq!(branch.readlink_bytes(&path("bytes")), Ok(vec![b'x', 0xff]));
     }
 
     /// `handle_symlink` refuses to record a link whose target is absolute or

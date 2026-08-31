@@ -278,6 +278,14 @@ filesystem isolation.
 
 Landlock rules are kernel-evaluated and TOCTOU-immune.
 
+Mediated `readlink`/`readlinkat` distinguish a non-link file or directory
+(`EINVAL`) from an absent entry (`ENOENT`); the chroot handler checks the resolved
+virtual path against its read/deny policy before returning any link target.
+COW reads select the upper entry when present, including a non-link shadowing
+a lower symlink. Only an absent, non-whiteouted upper entry falls back to lower;
+a deleted lower link is never exposed. Successful syscall replies retain the
+link's raw target bytes.
+
 A virtual mount also grants metadata traversal on each of its ancestor
 directories. This lets runtimes resolve a nested mounted entry point one
 component at a time (for example `lstat("/Users")` before entering a Workspace

@@ -2087,13 +2087,13 @@ pub(crate) async fn handle_cow_readlink(
         return NotifAction::Errno(errno);
     }
 
-    let target = match cow.handle_readlink(&path) {
-        Some(t) => t,
-        None => return NotifAction::Errno(libc::ENOENT),
+    let target = match cow.readlink_bytes(&path) {
+        Ok(t) => t,
+        Err(errno) => return NotifAction::Errno(errno),
     };
     drop(st);
 
-    let target_bytes = target.as_bytes();
+    let target_bytes = target.as_slice();
     let write_len = target_bytes.len().min(bufsiz);
 
     if write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, &target_bytes[..write_len]).is_err()

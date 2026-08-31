@@ -218,6 +218,17 @@ pub(crate) fn readlink_in_root(root: &Path, path: &str) -> Result<Vec<u8>, i32> 
     // O_PATH|O_NOFOLLOW opens the link itself; readlinkat with an empty path
     // then reads its target. The parent walk is confined to root.
     let fd = opath_in_root(root, path, false)?;
+    // Empty-path readlinkat returns ENOENT for a non-link fd. The path syscall
+    // we emulate must return EINVAL instead. Inspect the SAME pinned inode, not
+    // the original pathname, so a concurrent rename cannot change this decision.
+    match nix::sys::stat::fstat(fd) {
+        Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFLNK => {}
+        stat => {
+            let errno = stat.err().map_or(libc::EINVAL, |error| error as i32);
+            let _ = nix::unistd::close(fd);
+            return Err(errno);
+        }
+    }
     let mut buf = vec![0u8; 4096];
     let n = unsafe {
         libc::readlinkat(fd, EMPTY, buf.as_mut_ptr() as *mut libc::c_char, buf.len())
@@ -678,6 +689,16 @@ mod tests {
 
         // But a link reached through an escaping parent is not visible.
         assert_eq!(readlink_in_root(root, "dirlink/group"), Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn readlink_distinguishes_nonlinks_from_missing_paths() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("regular"), b"content").unwrap();
+        assert_eq!(skip_if_nosys!(readlink_in_root(tmp.path(), "")), Err(libc::EINVAL));
+        assert_eq!(readlink_in_root(tmp.path(), "regular"), Err(libc::EINVAL));
+        assert_eq!(readlink_in_root(tmp.path(), "missing"), Err(libc::ENOENT));
+        assert_eq!(readlink_in_root(tmp.path(), "regular/child"), Err(libc::ENOTDIR));
     }
 
     #[test]

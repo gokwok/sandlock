@@ -83,6 +83,37 @@ static int cmd_pwd(void) {
 }
 
 /* ── readlink ───────────────────────────────────────────────── */
+/* Check libc and direct syscall errno, including the legacy entry on x86_64. */
+static int cmd_readlink_errno(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int expected = atoi(argv[1]);
+    char buf[4096];
+    for (int variant = 0; variant < 3; variant++) {
+        errno = 0;
+        long n;
+        if (variant == 0) n = readlink(argv[0], buf, sizeof(buf));
+#ifdef SYS_readlink
+        else if (variant == 1) n = syscall(SYS_readlink, argv[0], buf, sizeof(buf));
+#endif
+        else n = syscall(SYS_readlinkat, AT_FDCWD, argv[0], buf, sizeof(buf));
+        if (n != -1 || errno != expected) {
+            fprintf(stderr, "readlink variant %d: expected errno %d, got result %ld errno %d\n",
+                    variant, expected, n, errno);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_realpath(int argc, char **argv) {
+    if (argc != 1) return 2;
+    char *path = realpath(argv[0], NULL);
+    if (!path) { perror("realpath"); return 1; }
+    puts(path);
+    free(path);
+    return 0;
+}
+
 static int cmd_readlink(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "readlink: missing operand\n"); return 1; }
     char buf[4096];
@@ -1014,6 +1045,8 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);
     if (strcmp(cmd, "pwd") == 0)            return cmd_pwd();
     if (strcmp(cmd, "readlink") == 0)       return cmd_readlink(argc, argv);
+    if (strcmp(cmd, "readlink-errno") == 0) return cmd_readlink_errno(argc, argv);
+    if (strcmp(cmd, "realpath") == 0) return cmd_realpath(argc, argv);
     if (strcmp(cmd, "stat") == 0)           return cmd_stat(argc, argv);
     if (strcmp(cmd, "mkdir") == 0)          return cmd_mkdir(argc, argv);
     if (strcmp(cmd, "rmdir") == 0)          return cmd_rmdir(argc, argv);

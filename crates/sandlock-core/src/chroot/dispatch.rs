@@ -1950,10 +1950,13 @@ pub(crate) async fn handle_chroot_readlink(
 
     // readlink must read the link itself, never what it points at, which is
     // exactly what the no-follow resolver gives.
-    let (host_path, _) = match resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, false, true).await {
+    let (host_path, virtual_path) = match resolve_merged_chroot_path(notif, dirfd, &path, ctx, cow_state, false, true).await {
         Some(r) => r,
         None => return NotifAction::Errno(libc::EACCES),
     };
+    if !ctx.can_read(&virtual_path) {
+        return NotifAction::Errno(libc::EACCES);
+    }
 
     // COW
     {
@@ -1961,19 +1964,19 @@ pub(crate) async fn handle_chroot_readlink(
         if let Some(cow) = cs.branch.as_ref() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
-                let target = match cow.handle_readlink(&host_str) {
-                    Some(t) => t,
-                    None => return NotifAction::Errno(libc::ENOENT),
+                let target = match cow.readlink_bytes(&host_str) {
+                    Ok(t) => t,
+                    Err(errno) => return NotifAction::Errno(errno),
                 };
                 drop(cs);
-                return write_target(target.as_bytes());
+                return write_target(&target);
             }
         }
     }
 
     let target = match std::fs::read_link(&host_path) {
         Ok(t) => t,
-        Err(_) => return NotifAction::Errno(libc::ENOENT),
+        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EIO)),
     };
 
     // Strip chroot/mount prefix from absolute targets

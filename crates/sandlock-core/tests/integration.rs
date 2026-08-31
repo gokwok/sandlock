@@ -55,6 +55,9 @@ mod test_user_mapping;
 #[path = "integration/test_chroot.rs"]
 mod test_chroot;
 
+#[path = "integration/test_readlink.rs"]
+mod test_readlink;
+
 #[path = "integration/test_dry_run.rs"]
 mod test_dry_run;
 
