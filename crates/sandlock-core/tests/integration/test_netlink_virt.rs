@@ -8,6 +8,38 @@ fn base_policy() -> sandlock_core::SandboxBuilder {
         .fs_read("/dev").fs_write("/tmp")
 }
 
+#[tokio::test]
+async fn close_under_signals_does_not_leak_descriptors() {
+    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper").canonicalize().unwrap();
+    let mut policy = base_policy().fs_read(&helper).build().unwrap();
+    let result = policy.run(&[helper.to_str().unwrap(), "close-signals"]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or_default());
+    assert!(result.stdout_str().unwrap().contains("close preserved under signals"));
+}
+
+#[tokio::test]
+async fn virtual_socket_identity_survives_dup_fork_and_unmediated_close() {
+    let script = r#"
+import os, socket
+s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+s.bind((0, 0))
+address = s.getsockname()
+assert address[0] == os.getpid(), address
+alias = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE, fileno=os.dup(s.fileno()))
+assert alias.getsockname() == address
+child = os.fork()
+if child == 0:
+    os._exit(0 if alias.getsockname() == address else 1)
+assert os.waitpid(child, 0)[1] == 0
+os.closerange(s.fileno(), s.fileno() + 1)
+assert alias.getsockname() == address
+print('virtual socket aliases OK')
+"#;
+    let result = base_policy().build().unwrap().run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "{}", result.stderr_str().unwrap_or_default());
+}
+
 fn temp_out(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "sandlock-test-nlvirt-{}-{}", name, std::process::id()

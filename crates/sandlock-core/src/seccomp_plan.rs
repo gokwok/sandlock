@@ -116,8 +116,8 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
 //   recvfrom, recvmsg         -- zero msg_name so glibc accepts the reply
 //                                (kernel only writes sun_family on unix
 //                                 recvmsg, leaving nl_pid uninitialized)
-//   close                     -- unregister (pid, fd) so reuse doesn't
-//                                collide with the cookie set
+// SO_COOKIE identifies live virtual sockets across fd reuse. Never notify close:
+// interruption before kernel dispatch would leave a descriptor open on EINTR.
 // Send traffic flows through the real socketpair untouched.
 const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_socket,
@@ -125,8 +125,13 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_getsockname,
     libc::SYS_recvfrom,
     libc::SYS_recvmsg,
-    libc::SYS_close,
 ];
+
+#[test]
+fn built_in_supervision_does_not_intercept_close() {
+    let policy = Sandbox::builder().build().unwrap();
+    assert!(!notif_syscalls(&policy, None).contains(&(libc::SYS_close as u32)));
+}
 
 fn cow_path_syscalls() -> Vec<i64> {
     let mut v = vec![

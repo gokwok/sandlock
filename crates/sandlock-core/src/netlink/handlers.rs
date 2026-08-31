@@ -5,17 +5,16 @@
 //! based on register args (socket domain, fd number) or a fall-through
 //! after harmless cosmetic adjustments (recvmsg pre-zeroing). Decisions
 //! that require security enforcement (non-NETLINK_ROUTE protocol) return
-//! Errno; substitution returns InjectFdSendTracked. The fd-cookie check
-//! (`state.is_cookie(tgid, fd)`) examines a register arg, not user memory,
-//! so the seccomp_unotify TOCTOU class doesn't apply: a racing thread
-//! cannot change the fd number stored in another thread's syscall
-//! registers.
+//! Errno; substitution returns InjectFdSend. The fd-cookie check
+//! pins the open file description and checks its kernel SO_COOKIE. Descriptor
+//! reuse cannot authorize a network operation: these matches only synthesize
+//! metadata, skip a virtual bind, or pre-zero the caller's receive address.
 
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::netlink::{proxy, state::NetlinkState};
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction, OnInjectSuccess};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 
 const AF_UNIX: u64 = 1;
@@ -40,9 +39,8 @@ fn family_allowed(domain: u64) -> bool {
 }
 
 /// Resolve `notif.pid` (which is a TID per the kernel's `task_pid_vnr`) to
-/// the enclosing thread group id.  fds are shared across all threads of a
-/// process, so cookie entries must be keyed by TGID — otherwise a cookie
-/// created by thread A is invisible to thread B in the same process.
+/// the enclosing thread group id, used as the socket creator's virtual port id.
+/// Socket identity itself is independent of process and descriptor numbers.
 fn tgid_of(tid: i32) -> i32 {
     let path = format!("/proc/{}/status", tid);
     if let Ok(s) = std::fs::read_to_string(&path) {
@@ -124,28 +122,20 @@ pub async fn handle_socket(
     let responder_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     let child_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-    // tgid, not tid: fds are process-scoped, so the cookie set must be
-    // keyed per-process to be visible across threads of the same app.
-    // The responder also uses tgid as `nlmsg_pid` in its replies so the
-    // value is consistent with what `handle_getsockname` writes for the
-    // same process (glibc compares incoming nlmsg_pid against the value
-    // it read back from getsockname — they must agree).
+    // Preserve the creator's virtual port id across dup/fork, matching the
+    // responder's nlmsg_pid and the value returned by getsockname.
     let tgid = tgid_of(notif.pid as i32);
-    proxy::spawn_responder(responder_fd, tgid as u32);
+    let registration = match state.register(child_fd.as_raw_fd(), tgid as u32) {
+        Ok(registration) => registration,
+        Err(error) => return NotifAction::Errno(error.raw_os_error().unwrap_or(libc::EIO)),
+    };
+    proxy::spawn_responder(responder_fd, tgid as u32, registration);
 
-    // Record the (tgid, fd) once the kernel's ADDFD ioctl returns the
-    // child-side fd number.  Doing it from the on-success callback
-    // (rather than guessing via inode matching afterwards) closes the
-    // TOCTOU gap: the entry lands in the state map *before* the child's
-    // syscall unblocks, and the key is the exact fd slot the kernel
-    // allocated — not derivable by racing the child.
-    let state = Arc::clone(state);
-    NotifAction::InjectFdSendTracked {
+    // Registration precedes injection; failed injection closes child_fd and
+    // responder EOF releases it. No close syscall interception is necessary.
+    NotifAction::InjectFdSend {
         srcfd: child_fd,
         newfd_flags: libc::O_CLOEXEC as u32,
-        on_success: OnInjectSuccess::new(move |child_fd_num| {
-            state.register(tgid, child_fd_num);
-        }),
     }
 }
 
@@ -165,8 +155,7 @@ pub async fn handle_netlink_recvmsg(
     notif_fd: RawFd,
 ) -> NotifAction {
     let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if !state.is_cookie(tgid, fd) {
+    if state.cookie_pid(notif.pid, fd).is_none() {
         return NotifAction::Continue;
     }
 
@@ -206,23 +195,8 @@ pub async fn handle_bind(
     state: &Arc<NetlinkState>,
 ) -> NotifAction {
     let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if state.is_cookie(tgid, fd) {
+    if state.cookie_pid(notif.pid, fd).is_some() {
         return NotifAction::ReturnValue(0);
-    }
-    NotifAction::Continue
-}
-
-/// Remove `(tgid, fd)` from the cookie set when the child closes a
-/// tracked netlink socket.  Lets the kernel actually close the fd too.
-pub async fn handle_close(
-    notif: &SeccompNotif,
-    state: &Arc<NetlinkState>,
-) -> NotifAction {
-    let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if state.is_cookie(tgid, fd) {
-        state.unregister(tgid, fd);
     }
     NotifAction::Continue
 }
@@ -233,20 +207,18 @@ pub async fn handle_getsockname(
     notif_fd: RawFd,
 ) -> NotifAction {
     let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if !state.is_cookie(tgid, fd) {
+    let Some(reply_pid) = state.cookie_pid(notif.pid, fd) else {
         return NotifAction::Continue;
-    }
+    };
 
     // struct sockaddr_nl { u16 nl_family; u16 _pad; u32 nl_pid; u32 nl_groups; }
     //
-    // We use the tgid as the synthesized nl_pid so it's stable across
-    // threads of the same process — matching the real kernel's netlink
-    // auto-bind behavior which assigns one nl_pid per netlink socket.
+    // The creator's virtual port id is stable across threads and inherited or
+    // duplicated descriptors, and matches nlmsg_pid in the responder's replies.
     let mut addr = [0u8; 12];
     let nl_family = libc::AF_NETLINK as u16;
     addr[0..2].copy_from_slice(&nl_family.to_ne_bytes());
-    addr[4..8].copy_from_slice(&(tgid as u32).to_ne_bytes());
+    addr[4..8].copy_from_slice(&reply_pid.to_ne_bytes());
 
     let addr_ptr = notif.data.args[1] as u64;
     let addrlen_ptr = notif.data.args[2] as u64;

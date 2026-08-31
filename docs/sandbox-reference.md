@@ -333,6 +333,13 @@ this optimization grants no additional filesystem access.
 
 ## `[network]`
 
+Virtual `NETLINK_ROUTE` sockets are tracked by kernel socket identity, including
+duplicated and inherited descriptors, rather than by reusable fd slots. Registry
+entries are released when their responder exits (EOF or cancellation), with at
+most 1024 live virtual sockets per sandbox (`EMFILE` on exhaustion). Built-in
+supervision does not intercept `close`, preserving Linux descriptor-release
+semantics when a caught signal interrupts a shell pipeline.
+
 Outbound allowlist, bind allowlist, and port virtualization. Each
 entry of `net_allow` is a single rule of the form **protocol, host,
 port**. Rules are OR'd. An empty `net_allow` denies all outbound

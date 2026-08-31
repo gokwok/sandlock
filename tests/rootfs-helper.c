@@ -22,12 +22,44 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t close_signals;
+static void close_signal(int sig) { (void)sig; close_signals++; }
+
+/* A caught signal must not turn Linux close into a pre-dispatch EINTR leak. */
+static int cmd_close_signals(void) {
+    struct sigaction action = {0};
+    action.sa_handler = close_signal;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGALRM, &action, NULL) < 0) return 2;
+    struct itimerval timer = {{0, 200}, {0, 200}};
+    if (setitimer(ITIMER_REAL, &timer, NULL) < 0) return 2;
+    int result = 0;
+    for (int i = 0; i < 4000; i++) {
+        int fd;
+        do { fd = open("/dev/null", O_RDONLY); } while (fd < 0 && errno == EINTR);
+        if (fd < 0) { result = 2; break; }
+        int closed = close(fd);
+        int error = errno;
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) {
+            fprintf(stderr, "close left descriptor open: result=%d errno=%d\n", closed, error);
+            result = 1;
+            break;
+        }
+    }
+    timer = (struct itimerval){{0, 0}, {0, 0}};
+    setitimer(ITIMER_REAL, &timer, NULL);
+    if (!close_signals) return 2;
+    if (!result) puts("close preserved under signals");
+    return result;
+}
 
 /* posix_spawn uses CLONE_VM|CLONE_VFORK: its caller's strings survive exec. */
 static int cmd_spawn_preserve(int argc, char **argv) {
@@ -1090,6 +1122,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "open-errno") == 0)     return cmd_open_errno(argc, argv);
     if (strcmp(cmd, "spawn-preserve") == 0) return cmd_spawn_preserve(argc, argv);
+    if (strcmp(cmd, "close-signals") == 0) return cmd_close_signals();
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
