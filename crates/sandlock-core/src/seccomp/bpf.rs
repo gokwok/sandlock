@@ -168,48 +168,57 @@ pub fn install_deny_filter(prog: &[SockFilter]) -> std::io::Result<()> {
 ///
 /// Returns the seccomp notification file descriptor.
 pub fn install_filter(prog: &[SockFilter]) -> std::io::Result<OwnedFd> {
-    install_filter_for_domain(prog, false)
+    install_filter_for_domain(prog, false).map(|listener| listener.fd)
 }
 
-/// Managed-domain freezing relies on received notifications remaining parked
-/// until a reply or fatal signal. Do not fall back without that kernel promise.
+/// The actual wait semantics must travel with the listener. A managed freezer
+/// may only count a received notification as stopped when this bit is true.
+pub(crate) struct InstalledListener {
+    pub fd: OwnedFd,
+    pub killable_recv: bool,
+}
+
+/// Prefer the kernel-assisted freeze only when its complete prerequisites are
+/// available. Otherwise ordinary notification plus confirmed ptrace stops is
+/// used; neither the filter nor the notification supervisor is disabled.
 pub(crate) fn install_filter_for_domain(
     prog: &[SockFilter],
-    require_killable_recv: bool,
-) -> std::io::Result<OwnedFd> {
+    managed: bool,
+) -> std::io::Result<InstalledListener> {
+    let preferred = if !managed || thread_pidfds_available()? {
+        SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+    } else {
+        SECCOMP_FILTER_FLAG_NEW_LISTENER
+    };
     let fprog = SockFprog {
         len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
-    let fd = install_with_required_flags(
-        SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV,
+    let (fd, killable_recv) = install_with_einval_fallback(
+        preferred,
         SECCOMP_FILTER_FLAG_NEW_LISTENER,
-        require_killable_recv,
         |flags| {
             seccomp(
                 SECCOMP_SET_MODE_FILTER,
                 flags,
                 &fprog as *const SockFprog as *const std::ffi::c_void,
-            )
+            ).map(|fd| (fd, flags & SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0))
         },
     )?;
     // SAFETY: kernel returns a valid fd on success
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    Ok(InstalledListener {
+        fd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+        killable_recv,
+    })
 }
 
-fn install_with_required_flags<F>(
-    preferred: u64,
-    fallback: u64,
-    required: bool,
-    mut install: F,
-) -> std::io::Result<i64>
-where
-    F: FnMut(u64) -> std::io::Result<i64>,
-{
-    if required {
-        install(preferred)
-    } else {
-        install_with_einval_fallback(preferred, fallback, install)
+fn thread_pidfds_available() -> std::io::Result<bool> {
+    // PIDFD_THREAD is O_EXCL. Probe in the installing task's actual context;
+    // version strings and a Host-side probe cannot describe its restrictions.
+    match crate::sys::syscall::pidfd_open(std::process::id(), libc::O_EXCL as u32) {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -217,17 +226,19 @@ where
 ///
 /// Extracted as a generic helper so the EINVAL-retry control flow can be
 /// unit-tested without the real `seccomp(2)` syscall.
-pub(crate) fn install_with_einval_fallback<F>(
+pub(crate) fn install_with_einval_fallback<T, F>(
     preferred_flags: u64,
     fallback_flags: u64,
     mut install: F,
-) -> std::io::Result<i64>
+) -> std::io::Result<T>
 where
-    F: FnMut(u64) -> std::io::Result<i64>,
+    F: FnMut(u64) -> std::io::Result<T>,
 {
     match install(preferred_flags) {
         Ok(fd) => Ok(fd),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => install(fallback_flags),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) && preferred_flags != fallback_flags => {
+            install(fallback_flags)
+        }
         Err(e) => Err(e),
     }
 }
@@ -241,14 +252,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_filter_never_retries_without_killable_recv() {
+    fn identical_flags_do_not_retry_an_invalid_filter() {
         let mut calls = Vec::new();
-        let result = install_with_required_flags(3, 1, true, |flags| {
+        let result: std::io::Result<i64> = install_with_einval_fallback(FALLBACK, FALLBACK, |flags| {
             calls.push(flags);
             Err(std::io::Error::from_raw_os_error(libc::EINVAL))
         });
         assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
-        assert_eq!(calls, vec![3]);
+        assert_eq!(calls, vec![FALLBACK]);
     }
 
     #[test]
@@ -418,7 +429,7 @@ mod tests {
     #[test]
     fn fallback_non_einval_error_propagates_without_retry() {
         let mut calls = 0;
-        let res = install_with_einval_fallback(PREFERRED, FALLBACK, |_| {
+        let res: std::io::Result<i64> = install_with_einval_fallback(PREFERRED, FALLBACK, |_| {
             calls += 1;
             Err(std::io::Error::from_raw_os_error(libc::EPERM))
         });
@@ -430,7 +441,7 @@ mod tests {
     #[test]
     fn fallback_einval_on_both_returns_second_einval() {
         let mut calls = 0;
-        let res = install_with_einval_fallback(PREFERRED, FALLBACK, |_| {
+        let res: std::io::Result<i64> = install_with_einval_fallback(PREFERRED, FALLBACK, |_| {
             calls += 1;
             Err(std::io::Error::from_raw_os_error(libc::EINVAL))
         });

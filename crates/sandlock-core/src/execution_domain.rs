@@ -44,10 +44,12 @@ struct TaskStat {
 }
 
 fn stat(pid: i32) -> io::Result<TaskStat> {
+    read_stat(fs::File::open(format!("/proc/{pid}/stat"))?)
+}
+
+fn read_stat(reader: impl Read) -> io::Result<TaskStat> {
     let mut value = String::new();
-    fs::File::open(format!("/proc/{pid}/stat"))?
-        .take(4096)
-        .read_to_string(&mut value)?;
+    reader.take(4096).read_to_string(&mut value)?;
     let fields: Vec<_> = value
         .rsplit_once(')')
         .ok_or_else(invalid_stat)?
@@ -141,17 +143,22 @@ impl Drop for ThrottleGuard<'_> {
 }
 
 impl ExecutionDomain {
-    pub(crate) fn capture(anchor: i32) -> io::Result<Arc<Self>> {
+    pub(crate) fn capture(anchor: i32, killable_recv: bool) -> io::Result<Arc<Self>> {
         let info = stat(anchor)?;
         if info.session != anchor {
             return Err(io::Error::other(
                 "execution did not establish its own session",
             ));
         }
-        Self::open(ExecutionDomainDescriptor {
+        let domain = Self::open(ExecutionDomainDescriptor {
             session_id: anchor,
             anchor_start_time: info.start,
-        })
+        })?;
+        domain
+            .gate
+            .killable_recv
+            .store(killable_recv, Ordering::Release);
+        Ok(domain)
     }
 
     /// Open an observer while the original session anchor still exists.
@@ -406,7 +413,14 @@ impl ExecutionDomain {
         loop {
             // Do not stop tasks still owned by fork/exec ptrace workers.
             if self.gate.idle() {
-                self.stop_tasks()?;
+                if self.gate.killable_recv.load(Ordering::Acquire) {
+                    self.stop_tasks()?;
+                } else {
+                    // Interruptible notification waits participate in group-stop.
+                    // Process pidfds suffice on old kernels; no numeric-TID
+                    // signals or unsupported PIDFD_THREAD handles are needed.
+                    self.signal(libc::SIGSTOP)?;
+                }
                 if !self.tasks_stoppable()? {
                     if Instant::now() >= deadline {
                         return Err(io::Error::new(
@@ -584,6 +598,7 @@ struct GateState {
 pub(crate) struct NotificationGate {
     state: Mutex<GateState>,
     notif_fd: AtomicI32,
+    killable_recv: AtomicBool,
     pub(crate) changed: tokio::sync::Notify,
 }
 
@@ -592,6 +607,7 @@ impl Default for NotificationGate {
         Self {
             state: Mutex::new(GateState::default()),
             notif_fd: AtomicI32::new(-1),
+            killable_recv: AtomicBool::new(false),
             changed: tokio::sync::Notify::new(),
         }
     }
@@ -614,6 +630,11 @@ impl NotificationGate {
         self.notif_fd.store(fd, Ordering::Release);
     }
     fn holds(&self, tid: i32) -> bool {
+        if !self.killable_recv.load(Ordering::Acquire) {
+            // ID_VALID only proves that a notification exists now. Without
+            // killable receive, a signal may invalidate it immediately.
+            return false;
+        }
         let state = self.state.lock().unwrap();
         state.closed
             && state.held.iter().any(|n| {
@@ -625,6 +646,12 @@ impl NotificationGate {
     pub(crate) fn enter(self: &Arc<Self>, notif: SeccompNotif) -> Admission {
         let mut state = self.state.lock().unwrap();
         if state.closed {
+            if state.held.len() == MAX_HELD_NOTIFICATIONS {
+                let fd = self.notif_fd.load(Ordering::Acquire);
+                state
+                    .held
+                    .retain(|notif| crate::seccomp::notif::id_valid(fd, notif.id).is_ok());
+            }
             if state.held.len() == MAX_HELD_NOTIFICATIONS {
                 return Admission::Full;
             }

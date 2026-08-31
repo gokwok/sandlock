@@ -1,6 +1,7 @@
 //! Pinned ptrace owner for a filesystem freeze. SIGCONT cannot release it.
 
 use super::*;
+use std::io::Seek;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
 pub(super) struct SessionFreeze {
@@ -79,7 +80,27 @@ impl Drop for SessionFreeze {
 
 struct Task {
     tid: i32,
-    pidfd: OwnedFd,
+    // An open proc file refers to the captured task, not a reused numeric TID.
+    identity: fs::File,
+    pidfd: Option<OwnedFd>,
+}
+
+impl Task {
+    fn stat(&mut self) -> io::Result<TaskStat> {
+        self.identity.rewind()?;
+        read_stat(&mut self.identity)
+    }
+
+    fn exited(&mut self) -> io::Result<bool> {
+        if let Some(fd) = &self.pidfd {
+            return exited(fd);
+        }
+        match self.stat() {
+            Ok(stat) => Ok(matches!(stat.state, b'Z' | b'X')),
+            Err(error) if gone(&error) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn freeze(
@@ -123,7 +144,13 @@ fn freeze(
                 .parse::<i32>()
                 .map_err(|_| invalid_stat())?;
             if !gate.holds(tid) {
-                seize(tid, descriptor.session_id, deadline, seized)?;
+                seize(
+                    tid,
+                    descriptor.session_id,
+                    gate.killable_recv.load(Ordering::Acquire),
+                    deadline,
+                    seized,
+                )?;
             }
         }
     }
@@ -131,8 +158,24 @@ fn freeze(
     Ok(())
 }
 
-fn seize(tid: i32, session: i32, deadline: Instant, seized: &mut Vec<Task>) -> io::Result<()> {
-    let before = match stat(tid) {
+fn seize(
+    tid: i32,
+    session: i32,
+    killable_recv: bool,
+    deadline: Instant,
+    seized: &mut Vec<Task>,
+) -> io::Result<()> {
+    let identity = match fs::File::open(format!("/proc/{tid}/stat")) {
+        Ok(file) => file,
+        Err(e) if gone(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut task = Task {
+        tid,
+        identity,
+        pidfd: None,
+    };
+    let before = match task.stat() {
         Ok(s) => s,
         Err(e) if gone(&e) => return Ok(()),
         Err(e) => return Err(e),
@@ -140,25 +183,31 @@ fn seize(tid: i32, session: i32, deadline: Instant, seized: &mut Vec<Task>) -> i
     if before.session != session || matches!(before.state, b'Z' | b'X') {
         return Ok(());
     }
-    let pidfd = match crate::sys::syscall::pidfd_open(tid as u32, libc::O_EXCL as u32) {
-        Ok(fd) => fd,
-        Err(e) if gone(&e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    if killable_recv {
+        task.pidfd = Some(
+            match crate::sys::syscall::pidfd_open(tid as u32, libc::O_EXCL as u32) {
+                Ok(fd) => fd,
+                Err(e) if gone(&e) => return Ok(()),
+                Err(e) => return Err(e),
+            },
+        );
+    }
     // SAFETY: this thread owns every ptrace operation. EXITKILL prevents a
     // failed freeze worker from releasing unconfirmed attachments to run.
     if unsafe { libc::ptrace(libc::PTRACE_SEIZE, tid, 0, libc::PTRACE_O_EXITKILL) } < 0 {
         let e = io::Error::last_os_error();
         return if gone(&e) { Ok(()) } else { Err(e) };
     }
-    seized.push(Task { tid, pidfd });
-    let current = stat(tid)?;
+    seized.push(task);
+    let task = seized.last_mut().unwrap();
+    let current = task.stat()?;
     if current.session != session || current.start != before.start {
         return Err(io::Error::other(
             "task identity changed while freezing execution domain",
         ));
     }
-    // SAFETY: this worker just seized this task, and retains its identity fd.
+    // SAFETY: this worker owns the ptrace relationship and pinned proc identity.
+    // Ptrace requests cannot target a replacement TID not traced by this worker.
     if unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0) } < 0 {
         let e = io::Error::last_os_error();
         return if gone(&e) { Ok(()) } else { Err(e) };
@@ -166,7 +215,9 @@ fn seize(tid: i32, session: i32, deadline: Instant, seized: &mut Vec<Task>) -> i
     // SIGSTOP is uncatchable; under ptrace it becomes a held delivery stop.
     // Received notification waiters were separately proven kernel-parked and
     // skipped above; WAIT_KILLABLE_RECV is mandatory for that proof.
-    send(&seized.last().unwrap().pidfd, libc::SIGSTOP)?;
+    if let Some(fd) = &task.pidfd {
+        send(fd, libc::SIGSTOP)?;
+    }
     loop {
         // SAFETY: waitid fills initialized siginfo; only consume ptrace stops,
         // never terminal status (the session anchor must remain unreaped).
@@ -182,7 +233,7 @@ fn seize(tid: i32, session: i32, deadline: Instant, seized: &mut Vec<Task>) -> i
         if rc == 0 && info.si_code == libc::CLD_TRAPPED && unsafe { info.si_pid() } == tid {
             return Ok(());
         }
-        if exited(&seized.last().unwrap().pidfd)? {
+        if task.exited()? {
             return Ok(());
         }
         if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
@@ -193,7 +244,7 @@ fn seize(tid: i32, session: i32, deadline: Instant, seized: &mut Vec<Task>) -> i
                 io::ErrorKind::TimedOut,
                 format!(
                     "task {tid} did not enter a held ptrace stop: state={} wchan={}",
-                    stat(tid).map(|s| s.state as char).unwrap_or('?'),
+                    task.stat().map(|s| s.state as char).unwrap_or('?'),
                     fs::read_to_string(format!("/proc/{tid}/wchan")).unwrap_or_default()
                 ),
             ));

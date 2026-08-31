@@ -12,7 +12,7 @@ use crate::sandbox::Sandbox;
 use crate::sys::structs::SockFilter;
 
 const BOOTSTRAP_DESTINATION: &str = "/.sandlock-bootstrap";
-const LISTENER_MAGIC: [u8; 4] = *b"SLNF";
+use crate::bootstrap::LISTENER_MAGIC;
 
 pub(crate) struct PreparedBubblewrap {
     executable: CString,
@@ -435,12 +435,12 @@ impl PreparedBubblewrap {
         self.inherited.clear();
     }
 
-    pub(crate) fn receive_listener(&mut self) -> io::Result<(OwnedFd, libc::pid_t)> {
+    pub(crate) fn receive_listener(&mut self) -> io::Result<(OwnedFd, libc::pid_t, bool)> {
         let socket = self
             .control_parent
             .take()
             .ok_or_else(|| io::Error::other("Bubblewrap listener socket already consumed"))?;
-        let mut payload = [0u8; 8];
+        let mut payload = [0u8; 12];
         let mut iov = libc::iovec {
             iov_base: payload.as_mut_ptr().cast(),
             iov_len: payload.len(),
@@ -476,15 +476,21 @@ impl PreparedBubblewrap {
             ));
         }
         let listener_fd = unsafe { std::ptr::read(libc::CMSG_DATA(cmsg).cast::<RawFd>()) };
+        // SAFETY: SCM_RIGHTS above supplied one owned descriptor.
+        let listener_fd = unsafe { OwnedFd::from_raw_fd(listener_fd) };
         let payload_pid = i32::from_le_bytes(payload[4..8].try_into().unwrap());
         if payload_pid <= 0 {
-            unsafe { libc::close(listener_fd) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid Bubblewrap payload pid",
             ));
         }
-        Ok((unsafe { OwnedFd::from_raw_fd(listener_fd) }, payload_pid))
+        let killable_recv = match u32::from_le_bytes(payload[8..12].try_into().unwrap()) {
+            0 => false,
+            1 => true,
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid notification wait mode")),
+        };
+        Ok((listener_fd, payload_pid, killable_recv))
     }
 
     pub(crate) fn exec_child(

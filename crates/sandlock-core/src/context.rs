@@ -657,9 +657,14 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
                 fail!(format!("seccomp install: {}", e));
             }
         };
-        keep_fd = notif_fd.as_raw_fd();
+        keep_fd = notif_fd.fd.as_raw_fd();
         if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), keep_fd as u32) {
             fail!(format!("write notif fd: {}", e));
+        }
+        if sandbox.session_domain_required {
+            if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), u32::from(notif_fd.killable_recv)) {
+                fail!(format!("write notification wait mode: {}", e));
+            }
         }
         std::mem::forget(notif_fd);
     }

@@ -10,8 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 
 use crate::sys::structs::SockFilter;
 
-pub(crate) const FILTER_MAGIC: [u8; 8] = *b"SLBP0001";
-const LISTENER_MAGIC: [u8; 4] = *b"SLNF";
+pub(crate) const FILTER_MAGIC: [u8; 8] = *b"SLBP0002";
+pub(crate) const LISTENER_MAGIC: [u8; 4] = *b"SLN2";
 const MAX_FILTER_INSTRUCTIONS: usize = 4096;
 const EXEC_FAILURE_MAGIC: [u8; 4] = *b"SLXF";
 
@@ -167,14 +167,15 @@ struct RelayArgs {
 
 extern "C" fn relay_main(raw: *mut libc::c_void) -> libc::c_int {
     let args = unsafe { Box::from_raw(raw.cast::<RelayArgs>()) };
-    let mut listener_bytes = [0u8; 4];
+    let mut listener_bytes = [0u8; 8];
     if read_exact_fd(args.pipe_r, &mut listener_bytes).is_err() {
         return 126;
     }
-    let listener_fd = i32::from_le_bytes(listener_bytes);
-    let mut payload = [0u8; 8];
+    let listener_fd = i32::from_le_bytes(listener_bytes[..4].try_into().unwrap());
+    let mut payload = [0u8; 12];
     payload[..4].copy_from_slice(&LISTENER_MAGIC);
-    payload[4..].copy_from_slice(&(args.payload_pid as i32).to_le_bytes());
+    payload[4..8].copy_from_slice(&(args.payload_pid as i32).to_le_bytes());
+    payload[8..].copy_from_slice(&listener_bytes[4..]);
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
         iov_len: payload.len(),
@@ -236,7 +237,10 @@ fn relay_listener(control_fd: RawFd, filter: &[SockFilter], session_domain: bool
     unsafe { drop(Box::from_raw(relay_args_raw)) };
 
     let listener = crate::seccomp::bpf::install_filter_for_domain(filter, session_domain)?;
-    write_exact_fd(pipe_w.as_raw_fd(), &listener.as_raw_fd().to_le_bytes())?;
+    let mut listener_bytes = [0u8; 8];
+    listener_bytes[..4].copy_from_slice(&listener.fd.as_raw_fd().to_le_bytes());
+    listener_bytes[4..].copy_from_slice(&u32::from(listener.killable_recv).to_le_bytes());
+    write_exact_fd(pipe_w.as_raw_fd(), &listener_bytes)?;
     let mut status = 0;
     if unsafe { libc::waitpid(relay_pid, &mut status, 0) } < 0 {
         return Err(io::Error::last_os_error());

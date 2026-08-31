@@ -21,10 +21,23 @@ retain their writer/storage fence rather than infer success from an empty scan.
 Pause closes a bounded notification gate, drains operations already admitted
 (including fork birth tracking and deferred handlers), and confirms that every
 task in the session is held in a ptrace stop or a valid, received notification.
-The latter requires `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`; managed launch
-fails instead of falling back if the kernel rejects this flag. New
-notifications remain parked until resume;
-they are revalidated and dispatched normally, never blindly continued. Freeze
+The latter requires `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`. Installation
+probes actual thread-pidfd support and prefers this flag when the complete
+kernel-assisted freeze is available. If a prerequisite is unsupported, managed
+execution automatically uses ordinary notifications instead: process pidfds
+request group-stop, every live thread must settle, and a pinned ptrace owner
+confirms and holds every thread's stop. An open proc identity prevents a reused
+numeric TID from being mistaken for the captured task. No thread-pidfd or
+notification-wait assumption is used by this compatibility path.
+
+The listener handshake carries the actual installed wait mode; it is never
+inferred from a kernel version or a separate Host environment. The private
+bootstrap protocol is version 2 and requires a matching bootstrap executable.
+Only unsupported-operation errors permit capability fallback; permission or
+filter installation failures remain errors. The filesystem policy and
+notification supervisor are never disabled. New notifications remain queued
+until resume; canceled IDs are discarded and restarted calls are revalidated
+and dispatched normally, never blindly continued. Freeze
 failure resumes the execution or reports cleanup failure. A process in an
 uninterruptible wait without that notification proof is not accepted as a
 completed filesystem freeze. In particular a vfork parent waiting for a parked
@@ -43,9 +56,10 @@ detach, CPU throttling, cancellation, and failure cleanup use the same domain.
 PTY bytes and foreground-job semantics remain independent of domain control.
 
 No root, cgroup, new namespace, or global daemon is required by this contract.
-The deployment must permit thread pidfds (Linux 6.9+), killable seccomp
-notification and ptrace birth tracking/freezing. Incompatible facilities fail
-closed. These requirements do not lower the normal protection-policy minimum.
+The deployment must permit ordinary process pidfds, seccomp user notification
+and ptrace birth tracking/freezing. Thread pidfds and killable notification
+waits are optional optimizations. Missing base facilities fail closed. These
+requirements do not lower the normal protection-policy minimum.
 
 The existing FFI/CLI/Python/Go policy schema is unchanged. This initial hosted
 runtime contract is a Rust API; deserializing or cloning a policy does not

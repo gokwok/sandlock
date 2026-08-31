@@ -3196,20 +3196,37 @@ impl Sandbox {
 
         let mut payload_pid = pid;
         let mut supervised_pidfd = None;
+        let mut killable_recv = false;
         let (notif_fd, _is_nested_mode) = if let Some(launch) = bubblewrap_launch.as_mut() {
             launch.parent_after_fork();
-            let (listener, actual_payload_pid) = launch.receive_listener().map_err(|error| {
-                SandboxRuntimeError::Child(format!(
-                    "receive seccomp listener from Bubblewrap bootstrap: {error}"
-                ))
-            })?;
+            let (listener, actual_payload_pid, actual_killable_recv) = match launch.receive_listener() {
+                Ok(listener) => listener,
+                Err(error) => {
+                    // The bootstrap publishes its bounded errno/stage record
+                    // before exiting. Preserve that cause instead of reporting
+                    // the consequent EOF as a malformed listener frame.
+                    self.wait_until_exec().await?;
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "receive seccomp listener from Bubblewrap bootstrap: {error}"
+                    )).into());
+                }
+            };
             payload_pid = actual_payload_pid;
+            killable_recv = actual_killable_recv;
             supervised_pidfd = syscall::pidfd_open(actual_payload_pid as u32, 0).ok();
             (Some(listener), false)
         } else {
             let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd()).map_err(|error| {
                 SandboxRuntimeError::Child(format!("read notif fd from child: {error}"))
             })?;
+            if self.session_domain_required && notif_fd_num != 0 {
+                killable_recv = match read_u32_fd(pipes.notif_r.as_raw_fd())
+                    .map_err(SandboxRuntimeError::Io)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(SandboxRuntimeError::Child("invalid notification wait mode".into()).into()),
+                };
+            }
             if notif_fd_num == 0 {
                 (None, true)
             } else if let Some(ref pfd) = pidfd {
@@ -3243,7 +3260,7 @@ impl Sandbox {
                 ).into());
             }
             self.rt_mut().domain = Some(
-                crate::execution_domain::ExecutionDomain::capture(pid)
+                crate::execution_domain::ExecutionDomain::capture(pid, killable_recv)
                     .map_err(SandboxRuntimeError::Io)?
             );
         }
