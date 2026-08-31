@@ -324,6 +324,13 @@ notification-gated `/proc/<pid>/mem` path, which can read valid execute-only or
 otherwise non-readable mappings without turning an invalid pointer into an
 allowed exec.
 
+When the virtual root is `/`, an absolute executable outside mapped and COW
+paths retains its original kernel exec pathname and static Landlock checks.
+No input memory is rewritten in that case, including for `posix_spawn` children
+that share their still-running caller's address space. Relative paths and
+translated executable images retain virtual cwd and merged-view resolution;
+this optimization grants no additional filesystem access.
+
 ## `[network]`
 
 Outbound allowlist, bind allowlist, and port virtualization. Each

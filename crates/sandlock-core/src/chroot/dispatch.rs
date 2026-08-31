@@ -39,10 +39,14 @@
 //! not merely a race: the kernel resolves the path it is given against the
 //! real root and the real cwd, so an absolute path would escape the virtual
 //! root and a relative one would resolve against wherever exec left the
-//! child. Since `handle_chroot_chdir` services chdir by recording the cwd
+//! child. The one healthy pathname exception is an absolute, unmapped host-
+//! identity executable with virtual root `/`: it needs no translation and
+//! retains kernel Landlock enforcement without modifying shared spawn memory.
+//! Since `handle_chroot_chdir` services chdir by recording the cwd
 //! rather than moving the child's own (see there for why), that real cwd is
 //! frozen for the process's whole life and diverges from the sandbox's view
-//! the moment anything chdirs. Every `Continue` above is therefore either
+//! the moment anything chdirs. Apart from that host-identity exception,
+//! every `Continue` above is therefore either
 //! fd-based, where no path is resolved at all (AT_EMPTY_PATH stat, getdents,
 //! fchdir), or reached only after a fault that makes the kernel fail the
 //! same syscall the same way. A new handler must keep to one of those two.
@@ -1142,10 +1146,30 @@ pub(crate) async fn handle_chroot_exec(
         return NotifAction::Errno(libc::EACCES);
     }
 
+    // An absolute executable outside every remapped path needs no translation
+    // when the virtual root is the host root. Let the kernel execute its original
+    // pathname under Landlock, just as it does without chroot virtualization.
+    // In particular, posix_spawn's CLONE_VM child shares the caller's address
+    // space: rewriting even a long enough pathname would corrupt surviving
+    // caller memory. Relative paths must still use the virtual cwd, and mapped
+    // or COW executables must still use the pinned merged-view image below.
+    // This is not an authorization shortcut: the resolved virtual grant was
+    // checked above, and the kernel enforces its static inode policy on exec.
+    let cow_exec = cow_layer_root_rel(cow_state, &host_path).await;
+    if ctx.root == Path::new("/")
+        && Path::new(&rel_path).is_absolute()
+        && !Path::new(&rel_path).components().any(|part| part == std::path::Component::ParentDir)
+        && host_path == virtual_path
+        && !ctx.is_mounted(&virtual_path)
+        && !ctx.is_mounted(Path::new(&rel_path))
+        && cow_exec.is_none()
+    {
+        return NotifAction::Continue;
+    }
+
     // Select an upper-only executable from the merged view, then re-open it
     // relative to its trusted layer root. Non-COW paths retain ordinary
     // chroot/mount resolution.
-    let cow_exec = cow_layer_root_rel(cow_state, &host_path).await;
     let (exec_root, exec_path) = cow_exec.map_or_else(
         || {
             if let Some((mount, sub)) = ctx.mount_target(&virtual_path) {

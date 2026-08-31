@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,33 @@
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
+
+/* posix_spawn uses CLONE_VM|CLONE_VFORK: its caller's strings survive exec. */
+static int cmd_spawn_preserve(int argc, char **argv) {
+    if (argc < 1 || argc > 2 || strlen(argv[0]) >= 4096) return 2;
+    int expected = argc == 2 ? atoi(argv[1]) : 0;
+    char path[8192], original[8192];
+    memset(path, 0x5a, sizeof(path));
+    strcpy(path, argv[0]);
+    memcpy(original, path, sizeof(path));
+    char name[] = "rootfs-helper";
+    char action[] = "true";
+    char *args[] = { name, action, NULL };
+    char *env[] = { NULL };
+    pid_t child;
+    int error = posix_spawn(&child, path, NULL, NULL, args, env);
+    if (error != expected) { fprintf(stderr, "posix_spawn: got %d, expected %d\n", error, expected); return 3; }
+    if (!error) {
+        int status;
+        if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 4;
+    }
+    if (memcmp(path, original, sizeof(path)) || strcmp(name, "rootfs-helper")) {
+        fprintf(stderr, "exec changed surviving posix_spawn caller memory\n");
+        return 5;
+    }
+    puts("spawn memory preserved");
+    return 0;
+}
 
 /* ── echo ───────────────────────────────────────────────────── */
 static int cmd_echo(int argc, char **argv) {
@@ -1061,6 +1089,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "fchdir") == 0)         return cmd_fchdir(argc, argv);
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "open-errno") == 0)     return cmd_open_errno(argc, argv);
+    if (strcmp(cmd, "spawn-preserve") == 0) return cmd_spawn_preserve(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);

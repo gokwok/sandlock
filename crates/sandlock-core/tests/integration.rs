@@ -61,6 +61,9 @@ mod test_readlink;
 #[path = "integration/test_open_missing.rs"]
 mod test_open_missing;
 
+#[path = "integration/test_exec_unmapped.rs"]
+mod test_exec_unmapped;
+
 #[path = "integration/test_dry_run.rs"]
 mod test_dry_run;
 
