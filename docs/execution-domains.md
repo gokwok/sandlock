@@ -61,6 +61,24 @@ and ptrace birth tracking/freezing. Thread pidfds and killable notification
 waits are optional optimizations. Missing base facilities fail closed. These
 requirements do not lower the normal protection-policy minimum.
 
+The notification receiver rejects impossible native-architecture metadata.
+Affected vendor kernels can supply malformed register data even when the
+notification ID is valid. After detecting this, the receiver reads the kernel's
+`/proc/<tid>/syscall` view for subsequent notifications and validates the ID
+before and after each read. It waits at most nine milliseconds for a notifying
+task that has not parked yet. Missing access, malformed registers, or an expired
+wait deny the syscall; unknown metadata is never dispatched as `Continue`.
+The installed filter still rejects non-native architectures. This compatibility
+path requires the kernel's proc syscall view and ordinary ptrace read permission.
+
+Descriptor delivery prefers atomic `ADDFD|SEND`. Kernels rejecting that flag
+with `EINVAL` use `ADDFD` followed by a synthetic descriptor return, preserving
+the requested close-on-exec flag. Other errors do not trigger fallback. If a
+signal cancels the notification between these operations, an already-authorized
+descriptor can remain in the child until close or process cleanup, bounded by
+its descriptor limit; tracking records the injection before replying. The
+original open is never continued against a lower or host pathname.
+
 The existing FFI/CLI/Python/Go policy schema is unchanged. This initial hosted
 runtime contract is a Rust API; deserializing or cloning a policy does not
 transfer a running domain or a cleanup proof.

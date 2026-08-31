@@ -944,24 +944,45 @@ fn inject_failure_resp(id: u64) -> SeccompNotifResp {
     }
 }
 
-/// Inject a file descriptor into the child process using SECCOMP_ADDFD_FLAG_SEND.
-///
-/// Uses the SEND flag to atomically inject the fd and respond to the syscall.
-/// The ioctl return value is the fd number assigned in the child process.
-/// After this call, no additional SECCOMP_IOCTL_NOTIF_SEND is needed.
-fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io::Result<i32> {
-    let addfd = SeccompNotifAddfd {
+/// Prefer atomic injection (5.14+); older kernels use ADDFD then a synthetic
+/// return value. Neither path continues the original path-bearing syscall.
+/// A signal between the two legacy ioctls can leave an already-authorized fd
+/// in the child, bounded by its fd limit and reclaimed on process cleanup.
+/// Record that fd even when replying loses the race, so tracked COW/procfs
+/// descriptors never lose their bookkeeping after a successful injection.
+fn inject_fd_and_send(
+    fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32,
+    on_injected: impl FnOnce(i32),
+) -> io::Result<()> {
+    inject_fd_with(id, srcfd, newfd_flags, on_injected, |addfd| {
+        // SAFETY: addfd is initialized and borrowed for the ioctl duration.
+        let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as _, addfd as *const _) };
+        if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
+    }, |newfd| respond_value(fd, id, i64::from(newfd)))
+}
+
+fn inject_fd_with(
+    id: u64, srcfd: RawFd, newfd_flags: u32,
+    on_injected: impl FnOnce(i32),
+    mut add: impl FnMut(&SeccompNotifAddfd) -> io::Result<i32>,
+    reply: impl FnOnce(i32) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SEND,
         srcfd: srcfd as u32,
-        newfd: 0,   // ignored when SECCOMP_ADDFD_FLAG_SETFD is not set
+        newfd: 0,
         newfd_flags,
     };
-    let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as _, &addfd as *const _) };
-    if ret < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(ret as i32)
+    match add(&addfd) {
+        Ok(newfd) => { on_injected(newfd); Ok(()) }
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            addfd.flags = 0;
+            let newfd = add(&addfd)?;
+            on_injected(newfd);
+            reply(newfd)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1503,22 +1524,17 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             respond_continue(fd, id)
         }
         NotifAction::InjectFdSend { srcfd, newfd_flags } => {
-            // SECCOMP_ADDFD_FLAG_SEND atomically injects the fd and responds.
-            // No separate NOTIF_SEND needed after this.
             // On failure, deny (fail closed) rather than letting the original
             // syscall continue unmediated against the host path.
             // srcfd (OwnedFd) is dropped at end of this arm, closing the fd.
-            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
-                Ok(_new_fd) => Ok(()),
+            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags, |_| {}) {
+                Ok(()) => Ok(()),
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
         }
         NotifAction::InjectFdSendTracked { srcfd, newfd_flags, on_success } => {
-            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
-                Ok(new_fd) => {
-                    (on_success.0)(new_fd);
-                    Ok(())
-                }
+            match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags, |new_fd| (on_success.0)(new_fd)) {
+                Ok(()) => Ok(()),
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
         }
@@ -2516,6 +2532,7 @@ pub async fn supervisor(
     //
     // Notifications are processed sequentially (not spawned) to avoid
     // mutex contention between concurrent handlers.
+    let mut metadata = super::notif_metadata::MetadataReader::default();
     'outer: loop {
         if let Some(notif) = ctx.domain.as_ref().and_then(|domain| domain.gate.pop()) {
             handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
@@ -2550,6 +2567,16 @@ pub async fn supervisor(
                         // every later intercepted syscall forever.
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
+                    };
+                    let notif = match metadata.validate(fd, notif).await {
+                        Ok(notif) => notif,
+                        Err(error) => {
+                            if error.raw_os_error() != Some(libc::ENOENT) {
+                                eprintln!("sandlock: cannot read notification metadata: {error}");
+                                let _ = respond_errno(fd, notif.id, libc::EIO);
+                            }
+                            continue;
+                        }
                     };
                     handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
                 }
@@ -2711,6 +2738,57 @@ pub(crate) async fn cleanup_pid_parts(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_injection_tracks_fd_before_interrupted_reply() {
+        use std::cell::Cell;
+        let tracked = Cell::new(None);
+        let mut calls = 0;
+        let error = super::inject_fd_with(99, 3, libc::O_CLOEXEC as u32,
+            |fd| tracked.set(Some(fd)),
+            |request| {
+                calls += 1;
+                assert_eq!(request.id, 99);
+                assert_eq!(request.srcfd, 3);
+                assert_eq!(request.newfd_flags, libc::O_CLOEXEC as u32);
+                if request.flags == super::SECCOMP_ADDFD_FLAG_SEND {
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    assert_eq!(request.flags, 0);
+                    Ok(17)
+                }
+            },
+            |fd| {
+                assert_eq!(fd, 17);
+                assert_eq!(tracked.get(), Some(17));
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            }).unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn atomic_injection_does_not_send_twice() {
+        super::inject_fd_with(99, 3, 0, |fd| assert_eq!(fd, 17),
+            |request| {
+                assert_eq!(request.flags, super::SECCOMP_ADDFD_FLAG_SEND);
+                Ok(17)
+            },
+            |_| panic!("atomic injection already replied")).unwrap();
+    }
+
+    #[test]
+    fn injection_errors_never_relax_permissions() {
+        for errno in [libc::EPERM, libc::EACCES, libc::ENOENT, libc::EBADF] {
+            let mut calls = 0;
+            let error = super::inject_fd_with(99, 3, 0,
+                |_| panic!("injection failed"),
+                |_| { calls += 1; Err(std::io::Error::from_raw_os_error(errno)) },
+                |_| panic!("must not reply with a descriptor")).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(calls, 1);
+        }
+    }
+
     use super::*;
     use std::os::unix::io::FromRawFd;
 
